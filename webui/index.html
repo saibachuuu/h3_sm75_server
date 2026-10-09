@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>H3 SM75 生成服务</title>
+<style>
+  :root { --bg:#0f1420; --panel:#171e2e; --panel2:#1d2639; --line:#2a3650; --fg:#dde6f5;
+          --dim:#8fa3c4; --acc:#5b9dff; --ok:#39c37d; --warn:#f0a93b; --err:#ef6461; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.55 "Microsoft YaHei UI","Segoe UI",system-ui,sans-serif; }
+  header { display:flex; align-items:center; gap:14px; padding:14px 20px;
+           background:var(--panel); border-bottom:1px solid var(--line);
+           position:sticky; top:0; z-index:5; flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; font-weight:600; }
+  .chip { font-size:12px; padding:3px 9px; border-radius:20px; border:1px solid var(--line);
+          color:var(--dim); background:var(--panel2); white-space:nowrap; }
+  .chip.ok  { color:#0c1a12; background:var(--ok);    border-color:var(--ok); }
+  .chip.bad { color:#2a0b0a; background:var(--err);   border-color:var(--err); }
+  .chip.warn{ color:#241703; background:var(--warn);  border-color:var(--warn); }
+  main { max-width:1080px; margin:0 auto; padding:18px 20px 60px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+            padding:16px 18px; margin-bottom:18px; }
+  section h2 { font-size:14px; margin:0 0 12px; color:var(--dim); font-weight:600;
+               text-transform:uppercase; letter-spacing:.06em; }
+  #banner { display:none; background:#2a2110; border:1px solid var(--warn); color:#ffd88a;
+            padding:10px 14px; border-radius:8px; margin-bottom:16px; }
+  label { display:block; font-size:12px; color:var(--dim); margin:8px 0 3px; }
+  textarea, input[type=text], input[type=number], select {
+    width:100%; background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+    border-radius:6px; padding:7px 9px; font:inherit; }
+  textarea { min-height:76px; resize:vertical; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:4px 12px; }
+  .row  { display:flex; gap:14px; align-items:flex-start; }
+  .row > div { flex:1; }
+  button { background:var(--acc); color:#06101f; border:0; border-radius:7px;
+           padding:9px 18px; font:inherit; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.ghost { background:transparent; color:var(--dim); border:1px solid var(--line);
+                 padding:4px 10px; font-weight:400; font-size:12px; }
+  button.ghost:hover { color:var(--fg); border-color:var(--acc); }
+  #imgPreview { max-width:170px; max-height:170px; border-radius:6px; border:1px solid var(--line);
+                display:none; margin-top:6px; }
+  .job { display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:7px;
+         background:var(--panel2); border:1px solid var(--line); margin-bottom:7px; font-size:13px; }
+  .job .id { color:var(--dim); min-width:170px; }
+  .job .st { min-width:70px; font-weight:600; }
+  .st.queued { color:var(--dim); } .st.running { color:var(--warn); }
+  .st.done { color:var(--ok); } .st.failed { color:var(--err); } .st.cancelled { color:var(--dim); }
+  .job .stage { flex:1; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .job .act { white-space:nowrap; }
+  .job .err { color:var(--err); font-size:12px; }
+  #running .job { border-color:var(--warn); }
+  .gal { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:14px; }
+  .card { background:var(--panel2); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .card video { width:100%; aspect-ratio:16/9; background:#000; display:block; }
+  .card .meta { padding:9px 11px; font-size:12px; color:var(--dim); }
+  .card .meta .p { color:var(--fg); margin-bottom:4px; word-break:break-all;
+                   display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+  .card a { color:var(--acc); text-decoration:none; margin-right:10px; }
+  details summary { cursor:pointer; color:var(--dim); font-size:12px; margin-top:8px; }
+  #toast { position:fixed; right:18px; top:64px; z-index:99; display:flex; flex-direction:column; gap:8px; }
+  .toast { background:#2a1210; border:1px solid var(--err); color:#ffb3b0; padding:9px 14px;
+           border-radius:7px; max-width:380px; font-size:13px; }
+  .toast.info { background:#12231a; border-color:var(--ok); color:#a9ecc9; }
+  .muted { color:var(--dim); font-size:12px; }
+  .spin { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--warn);
+          margin-right:6px; animation:p 1s infinite alternate; }
+  @keyframes p { from{opacity:.3} to{opacity:1} }
+</style>
+</head>
+<body>
+<header>
+  <h1>H3 SM75 生成服务</h1>
+  <span id="chipReady" class="chip">连接中…</span>
+  <span id="chipAttn"   class="chip">attn: –</span>
+  <span id="chipCond"   class="chip">cond: –</span>
+  <span id="chipVram"   class="chip">显存: –</span>
+  <span id="chipQueue"  class="chip">队列: –</span>
+</header>
+
+<main>
+  <div id="banner"></div>
+
+  <!-- ============ 提交表单（轮询不触碰此区域） ============ -->
+  <section>
+    <h2>新建生成任务</h2>
+    <label>提示词 *（必填）</label>
+    <textarea id="prompt" placeholder="描述要生成的视频内容…"></textarea>
+
+    <div class="row">
+      <div>
+        <label>参考图 *（ref2va / fl2va 均需）</label>
+        <input type="file" id="image" accept="image/*">
+        <img id="imgPreview" alt="">
+      </div>
+      <div>
+        <label>模式</label>
+        <select id="mode">
+          <option value="ref2va">ref2va（参考图条件）</option>
+          <option value="fl2va">fl2va（首帧锚定）</option>
+        </select>
+        <label>参考图尺寸策略</label>
+        <select id="ref_image_size">
+          <option value="match">match（对齐画布面积）</option>
+          <option value="max">max（短边上限 2048）</option>
+        </select>
+      </div>
+      <div>
+        <label>宽 × 高（32 倍数）</label>
+        <div class="grid">
+          <input type="number" id="width" value="640" step="32" min="256" max="1600">
+          <input type="number" id="height" value="960" step="32" min="256" max="1600">
+        </div>
+        <label>帧数（24 fps）</label>
+        <input type="number" id="length" value="124" min="16" max="400">
+      </div>
+    </div>
+
+    <div class="grid">
+      <div><label>采样步数</label><input type="number" id="steps" value="4" min="1" max="50"></div>
+      <div><label>采样器</label><select id="sampler"></select></div>
+      <div><label>调度器</label><select id="scheduler"></select></div>
+      <div><label>seed（-1 随机）</label><input type="number" id="seed" value="12345"></div>
+      <div><label>refine 步数（0=单 pass，已验收）</label>
+           <input type="number" id="refine_steps" value="0" min="0" max="20"></div>
+    </div>
+
+    <details>
+      <summary>高级选项（手动 sigmas / refine denoise）</summary>
+      <label>sigmas（逗号分隔，留空用调度器；如 1.0,0.5,0.0）</label>
+      <input type="text" id="sigmas" placeholder="">
+      <label>refine denoise</label>
+      <input type="number" id="refine_denoise" value="0.85" step="0.05" min="0.05" max="1">
+    </details>
+
+    <p class="muted" id="attnNote">attention 后端为服务级配置（启动时固定，当前为 int8）。</p>
+    <button id="submitBtn">提交生成任务</button>
+  </section>
+
+  <!-- ============ 队列 ============ -->
+  <section>
+    <h2>队列与进度</h2>
+    <div id="running"><span class="muted" id="runningEmpty">当前无生成中的任务</span></div>
+    <div id="queueList"><span class="muted" id="queueEmpty">暂无任务</span></div>
+    <button class="ghost" id="clearBtn">清空排队中的任务</button>
+  </section>
+
+  <!-- ============ 成果画廊 ============ -->
+  <section>
+    <h2>生成结果</h2>
+    <div class="gal" id="gallery"><span class="muted" id="galEmpty">还没有完成的任务</span></div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let imageB64 = null, imageName = "";
+const STATUS_TXT = { queued:"排队中", running:"生成中", done:"完成", failed:"失败", cancelled:"已取消" };
+
+/* ========== 渲染状态：轮询只做原地更新，绝不整块重建 ========== */
+const rowEls = new Map();   // jobId -> {row, st, stage, act}
+const galIds = new Set();   // 已进画廊的 jobId（进了就永不重建，视频不被打断）
+let queueSig = "";          // 队列成员签名，变了才允许增删行
+let runningId = null, runningCard = null, runningRefs = null;
+let lastBanner = null;
+
+function toast(msg, info) {
+  const d = document.createElement("div");
+  d.className = "toast" + (info ? " info" : "");
+  d.textContent = msg;
+  $("toast").appendChild(d);
+  setTimeout(() => d.remove(), info ? 3500 : 7000);
+}
+
+async function jget(url) { const r = await fetch(url); return r.json(); }
+async function jpost(url, body) {
+  const r = await fetch(url, { method:"POST", headers:{"Content-Type":"application/json"},
+                               body: JSON.stringify(body) });
+  let j = null; try { j = await r.json(); } catch (e) {}
+  if (!r.ok) throw Object.assign(new Error((j && j.error) || ("HTTP " + r.status)), { status:r.status });
+  return j;
+}
+
+/* ---------- 表单 ---------- */
+async function loadDefaults() {
+  try {
+    const d = await jget("/api/defaults");
+    const fill = (el, arr, cur) => {
+      el.innerHTML = "";
+      arr.forEach(v => { const o = document.createElement("option");
+        o.value = v; o.textContent = v; if (v === cur) o.selected = true; el.appendChild(o); });
+    };
+    fill($("sampler"), d.sampler, d.defaults.sampler);
+    fill($("scheduler"), d.scheduler, d.defaults.scheduler);
+  } catch (e) {}
+}
+
+$("image").addEventListener("change", () => {
+  const f = $("image").files[0];
+  if (!f) { imageB64 = null; $("imgPreview").style.display = "none"; return; }
+  imageName = f.name;
+  const rd = new FileReader();
+  rd.onload = () => {
+    imageB64 = String(rd.result).split(",")[1];
+    $("imgPreview").src = rd.result;
+    $("imgPreview").style.display = "block";
+  };
+  rd.readAsDataURL(f);
+});
+
+$("submitBtn").addEventListener("click", async () => {
+  const prompt = $("prompt").value.trim();
+  if (!prompt) return toast("提示词不能为空");
+  if (!imageB64) return toast("请先选择参考图");
+  const payload = {
+    prompt, image_b64: imageB64, image_name: imageName,
+    mode: $("mode").value, ref_image_size: $("ref_image_size").value,
+    width: +$("width").value, height: +$("height").value, length: +$("length").value,
+    steps: +$("steps").value, sampler: $("sampler").value, scheduler: $("scheduler").value,
+    seed: +$("seed").value, refine_steps: +$("refine_steps").value,
+    refine_denoise: +$("refine_denoise").value,
+    sigmas: $("sigmas").value.trim() || null,
+  };
+  const btn = $("submitBtn");
+  btn.disabled = true;
+  try {
+    const r = await jpost("/api/jobs", payload);
+    toast("已提交：" + r.job_id, true);
+    poll();
+  } catch (e) {
+    toast("提交失败：" + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("clearBtn").addEventListener("click", async () => {
+  try { const r = await jpost("/api/jobs/clear", {});
+        toast("已清空 " + r.dropped + " 个排队任务", true); poll(); }
+  catch (e) { toast(e.message); }
+});
+
+/* 取消按钮用事件委托：行元素稳定后只绑一次，重建也不丢 */
+document.addEventListener("click", async ev => {
+  const b = ev.target.closest("[data-drop]");
+  if (!b) return;
+  try { await jpost("/api/jobs/drop", { id: b.dataset.drop }); poll(); }
+  catch (e) { toast(e.message); }
+});
+
+/* ---------- 状态芯片（值不变不写 DOM，杜绝闪烁） ---------- */
+function setChip(el, text, cls) {
+  const want = "chip" + (cls ? " " + cls : "");
+  if (el.textContent !== text) el.textContent = text;
+  if (el.className !== want) el.className = want;
+}
+
+function renderStatus(s) {
+  if (s.error) setChip($("chipReady"), "加载失败", "bad");
+  else if (s.ready) setChip($("chipReady"), "就绪", "ok");
+  else setChip($("chipReady"), "加载中 " + Math.round(s.stage_elapsed) + "s｜" + s.stage, "warn");
+
+  const banner = (s.error ? "模型加载失败：" + s.error
+                : (s.ready ? null
+                : '<span class="spin"></span>模型加载中：' + s.stage +
+                  "（已 " + Math.round(s.stage_elapsed) + " 秒）——就绪后才能提交任务"));
+  if (banner === null) {
+    if ($("banner").style.display !== "none") $("banner").style.display = "none";
+  } else {
+    if (lastBanner !== banner) { $("banner").innerHTML = banner; lastBanner = banner; }
+    if ($("banner").style.display === "none") $("banner").style.display = "block";
+  }
+
+  setChip($("chipAttn"), "attn: " + s.attn + " / w4a8: " + s.w4a8_backend);
+  const c = s.cond;
+  if (c && c.ok) setChip($("chipCond"), "cond: 就绪" + (c.cache_hits ? "（缓存 " + c.cache_hits + "）" : ""), "ok");
+  else if (c && c.reachable === false) setChip($("chipCond"), "cond: 隧道不通", "bad");
+  else if (c && c.loading) setChip($("chipCond"), "cond: 加载中", "warn");
+  else if (c && c.error) setChip($("chipCond"), "cond: 错误", "bad");
+  else setChip($("chipCond"), "cond: –");
+
+  if (s.vram) setChip($("chipVram"), "显存 " + s.vram.free_gb + "/" + s.vram.total_gb + " GB 空闲");
+  const q = s.counts || {};
+  const active = (q.queued || 0) + (q.running || 0);
+  setChip($("chipQueue"), active ? ("队列 " + active) : "队列空闲", active ? "warn" : "");
+}
+
+/* ---------- 生成中卡片（原地更新，仅 running id 变化时重建） ---------- */
+function renderRunning(list) {
+  const run = list.find(j => j.status === "running");
+  if (!run) {
+    if (runningCard) { runningCard.remove(); runningCard = null; runningRefs = null; runningId = null; }
+    $("runningEmpty").style.display = "";
+    return;
+  }
+  $("runningEmpty").style.display = "none";
+  if (!runningCard || runningId !== run.id) {
+    if (runningCard) runningCard.remove();
+    runningId = run.id;
+    runningCard = document.createElement("div");
+    runningCard.className = "job";
+    runningCard.innerHTML =
+      '<span class="st running"><span class="spin"></span>生成中</span>' +
+      '<span class="id"></span><span class="stage"></span>';
+    runningRefs = { id: runningCard.querySelector(".id"),
+                    stage: runningCard.querySelector(".stage") };
+    runningRefs.id.textContent = run.id;
+    $("running").appendChild(runningCard);
+  }
+  runningRefs.stage.textContent =
+    "阶段：" + run.stage + "｜" + Math.round(run.elapsed) + "s｜seed " + run.seed;
+}
+
+/* ---------- 队列行（成员变才增删；状态/耗时只改文字，按钮不被换掉） ---------- */
+function makeRow(j) {
+  const row = document.createElement("div");
+  row.className = "job";
+  row.innerHTML = '<span class="id"></span><span class="st"></span>' +
+                  '<span class="stage"></span><span class="act"></span>';
+  const refs = { row, st: row.querySelector(".st"),
+                 stage: row.querySelector(".stage"), act: row.querySelector(".act") };
+  refs.id = row.querySelector(".id");
+  refs.id.textContent = j.id;
+  updateRow(refs, j);
+  return refs;
+}
+
+function updateRow(refs, j) {
+  const cls = "st " + j.status;
+  if (refs.st.className !== cls) refs.st.className = cls;
+  const stTxt = STATUS_TXT[j.status] || j.status;
+  if (refs.st.textContent !== stTxt) refs.st.textContent = stTxt;
+
+  let stageTxt;
+  if (j.status === "queued") stageTxt = "等待中｜" + Math.round(j.elapsed) + "s｜" + (j.prompt || "").slice(0, 40);
+  else if (j.status === "failed") stageTxt = Math.round(j.elapsed) + "s｜" + (j.prompt || "").slice(0, 30);
+  else stageTxt = j.stage + "｜" + Math.round(j.elapsed) + "s｜" + (j.prompt || "").slice(0, 40);
+  if (refs.stage.textContent !== stageTxt) refs.stage.textContent = stageTxt;
+
+  // act 内容只在“种类”变化时重写（queued→drop，failed→错误，done→链接）
+  const kind = j.status === "queued" ? "drop"
+             : j.status === "failed" ? "err"
+             : (j.status === "done" && j.output_url) ? "done" : "none";
+  if (refs.actKind !== kind) {
+    refs.actKind = kind;
+    if (kind === "drop") refs.act.innerHTML = '<button class="ghost" data-drop="' + j.id + '">取消</button>';
+    else if (kind === "err") refs.act.innerHTML = '<span class="err"></span>';
+    else if (kind === "done") refs.act.innerHTML = '<a target="_blank">查看</a>';
+    else refs.act.innerHTML = "";
+    if (kind === "err") refs.act.firstChild.textContent = (j.error || "失败").slice(0, 90);
+    if (kind === "done") { const a = refs.act.firstChild; a.textContent = "查看"; a.href = j.output_url; }
+  } else if (kind === "err") {
+    const t = (j.error || "失败").slice(0, 90);
+    if (refs.act.firstChild.textContent !== t) refs.act.firstChild.textContent = t;
+  }
+}
+
+function renderQueue(snap) {
+  const list = snap.jobs.filter(j => j.status !== "running");
+  const sig = list.map(j => j.id + ":" + j.status).join(",");
+
+  if (sig !== queueSig) {
+    // 签名（成员/状态）变了才动结构：提交、状态跃迁、清空——平时每 2 秒走不到这里
+    queueSig = sig;
+    for (const [, refs] of rowEls) refs.row.remove();
+    rowEls.clear();
+    const empty = $("queueEmpty");
+    list.forEach(j => {                       // list 为最新在前，逐个插到占位符前 => 顺序不变
+      const refs = makeRow(j);
+      rowEls.set(j.id, refs);
+      $("queueList").insertBefore(refs.row, empty);
+    });
+    empty.style.display = list.length ? "none" : "";
+  } else {
+    // 签名相同 = 只有耗时/stage 在变 → 纯文字原地更新（按钮/行不被替换，可正常点击）
+    list.forEach(j => updateRow(rowEls.get(j.id), j));
+  }
+}
+
+/* ---------- 画廊：只新增，绝不重建（视频播放不受轮询影响） ---------- */
+function esc(s) { return String(s || "").replace(/[&<>"]/g, c =>
+  ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c])); }
+
+function addCard(j) {
+  const c = document.createElement("div");
+  c.className = "card";
+  const t = j.timings || {};
+  c.innerHTML =
+    '<video controls preload="metadata" src="' + j.output_url + '"></video>' +
+    '<div class="meta"><div class="p">' + esc(j.prompt) + '</div>' +
+    'seed ' + j.seed + '｜' + (j.length || "?") + ' 帧｜' + (j.steps || "?") + ' 步｜' +
+    (t.sample_first ? ("采样 " + t.sample_first + "s") : "") +
+    (t.mux ? ("｜mux " + t.mux + "s") : "") +
+    '<div style="margin-top:5px"><a href="' + j.output_url + '" download>下载 mp4</a>' +
+    '<a href="/outputs/' + j.id + '.json" target="_blank">参数</a></div></div>';
+  $("gallery").insertBefore(c, $("gallery").firstChild); // 最新在前
+  galIds.add(j.id);
+}
+
+function renderGallery(snap) {
+  const done = snap.jobs.filter(j => j.status === "done" && j.mp4 && !galIds.has(j.id));
+  if (done.length) { $("galEmpty").style.display = "none"; done.forEach(addCard); }
+}
+
+/* ---------- 轮询：数据每 2 秒拉一次，但渲染全程增量 ---------- */
+async function poll() {
+  if (document.hidden) return;   // 标签页在后台时不刷
+  try {
+    const [st, jobs] = await Promise.all([jget("/api/status"), jget("/api/jobs")]);
+    renderStatus(st);
+    renderRunning(jobs.jobs);
+    renderQueue(jobs);
+    renderGallery(jobs);
+  } catch (e) {
+    setChip($("chipReady"), "服务失联", "bad");
+    if (lastBanner !== "err:" + e.message) {
+      $("banner").textContent = "连不上 dit server（隧道断了？）：" + e.message;
+      $("banner").style.display = "block";
+      lastBanner = "err:" + e.message;
+    }
+  }
+}
+
+loadDefaults();
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>
