@@ -27,6 +27,7 @@ from common.protocol import DEFAULT_COND_URL, DEFAULT_DIT_PORT  # noqa: E402
 DEFAULT_UNET = r"D:\10Eros_Max_h3_TURBO-hybrid_beta5_w4a8_14gb_optimized.safetensors"
 DEFAULT_VIDEO_VAE = r"D:\minimax_h3_video_vae_int8_convrot.safetensors"
 DEFAULT_AUDIO_VAE = r"D:\minimax_h3_audio_vae_fp32.safetensors"
+DEFAULT_VEDA_BUNDLE = r"D:\minimax_h3_r2va_veda_preview_fp8.safetensors"
 
 
 def find_runner_dir(explicit=None):
@@ -54,10 +55,10 @@ def main():
     ap.add_argument("--audio_vae", default=DEFAULT_AUDIO_VAE)
     ap.add_argument("--attn", choices=["int8", "sage", "w8a8", "sdpa", "veda"], default="int8",
                     help="服务级 attention 后端（int8=已验证默认；sage/w8a8=调试档；veda=dev 实验）")
-    ap.add_argument("--veda-bundle", default=None,
+    ap.add_argument("--veda-bundle", default=DEFAULT_VEDA_BUNDLE,
                     help="Veda predictor bundle (.safetensors)，--attn veda 时必填")
-    ap.add_argument("--veda-precision", choices=["w8a8", "bf16"], default="w8a8",
-                    help="Veda 打分器精度（sm75 上 bf16 走 FP32 仿算，更贵）")
+    ap.add_argument("--veda-precision", choices=["w8a8", "bf16"], default="bf16",
+                    help="Veda 打分器精度（远程 kernel 缺 w8a8 符号，默认 bf16；sm75 上走 FP32 仿算）")
     ap.add_argument("--veda-keep", type=float, default=0.0,
                     help="Veda 保留率，0=用 bundle 训练默认值 (0,1]")
     ap.add_argument("--veda-warmup", choices=["off", "probe", "tier1", "tier2", "tier3"],
