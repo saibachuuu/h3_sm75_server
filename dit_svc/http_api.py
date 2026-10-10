@@ -189,6 +189,25 @@ def make_handler(runtime, queue, ctx):
                     self._json({"ok": False, "error": str(e)}, 400)
                 except Exception as e:
                     self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
+            elif path == "/api/jobs/cond":
+                # 直接喂 cond：{cond_b64 | cond_file, image_b64s? 0–9, mode, width,
+                # height, length, steps, sampler, scheduler, seed, refine_steps,
+                # refine_denoise, ref_image_size, sigmas?, fps?, prompt?}
+                # cond_file 相对路径按 out_dir 解析；任务内不回调 cond server。
+                payload = self._read_json_body()
+                if payload is None:
+                    self._json({"ok": False, "error": "请求体不是合法 JSON 或过大"}, 400)
+                    return
+                try:
+                    from dit_svc.job_queue import BusyError
+                    job = queue.submit_cond(payload)
+                    self._json({"ok": True, "job_id": job.id}, 201)
+                except BusyError as e:
+                    self._json({"ok": False, "error": str(e)}, 409)
+                except ValueError as e:
+                    self._json({"ok": False, "error": str(e)}, 400)
+                except Exception as e:
+                    self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
             elif path == "/api/jobs/drop":
                 payload = self._read_json_body() or {}
                 job_id = payload.get("id")

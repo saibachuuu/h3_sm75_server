@@ -25,6 +25,7 @@ class Job:
         self.log = []
         self.timings = {}
         self.cond_stats = None
+        self.cond_source = None      # 直接喂 cond（/api/jobs/cond）时：{"kind","bytes"/"path","size"}
         self.latent_probe = None
         self.mp4 = None
 
@@ -38,8 +39,8 @@ class Job:
             "started": self.started,
             "finished": self.finished,
             "elapsed": round((self.finished or time.time()) - (self.created or time.time()), 1),
-            "prompt": self.params.get("prompt", "")[:120] if self.kind == "video"
-                      else ("warmup n=%s" % self.params.get("tokens")),
+            "prompt": (self.params.get("prompt") or self.params.get("cond_label") or "")[:120]
+                      if self.kind == "video" else ("warmup n=%s" % self.params.get("tokens")),
             "seed": self.params.get("seed"),
             "mode": self.params.get("mode"),
             "length": self.params.get("length"),
@@ -68,14 +69,17 @@ class QueueManager:
         self._worker.start()
 
     # ---------- 提交 ----------
-    def submit(self, payload):
-        from common.protocol import validate_job
-
+    def _require_ready(self):
         if self.runtime.error:
             raise BusyError("模型加载失败: %s" % self.runtime.error)
         if not self.runtime.ready:
             raise BusyError("模型加载中（%s，已 %.0f 秒），请稍后再提交"
                             % (self.runtime.stage, self.runtime.stage_elapsed()))
+
+    def submit(self, payload):
+        from common.protocol import validate_job
+
+        self._require_ready()
         params, err = validate_job(payload)
         if err:
             raise ValueError(err)
@@ -89,13 +93,32 @@ class QueueManager:
         print("[queue] submitted %s seed=%d" % (job.id, params["seed"]), flush=True)
         return job
 
+    # ---------- 直接喂 cond 提交（不回调 cond server；参考图可选） ----------
+    def submit_cond(self, payload, cond_base_dir=None):
+        from common.protocol import validate_cond_job
+
+        self._require_ready()
+        spec, err = validate_cond_job(
+            payload, cond_base_dir=cond_base_dir or self.ctx.get("out_dir"))
+        if err:
+            raise ValueError(err)
+        params, cond = spec["params"], spec["cond"]
+        if params["seed"] is None or params["seed"] < 0:
+            params["seed"] = random.randint(0, 2 ** 63 - 1)
+        job = Job(params)
+        job.cond_source = cond
+        with self._cond:
+            self.jobs[job.id] = job
+            self.order.append(job.id)
+            self._cond.notify_all()
+        print("[queue] submitted %s (直接喂 cond: %s, %d 图, %d bytes) seed=%d"
+              % (job.id, params["cond_label"], len(params["image_b64s"]),
+                 cond["size"], params["seed"]), flush=True)
+        return job
+
     # ---------- warmup 提交（与视频任务同队列串行，互不抢显存） ----------
     def submit_warmup(self, tokens, repeat=1):
-        if self.runtime.error:
-            raise BusyError("模型加载失败: %s" % self.runtime.error)
-        if not self.runtime.ready:
-            raise BusyError("模型加载中（%s，已 %.0f 秒），请稍后再提交"
-                            % (self.runtime.stage, self.runtime.stage_elapsed()))
+        self._require_ready()
         if self.runtime.attn_override is None:
             raise ValueError("当前 attention（%s）无 override 可测，warmup 仅支持 sage/w8a8/veda"
                              % self.runtime.attn)

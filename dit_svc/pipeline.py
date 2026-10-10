@@ -10,6 +10,10 @@ cond 文件是 slim 的（只含文本编码器输出）；参考帧由本机从
 本地解码 + 缩放（目标尺寸与 cond 侧 Qwen 输入共用 target_frame_size）后
 送 VAE 编码。
 
+POST /api/jobs/cond（job.cond_source 非空）直接喂 cond：内联 base64 或
+dit 机器上已有的文件，**不回调 cond server**（不需要 ssh -R 隧道）；该入口
+参考图可选，一张都不给就只带文本条件（不建 minimax_refs / minimax_keyframes）。
+
 解码与 DiT 常驻的显存关系已被 10/9 基线日志证明安全（解码峰值 16.70/17.10GB，
 refiner 常驻 +1.52GB 后 ≈18.6GB < 22.5GB）。
 """
@@ -43,17 +47,22 @@ def run_job(job, ctx):
     params = job.params
     job.stage = "cond"
 
-    # ---------- 1. 取条件（本机编码器常驻，缓存命中即时） ----------
-    from dit_svc import cond_client
+    # ---------- 1. 取条件 ----------
+    # 默认走本机编码器（cond server，缓存命中即时）；/api/jobs/cond 直接喂 cond 时
+    # 完全跳过 cond server —— 不依赖 ssh -R 隧道。
     t0 = time.perf_counter()
-    cond_bytes, cstats = cond_client.fetch(ctx["cond_url"], {
-        "prompt": params["prompt"],
-        "image_b64s": params.get("image_b64s") or [params["image_b64"]],
-        "mode": params["mode"],
-        "width": params["width"],
-        "height": params["height"],
-        "ref_image_size": params["ref_image_size"],
-    })
+    if getattr(job, "cond_source", None):
+        cond_bytes, cstats = _load_direct_cond(job)
+    else:
+        from dit_svc import cond_client
+        cond_bytes, cstats = cond_client.fetch(ctx["cond_url"], {
+            "prompt": params["prompt"],
+            "image_b64s": params.get("image_b64s") or [params["image_b64"]],
+            "mode": params["mode"],
+            "width": params["width"],
+            "height": params["height"],
+            "ref_image_size": params["ref_image_size"],
+        })
     job.cond_stats = cstats
     job.log.append("cond: %s" % json.dumps(cstats, ensure_ascii=False))
     _stage(job, "cond", t0)
@@ -71,6 +80,20 @@ def run_job(job, ctx):
             os.remove(cond_path)
         except OSError:
             pass
+
+
+def _load_direct_cond(job):
+    """直接喂 cond（POST /api/jobs/cond）：内联 base64 或 dit 机器上已有的文件。
+
+    返回 (cond bytes, stats)。内容契约由 _run_with_cond 的 COND_KEYS_REQUIRED 兜底。
+    """
+    src = job.cond_source
+    if src["kind"] == "b64":
+        return src["bytes"], {"source": "direct:b64", "bytes": len(src["bytes"])}
+    with open(src["path"], "rb") as f:
+        data = f.read()
+    return data, {"source": "direct:file", "file": os.path.basename(src["path"]),
+                  "bytes": len(data)}
 
 
 def _run_with_cond(job, ctx, cond_path):
@@ -106,12 +129,15 @@ def _run_with_cond(job, ctx, cond_path):
     del cond_tensor
     torch.cuda.empty_cache()
 
-    # ---------- 4. 参考帧：本地解码 image_b64s + 缩放 + 逐张 VAE 编码 ----------
+    # ---------- 4. 参考帧（可选）：本地解码 image_b64s + 缩放 + 逐张 VAE 编码 ----------
     # ref2va 1–9 张 → minimax_refs 多块（顺序即 <Picture i>）；fl2va 仅单图 → keyframes。
+    # 一张都没给（/api/jobs/cond 允许）→ 不建 ref/keyframe 块，纯文本条件。
     job.stage = "vae_encode"
     t0 = time.perf_counter()
-    b64s = params.get("image_b64s") or [params["image_b64"]]
+    b64s = params.get("image_b64s") or []
     ref_latents = []  # [(latent, latent_h, latent_w)]
+    if not b64s:
+        job.log.append("无参考图：纯文本条件（不建 minimax_refs/minimax_keyframes）")
     for i, b64 in enumerate(b64s):
         frame = _decode_ref_frame(params, b64)  # CPU [H,W,3] float 0..1，已缩到目标尺寸
         with torch.no_grad():
@@ -131,15 +157,16 @@ def _run_with_cond(job, ctx, cond_path):
     _stage(job, "vae_encode", t0)
     torch.cuda.empty_cache()
 
-    # ---------- 5. 组装 positive（区分 ref2va / fl2va） ----------
+    # ---------- 5. 组装 positive（ref2va / fl2va / 无参考图三种） ----------
     job.stage = "build_cond"
-    if params["mode"] == "ref2va":
-        values = {"minimax_token_tags": tags,
-                  "minimax_refs": [{"kind": "image", "latent_h": lh, "latent_w": lw,
-                                    "latent": zl} for zl, lh, lw in ref_latents]}
-    else:
-        values = {"minimax_token_tags": tags,
-                  "minimax_keyframes": [{"resolved_frame_index": 0, "latent": encoded_latent}]}
+    values = {"minimax_token_tags": tags}
+    if ref_latents:
+        if params["mode"] == "ref2va":
+            values["minimax_refs"] = [{"kind": "image", "latent_h": lh, "latent_w": lw,
+                                       "latent": zl} for zl, lh, lw in ref_latents]
+        else:
+            values["minimax_keyframes"] = [{"resolved_frame_index": 0,
+                                            "latent": ref_latents[0][0]}]
     for k in ("attention_mask", "pooled_output"):
         if k in sd:
             values[k] = sd[k].cuda()
@@ -191,7 +218,7 @@ def _run_with_cond(job, ctx, cond_path):
     else:
         out2 = out1
     _stage(job, "sample", t0)
-    del out1, latent, positive, refined, tags, encoded_latent, ref_latents
+    del out1, latent, positive, refined, tags, ref_latents
 
     # ---------- 7. 归因探针：latent 坏了就直接失败，不解码 ----------
     job.stage = "probe"

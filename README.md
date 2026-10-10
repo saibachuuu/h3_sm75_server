@@ -74,8 +74,48 @@ GET  /api/jobs/<id>                  任务详情（含日志尾部）
 POST /api/jobs                       JSON {prompt, image_b64, mode, width, height,
                                      length, steps, sampler, scheduler, seed,
                                      refine_steps, ref_image_size, sigmas?} -> {job_id}
+POST /api/jobs/cond                  直接喂 cond（不回调 cond server，不需要隧道）：
+                                     JSON {cond_b64 | cond_file, image_b64s? 0–9,
+                                     mode, width, height, length, steps, sampler,
+                                     scheduler, seed, refine_steps, refine_denoise,
+                                     ref_image_size, sigmas?, prompt?} -> {job_id}
 POST /api/jobs/drop {id}             取消排队任务
 GET  /outputs/<id>.mp4|.json         成果（支持 Range）
+```
+
+### POST /api/jobs/cond（直接喂 cond）
+
+调用方自己（离线/本机）算好 cond 后直接提交，任务内**不回调 cond server**，
+因此不需要 `ssh -R` 隧道；参考图可选。cond 来源二选一：
+
+- `cond_b64`：cond safetensors 字节的 base64（内联，原始字节 ≤ 96 MB）；
+- `cond_file`：dit 机器上已有的 cond 文件路径（绝对路径，或相对 `--out-dir` 的文件名；
+  远程场景可先 scp 上去再发小 JSON，完全绕开大 body 上传）。
+
+参考图 `image_b64s` 给 0–9 张：给了就在 dit 侧本地解码 + VAE 编码成
+`minimax_refs`（ref2va）或 `minimax_keyframes`（fl2va）块；**一张都不给就是纯文本
+条件**（只用 `cond` / `minimax_token_tags`[+ `attention_mask` / `pooled_output`]），
+`mode` 与 `ref_image_size` 此时无实际作用。`prompt` 只作任务标签/归档（可选）。
+
+cond 文件内容契约与 `/api/jobs` 相同（slim：`cond` + `minimax_token_tags`），
+缺字段的任务会在 `load_cond` 阶段失败并写明缺哪些字段。
+
+```bash
+# 内联 base64
+python - <<'PY'
+import base64, json, urllib.request
+cond = base64.b64encode(open("cond_cache/<hash>.safetensors","rb").read()).decode()
+body = {"cond_b64": cond, "mode": "ref2va", "width": 640, "height": 960,
+        "length": 124, "steps": 4, "seed": 12345, "cond_label": "cat-ref2va"}
+req = urllib.request.Request("http://127.0.0.1:8190/api/jobs/cond",
+                             data=json.dumps(body).encode(),
+                             headers={"Content-Type": "application/json"})
+print(urllib.request.urlopen(req, timeout=300).read().decode())
+PY
+
+# dit 机器上的文件（out_dir 下），参考图可选
+curl -X POST http://127.0.0.1:8190/api/jobs/cond -H "Content-Type: application/json" \
+  -d '{"cond_file":"cat.cond.safetensors","mode":"ref2va","width":640,"height":960,"length":124,"steps":4}'
 ```
 
 cond server：`GET /health`、`POST /encode`、`GET /files/<hash>.safetensors`。
@@ -88,6 +128,9 @@ cond server：`GET /health`、`POST /encode`、`GET /files/<hash>.safetensors`�
 - **cond 文件 slim**：只含文本编码器输出（cond/minimax_token_tags…），不带图像像素；
   参考帧由 dit server 从任务 `image_b64` 本地解码 + 缩放 + VAE 编码
   （目标尺寸 `common.protocol.target_frame_size`，与 cond 侧 Qwen 输入一致）。
+- **两条取 cond 路径**：默认回调本机 cond server（`/api/jobs`）；`/api/jobs/cond` 直接喂
+  cond（`cond_b64` 内联 / `cond_file` dit 机器上的文件），任务内不碰 cond server
+  —— 隧道不通也能出片；该入口参考图可选，没图就不建 ref/keyframe 块。
 - **无 warmup 逻辑**：DiT warmup 已被实测证伪（崩溃跟随全尺寸计算，与"第一次"无关）。
 - **ffmpeg 直出 mp4**：rawvideo 管进 + 临时 wav 管进，h264+AAC，mux 完删临时文件。
 - **latent 探针**：采样输出含 NaN/Inf 直接判失败，不送解码。
