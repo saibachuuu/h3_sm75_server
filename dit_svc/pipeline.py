@@ -254,11 +254,19 @@ def _run_with_cond(job, ctx, cond_path):
         decoded = decoded.reshape(-1, *decoded.shape[-3:])
     if decoded.shape[0] > params["length"]:
         decoded = decoded[:params["length"]]
+    # 逐帧探针：整块 decoded.float() 是 124×960×640×3 fp32 ≈ 0.91GB，再加
+    # isnan/isinf 的 bool 中间量就能把解码后的余量吃光（10/11 真任务实测 OOM）；
+    # 逐帧只多一帧的临时量（≈7MB），统计口径与整块一致。
+    vmin, vmax, vnan, vinf = float("inf"), float("-inf"), 0, 0
     with torch.no_grad():
-        df = decoded.float()
-        dec_probe = {"min": round(float(df.min()), 4), "max": round(float(df.max()), 4),
-                     "nan": int(torch.isnan(df).sum()), "inf": int(torch.isinf(df).sum())}
-        del df
+        for i in range(decoded.shape[0]):
+            f = decoded[i].float()
+            vmin = min(vmin, float(f.min()))
+            vmax = max(vmax, float(f.max()))
+            vnan += int(torch.isnan(f).sum())
+            vinf += int(torch.isinf(f).sum())
+            del f
+    dec_probe = {"min": round(vmin, 4), "max": round(vmax, 4), "nan": vnan, "inf": vinf}
     job.log.append("decoded video %s %s probe=%s" % (tuple(decoded.shape), decoded.dtype, dec_probe))
     if dec_probe["nan"] or dec_probe["inf"]:
         raise RuntimeError("视频 VAE 解码输出含 NaN/Inf: %s" % dec_probe)
