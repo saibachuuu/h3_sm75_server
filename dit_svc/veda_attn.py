@@ -94,7 +94,8 @@ def run_single_warmup(torch, device, attn_fn, tokens, log=print, repeat=1):
     给 POST /api/warmup 用（队列内串行执行，不重启）。失败抛 RuntimeError。
     上限 tokens 40000（超过 packed 上限太多无意义，且防手滑炸卡），
     repeat 上限 50（防长时间占卡；真任务 4 步约等于 repeat=4×56 层）。
-    每轮之间 synchronize + empty_cache（贴近真任务步间状态），NVML 每轮查。
+    QKV 只分配一次、循环复用（allocator 热态，贴近真任务步间状态，轮间无停顿）；
+    empty_cache 只放最后，NVML 每轮查。
     """
     import math
     if not isinstance(tokens, int) or not (16 <= tokens <= 40000):
@@ -106,19 +107,22 @@ def run_single_warmup(torch, device, attn_fn, tokens, log=print, repeat=1):
     if not ok:
         raise RuntimeError("NVML 异常，中止：%s" % vram0)
     log("[warmup once] n=%d x%d | %s" % (tokens, repeat, vram0))
+    # 一次分配、循环复用：首轮建图后 allocator 全热，后续轮无分配停顿
+    parts = []
+    for s in range(0, tokens, 4096):
+        m = min(4096, tokens - s)
+        parts.append(torch.randn(1, heads, m, dim, device=device, dtype=torch.float16))
+    q = torch.cat(parts, dim=2)
+    del parts
+    v = q.clone()
+    out_probe = attn_fn(q, q, v, heads)  # 建图轮（不计时，排除编译抖动）
+    del out_probe
+    torch.cuda.synchronize()
     rounds = []
     for i in range(repeat):
         ok, vram = check_nvml_sane(torch)
         if not ok:
             raise RuntimeError("[warmup %d/%d] NVML 异常，中止：%s" % (i + 1, repeat, vram))
-        parts = []
-        for s in range(0, tokens, 4096):
-            m = min(4096, tokens - s)
-            parts.append(torch.randn(1, heads, m, dim, device=device, dtype=torch.float16))
-        q = torch.cat(parts, dim=2)
-        del parts
-        v = q.clone()
-        torch.cuda.synchronize()
         t0 = torch.cuda.Event(enable_timing=True)
         t1 = torch.cuda.Event(enable_timing=True)
         t0.record()
@@ -129,8 +133,7 @@ def run_single_warmup(torch, device, attn_fn, tokens, log=print, repeat=1):
         finite = bool(torch.isfinite(out.float()).all())
         amax = float(out.float().abs().max())
         ok2, vram2 = check_nvml_sane(torch)
-        del q, v, out
-        torch.cuda.empty_cache()
+        del out
         r = {"ms": round(ms, 1), "finite": finite,
              "amax": amax if math.isfinite(amax) else None}
         log("[warmup %d/%d] %s | %s" % (i + 1, repeat, r, vram2))
@@ -139,6 +142,8 @@ def run_single_warmup(torch, device, attn_fn, tokens, log=print, repeat=1):
         if not ok2:
             raise RuntimeError("[warmup %d/%d] 跑后 NVML 异常：%s" % (i + 1, repeat, vram2))
         rounds.append(r)
+    del q, v
+    torch.cuda.empty_cache()
     result = {"tokens": tokens, "repeat": repeat, "rounds": rounds,
               "ms_min": min(r["ms"] for r in rounds),
               "ms_max": max(r["ms"] for r in rounds),
