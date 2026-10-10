@@ -32,6 +32,9 @@ ssh -p <port> sheepserver@<host> "C:\Users\sheepserver\Desktop\ComfyUI_windows_p
 sshd 转发时 `localhost` 会解析成 IPv6 `::1`，而服务只绑 IPv4，会表现为
 "连上就被掐断"）
 ```powershell
+# 本机已有 tunnel.ps1（已预填 host/port/user，直接跑）：
+.\tunnel.ps1
+# 等价手动命令：
 ssh -N -p <port> -L 8190:127.0.0.1:8190 -R 9310:127.0.0.1:8189 sheepserver@<host>
 ```
 
@@ -91,6 +94,7 @@ cond server：`GET /health`、`POST /encode`、`GET /files/<hash>.safetensors`�
 h3_sm75_server/
 ├── h3_cond_server.py      # 入口A（本机）
 ├── h3_dit_server.py       # 入口B（远程）
+├── tunnel.ps1             # 本机双向隧道脚本（-L 8190 / -R 9310，已预填 host/port/user）
 ├── common/protocol.py     # API 约定与参数校验
 ├── cond_svc/              # 编码服务（Encoder 复用 embed_server.Encoder）
 ├── dit_svc/               # runtime / pipeline / job_queue / cond_client / http_api

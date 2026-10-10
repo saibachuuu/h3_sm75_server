@@ -3,8 +3,8 @@
 用法（远程 python_embeded）：
   python h3_dit_server.py [--port 8190] [--attn int8] [--out-dir outputs]
 
-推荐的本机连接方式（一条命令同时开双向隧道）：
-  ssh -p 56622 -L 8190:localhost:8190 -R 9310:localhost:8189 sheepserver@bwg.aki.pm
+推荐的本机连接方式（一条命令同时开双向隧道；或直接跑本目录 tunnel.ps1）：
+  ssh -N -p 56622 -L 8190:127.0.0.1:8190 -R 9310:127.0.0.1:8189 sheepserver@bwg.aki.pm
   浏览器打开 http://127.0.0.1:8190/ 即 WebUI；远程回调 127.0.0.1:9310 -> 本机 cond server 8189。
 
 说明：

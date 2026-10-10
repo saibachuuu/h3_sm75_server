@@ -8,7 +8,7 @@
   - POST /encode 同步编码 ref2va/fl2va 条件（首次 ~22s，内容哈希缓存命中即时）；
   - 输出 safetensors 契约 = infer_h3_turing.read_cond 所需（含 ref_image/first_frame）。
 
-远程 dit server 方案 A 的回调路径：ssh -R 9310:localhost:8189 之后，
+远程 dit server 方案 A 的回调路径：ssh -R 9310:127.0.0.1:8189 之后（或跑 tunnel.ps1），
 远程访问 http://127.0.0.1:9310 即本服务。
 """
 import argparse
