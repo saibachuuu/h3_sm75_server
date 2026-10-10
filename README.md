@@ -65,6 +65,8 @@ h3_dit_server.py
   --veda-bundle D:\minimax_h3_r2va_veda_preview_fp8.safetensors
   --veda-precision bf16|w8a8  --veda-keep 0(=bundle 默认) --veda-warmup off|probe|tier1..3
   --veda-debug                Veda 调试日志（tile plan/keep + 每 forward 的 sparse_calls）
+                              ＋ Veda 准入探针（/api/status.veda_probe）＋ 接管第三方 logger
+  --dump-module-dtypes        加载后打印 DiT 带权模块的 dtype/quant 台账（查 bf16 仿算层）
   --w4a8_backend turingutils   --mlp_chunk 8192  --runner-dir(自动探测)
 ```
 
@@ -143,9 +145,22 @@ cond server：`GET /health`、`POST /encode`、`GET /files/<hash>.safetensors`�
 ### 诊断：profile_attn: true
 
 任务里带 `profile_attn: true`（`/api/jobs` 与 `/api/jobs/cond` 都支持）→ 只对**第一个采样步**
-开 `torch.profiler`（CUDA activity + python 调用栈），top-14 kernel 与调用栈写进
-`cond_stats.attn_profile`（同时进任务日志）。配合 `--veda-debug` 就能在**真路径**上回答
-"`veda_sparse_online_attn` 到底跑没跑、时间花在稀疏内核还是打分/打包/搬运"。
+开 `torch.profiler`（CPU+CUDA activity、python 调用栈、张量形状），top-16 kernel 连带
+形状与调用栈写进 `cond_stats.attn_profile`（同时进任务日志）。配合 `--veda-debug` 就能在
+**真路径**上回答"`veda_sparse_online_attn` 到底跑没跑、时间花在稀疏内核还是打分/打包/搬运、
+以及那个 bf16 仿算 GEMM 是谁调的"。
+
+`--veda-debug` 另外把 **Veda 准入判定**记在 `/api/status.veda_probe`：
+
+```json
+{"legacy_calls": 200, "container_calls": 0, "sparse_attend_calls": 0,
+ "reasons": {"no minimax_h3_layout": 200},
+ "first": {"legacy|no minimax_h3_layout": {"has_minimax_h3_layout": false, ...}}}
+```
+
+`sparse_attend_calls == 0` 就是"一次稀疏都没真跑"；`reasons`/`first` 给出**为什么**
+（缺 `minimax_h3_layout` / 序列长不匹配 / 缺 `layer_index` / `schedule.is_dense`）。
+同一次启动还会把第三方库（comfyui-turing-utils）的 INFO/DEBUG 日志接到 stdout。
 
 ### POST /api/vae_probe（只跑 VAE 编解码）
 
