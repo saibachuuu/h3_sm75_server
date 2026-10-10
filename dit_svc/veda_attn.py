@@ -229,6 +229,159 @@ def bench_attention(torch, device, veda_call, dense_call, tokens, repeat=3,
     return result
 
 
+VEDA_PROBE = {}   # --veda-debug 的运行期探针（/api/status 里可见）
+
+
+def _enable_turing_logs(log=print):
+    """把第三方库的 INFO/DEBUG 日志接到 stdout。
+
+    它们用 logging.getLogger("comfyui-turing-utils.<component>")，默认只有 WARNING+
+    会经 lastResort 漏出来，而 Veda 的 plan/keep/sparse_calls 全是 INFO —— 平时一条
+    都看不到，这也是"有没有真的进稀疏分支"一直判不了的原因之一。
+    """
+    try:
+        import logging
+        import sys
+        lg = logging.getLogger("comfyui-turing-utils")
+        lg.setLevel(logging.DEBUG)
+        if not any(isinstance(h, logging.StreamHandler) for h in lg.handlers):
+            h = logging.StreamHandler(sys.stdout)
+            h.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
+            lg.addHandler(h)
+        lg.propagate = False
+        log("[veda-probe] turing-utils 日志已接到 stdout（DEBUG）")
+    except Exception as e:
+        log("[veda-probe] 日志接管失败: %s: %s" % (type(e).__name__, e))
+
+
+def gate_snapshot(options, query_tokens):
+    """原样抓下 Veda 准入判断的输入（纯读 dict，不 import 第三方）。
+
+    对应 integration.py:45-47 的门：`layer is not None and packed is not None
+    and packed.seq_len == query_tokens`，外加 sparse_runtime 的 schedule.is_dense。
+    """
+    options = options or {}
+    packed = options.get("minimax_h3_layout")
+    lay = options.get("turing_utils_attention_layout")
+    seq_len = getattr(packed, "seq_len", None)
+    dense = None
+    sched = options.get("turing_utils_veda_schedule")
+    if sched is not None and hasattr(sched, "is_dense"):
+        try:
+            dense = bool(sched.is_dense(options))
+        except Exception as e:
+            dense = "err:%s" % type(e).__name__
+    return {
+        "has_minimax_h3_layout": packed is not None,
+        "layout_seq_len": seq_len,
+        "query_tokens": query_tokens,
+        "seq_len_ok": seq_len == query_tokens,
+        "has_attention_layout_key": isinstance(lay, dict),
+        "layer_index": lay.get("layer_index") if isinstance(lay, dict) else None,
+        "strategy": options.get("turing_utils_attention_strategy"),
+        "schedule_dense": dense,
+        "veda_option_keys": sorted(k for k in options
+                                   if "turing" in k or "minimax" in k)[:12],
+    }
+
+
+def _probe_reason(snap):
+    """把快照压成一个可去重的"为什么 dense / 可稀疏"标签。"""
+    if not snap["has_minimax_h3_layout"]:
+        return "no minimax_h3_layout"
+    if not snap["seq_len_ok"]:
+        return "seq_len %r != query_tokens %r" % (snap["layout_seq_len"], snap["query_tokens"])
+    if not snap["has_attention_layout_key"] or snap["layer_index"] is None:
+        return "no layer_index (turing_utils_attention_layout)"
+    if snap["schedule_dense"]:
+        return "schedule.is_dense"
+    return "sparse-eligible"
+
+
+def install_veda_probe(override, args, log=print):
+    """--veda-debug：给 Veda override 套准入探针（两个入口都包，含 attend 真调用计数）。
+
+    记录进 VEDA_PROBE（/api/status 可读）：
+      legacy_calls / container_calls  —— 走了哪条调用路径
+      reasons                          —— 每种判定（含"为什么 dense"）各出现几次
+      first                            —— 每种判定的首次完整快照（不被日志刷掉）
+      sparse_attend_calls              —— engine.attend 真被执行几次（= 稀疏真跑的次数）
+    """
+    if override is None or not getattr(args, "veda_debug", False):
+        return override
+    VEDA_PROBE.clear()
+    VEDA_PROBE.update({"legacy_calls": 0, "container_calls": 0, "sparse_attend_calls": 0,
+                       "reasons": {}, "first": {}})
+    _enable_turing_logs(log=log)
+    try:
+        import os
+        os.environ.setdefault("COMFYUI_TURING_UTILS_PROFILE", "1")
+    except Exception:
+        pass
+    try:
+        from comfyui_turing_utils.adapters.minimax.veda import integration as vi
+        if not getattr(vi, "_h3_veda_probe_wrapped", False):
+            orig_attend = vi.attend
+
+            def attend_probe(*a, **k):
+                VEDA_PROBE["sparse_attend_calls"] += 1
+                return orig_attend(*a, **k)
+            vi.attend = attend_probe
+            vi._h3_veda_probe_wrapped = True
+    except Exception as e:
+        log("[veda-probe] attend 计数包装失败: %s: %s" % (type(e).__name__, e))
+
+    def _record(kind, snap):
+        VEDA_PROBE[kind + "_calls"] += 1
+        reason = _probe_reason(snap)
+        VEDA_PROBE["reasons"][reason] = VEDA_PROBE["reasons"].get(reason, 0) + 1
+        key = kind + "|" + reason
+        if key not in VEDA_PROBE["first"]:
+            VEDA_PROBE["first"][key] = snap
+            log("[veda-probe] %s 首次判定=%s 快照=%s" % (kind, reason, snap))
+
+    def _wrap_legacy(fn):
+        def probe(fallback, q, k, v, heads, mask=None, attn_precision=None,
+                  skip_reshape=False, skip_output_reshape=False, **kw):
+            try:
+                opts = kw.get("transformer_options") or {}
+                tokens = q.shape[2] if skip_reshape else q.shape[1]
+                snap = gate_snapshot(opts, tokens)
+                snap["mask"] = mask is not None
+                _record("legacy", snap)
+            except Exception as e:
+                log("[veda-probe] legacy 快照失败: %s: %s" % (type(e).__name__, e))
+            return fn(fallback, q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                      skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kw)
+        return probe
+
+    def _wrap_prepared(fn):
+        def probe(request):
+            try:
+                opts = getattr(request, "transformer_options", None) or {}
+                snap = gate_snapshot(opts, getattr(request, "query_tokens", None))
+                snap["mask"] = getattr(request, "mask", None) is not None
+                snap["is_causal"] = bool(getattr(request, "is_causal", False))
+                snap["tensor_layout"] = getattr(request, "tensor_layout", None)
+                snap["scale"] = getattr(request, "scale", None)
+                _record("container", snap)
+            except Exception as e:
+                log("[veda-probe] container 快照失败: %s: %s" % (type(e).__name__, e))
+            return fn(request)
+        return probe
+
+    wrapped = _wrap_legacy(override)
+    try:                                    # 保留原 override 的自带属性（implementation 等）
+        wrapped.__dict__.update(getattr(override, "__dict__", {}))
+    except Exception:
+        pass
+    prepared = getattr(override, "prepared_attention_executor", None)
+    if prepared is not None:
+        wrapped.prepared_attention_executor = _wrap_prepared(prepared)
+    log("[veda-probe] 已装：legacy/container 双入口 + attend 计数（见 /api/status.veda_probe）")
+    return wrapped
+
+
 def build_veda_override(args, unet, torch, log=print):
     """构建 Veda override。成功返回 (override, bundle_info)；失败抛 RuntimeError（调用方回退 int8）。
 
@@ -290,4 +443,5 @@ def build_veda_override(args, unet, torch, log=print):
             "keep": keep or bundle.keep_ratio}
     log("[veda] override 就绪: %s" % getattr(
         override, "turing_utils_attention_implementation", "?"))
+    override = install_veda_probe(override, args, log=log)
     return override, info

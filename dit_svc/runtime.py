@@ -68,6 +68,36 @@ class Runtime:
               % (label, alloc, alloc - prev, reserved, free, total), flush=True)
         self._ledger_prev = alloc
 
+    def _dump_module_dtypes(self, unet):
+        """打印 DiT 每个带权模块的实际 dtype/量化标记 + 汇总。
+
+        用途：定位"哪些层没被 w4a8 接管、于是按 bf16 跑"——bt16 在 sm75 上没有
+        张量核，PyTorch 会退回 MAGMA 的 fp32 仿算（profile 里那只 236ms/kernel）。
+        """
+        from collections import Counter
+        try:
+            dm = unet.model.diffusion_model
+        except AttributeError:
+            print("[dtype] 拿不到 diffusion_model，跳过", flush=True)
+            return
+        summary = Counter()
+        rows = []
+        for name, mod in dm.named_modules():
+            w = getattr(mod, "weight", None)
+            if w is None or getattr(w, "ndim", 0) < 2:
+                continue
+            qf = getattr(mod, "quant_format", None) or "-"
+            summary[(str(getattr(w, "dtype", "?")), str(qf))] += 1
+            rows.append("  %-56s %-16s %-20s quant=%s"
+                        % (name, str(getattr(w, "dtype", "?")), tuple(getattr(w, "shape", ())), qf))
+        print("[dtype] DiT 带权模块 %d 个，按 (dtype, quant) 汇总：" % len(rows), flush=True)
+        for (dt, qf), n in sorted(summary.items(), key=lambda kv: -kv[1]):
+            print("[dtype]   %-16s quant=%-12s x%d" % (dt, qf, n), flush=True)
+        for line in rows[:240]:
+            print("[dtype]" + line, flush=True)
+        if len(rows) > 240:
+            print("[dtype]   …（只打前 240 行，共 %d）" % len(rows), flush=True)
+
     def _dit_sub_ledger(self, unet, torch):
         """DiT 内部分项（静态参数量，按顶层子模块分组；与动态 alloc 对照）。"""
         try:
@@ -148,6 +178,8 @@ class Runtime:
               % (time.perf_counter() - t0, torch.cuda.memory_allocated() / 1e9), flush=True)
         self._vram_ledger("DiT权重", torch)
         self._dit_sub_ledger(unet, torch)
+        if getattr(args, "dump_module_dtypes", False):
+            self._dump_module_dtypes(unet)
         self.attn_override = _install_attention(
             rt, attention, minimax_model, comfy_kitchen, args.attn,
             args=args, unet=unet)

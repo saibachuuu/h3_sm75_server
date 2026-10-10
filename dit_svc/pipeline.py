@@ -137,9 +137,10 @@ def _start_attn_profiler(job, params):
         return None
     try:
         from torch.profiler import ProfilerActivity, profile as _profile
-        prof = _profile(activities=[ProfilerActivity.CUDA], with_stack=True)
+        prof = _profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                        with_stack=True, record_shapes=True)
         prof.__enter__()
-        job.log.append("attn profiler: 已开（只覆盖第一个采样步，带 python 栈）")
+        job.log.append("attn profiler: 已开（第一个采样步；CPU+CUDA activity + python 栈 + 张量形状）")
         return prof
     except Exception as e:
         job.log.append("attn profiler 启动失败: %s: %s" % (type(e).__name__, e))
@@ -152,12 +153,14 @@ def _finish_attn_profiler(job, prof):
         return
     try:
         prof.__exit__(None, None, None)
-        rows = sorted(prof.key_averages(group_by_stack_n=4), key=lambda e: -_self_cuda_us(e))
+        rows = sorted(prof.key_averages(group_by_stack_n=6), key=lambda e: -_self_cuda_us(e))
         lines = ["attn profile（第一个采样步；按 self CUDA 排序，共 %d 种 kernel）" % len(rows)]
-        for e in rows[:14]:
-            lines.append("  %-54s %9.2f ms x%d"
-                         % (str(e.key)[:54], _self_cuda_us(e) / 1000.0, int(e.count)))
-            for frame in list(getattr(e, "stack", None) or [])[:3]:
+        for e in rows[:16]:
+            shapes = list(getattr(e, "input_shapes", None) or [])
+            shape_txt = "; ".join(str(s) for s in shapes[:2])[:100] if shapes else "-"
+            lines.append("  %-42s %9.2f ms x%-5d %s"
+                         % (str(e.key)[:42], _self_cuda_us(e) / 1000.0, int(e.count), shape_txt))
+            for frame in list(getattr(e, "stack", None) or [])[:4]:
                 lines.append("        @ %s" % str(frame).replace("\n", " ")[:150])
         job.cond_stats = job.cond_stats or {}
         job.cond_stats["attn_profile"] = "\n".join(lines)

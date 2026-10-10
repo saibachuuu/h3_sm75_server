@@ -10,6 +10,15 @@ WEBUI_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 MAX_BODY = 96 * 1024 * 1024
 
 
+def _veda_probe_snapshot():
+    """--veda-debug 的运行期探针（准入判定统计 / 稀疏真跑次数）。"""
+    try:
+        from dit_svc import veda_attn
+        return dict(veda_attn.VEDA_PROBE) or None
+    except Exception:
+        return None
+
+
 def make_handler(runtime, queue, ctx):
     out_dir = ctx["out_dir"]
 
@@ -130,6 +139,7 @@ def make_handler(runtime, queue, ctx):
                 "vram": vram,
                 "counts": snap["counts"],
                 "running": snap["running"],
+                "veda_probe": _veda_probe_snapshot(),
                 "server_uptime": round(__import__("time").time() - runtime.started_at, 1),
             }
 
