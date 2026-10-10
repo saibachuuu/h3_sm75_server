@@ -52,11 +52,16 @@ def main():
     ap.add_argument("--unet", default=DEFAULT_UNET)
     ap.add_argument("--video_vae", default=DEFAULT_VIDEO_VAE)
     ap.add_argument("--audio_vae", default=DEFAULT_AUDIO_VAE)
-    ap.add_argument("--attn", choices=["int8", "sage", "w8a8", "sdpa"], default="int8",
-                    help="服务级 attention 后端（int8=已验证默认；sage/w8a8=调试档）")
-    ap.add_argument("--w4a8_backend", choices=["turingutils", "cublas"], default="turingutils")
-    ap.add_argument("--mlp_chunk", type=int, default=8192)
-    ap.add_argument("--out-dir", default=os.path.join(HERE, "outputs"))
+    ap.add_argument("--attn", choices=["int8", "sage", "w8a8", "sdpa", "veda"], default="int8",
+                    help="服务级 attention 后端（int8=已验证默认；sage/w8a8=调试档；veda=dev 实验）")
+    ap.add_argument("--veda-bundle", default=None,
+                    help="Veda predictor bundle (.safetensors)，--attn veda 时必填")
+    ap.add_argument("--veda-precision", choices=["w8a8", "bf16"], default="w8a8",
+                    help="Veda 打分器精度（sm75 上 bf16 走 FP32 仿算，更贵）")
+    ap.add_argument("--veda-keep", type=float, default=0.0,
+                    help="Veda 保留率，0=用 bundle 训练默认值 (0,1]")
+    ap.add_argument("--veda-warmup", choices=["off", "probe", "tier1", "tier2", "tier3"],
+                    default="probe", help="Veda/sage 启动 warmup 负载分级（默认 probe 最小）")
     args = ap.parse_args()
 
     # argv 清干净，避免 comfy.cli_args 读到外部参数（embed_h3 同款卫生）

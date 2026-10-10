@@ -96,10 +96,10 @@ class Runtime:
         else:
             rt.unlock_cuda_w4a8_on_sm75()
 
-        # ---- attention 后端（默认 int8；sage/w8a8 为调试档） ----
-        self.set_stage("安装 attention 后端 (%s)" % args.attn)
-        self.attn_override = _install_attention(
-            rt, attention, minimax_model, comfy_kitchen, args.attn)
+        # ---- attention 后端（默认 int8；sage/w8a8 为调试档；veda=dev 实验） ----
+        # Veda 的 configure() 需要 model 对象（bundle 维度校验 + layout 安装），
+        # 故 attention 安装推迟到 DiT 加载后（原先在这里的调用已下移）。
+        self.attn_override = None
 
         # ---- 解码功率节流（PSU di/dt 保护，沿用 runner） ----
         rt.install_decode_power_limiter(tile_batch=1)
@@ -121,6 +121,10 @@ class Runtime:
         print("[load] DiT loaded in %.1fs, vram: %.2f GB"
               % (time.perf_counter() - t0, torch.cuda.memory_allocated() / 1e9), flush=True)
 
+        self.set_stage("安装 attention 后端 (%s)" % args.attn)
+        self.attn_override = _install_attention(
+            rt, attention, minimax_model, comfy_kitchen, args.attn,
+            args=args, unet=unet)
         if self.attn_override is not None:
             unet.model_options.setdefault("transformer_options", {})[
                 "optimized_attention_override"] = self.attn_override
@@ -211,8 +215,12 @@ class Runtime:
               % (torch.cuda.mem_get_info()[0] / 1e9), flush=True)
 
 
-def _install_attention(rt, attention, minimax_model, comfy_kitchen, attn_choice):
-    """移植 infer_h3_turing 的 attention 选择（不含 warmup）。返回 sage/w8a8 的 override。"""
+def _install_attention(rt, attention, minimax_model, comfy_kitchen, attn_choice,
+                       args=None, unet=None):
+    """移植 infer_h3_turing 的 attention 选择（不含 warmup）。返回 sage/w8a8/veda 的 override。
+
+    veda（dev 实验）失败一律回退 int8；sdpa/int8/sage/w8a8 行为与 master 一致。
+    """
     import torch
 
     capability = torch.cuda.get_device_capability(0)
@@ -222,6 +230,53 @@ def _install_attention(rt, attention, minimax_model, comfy_kitchen, attn_choice)
           % (capability, int8_ok), flush=True)
 
     override = None
+    if attn_choice == "veda":
+        # dev 实验：Veda 稀疏 attention。任何失败 → 回退 int8（安全默认），绝不带病跑。
+        try:
+            from dit_svc import veda_attn
+            override, veda_info = veda_attn.build_veda_override(
+                args, unet, torch=torch,
+                log=lambda s: print(s, flush=True))
+        except Exception as e:
+            import traceback
+            print("[veda] 初始化失败，回退 int8: %s: %s"
+                  % (type(e).__name__, e), flush=True)
+            traceback.print_exc()
+            override, veda_info = None, None
+        if override is None:
+            print("[veda] fallback: 走 int8 路径", flush=True)
+        else:
+            print("[veda] active: %s" % veda_info, flush=True)
+            # int8 作 fallback 落点（Veda 稠密回退/非 H3 调用时用）
+            if int8_ok:
+                attention.optimized_attention = rt._wrap_attn_mem_probe(
+                    attention.attention_comfy_kitchen_int8, "veda-dense")
+            else:
+                attention.optimized_attention = attention.attention_sub_quad
+                rt.install_tuned_sub_quad_chunking(attention)
+            minimax_model.optimized_attention = attention.optimized_attention
+            # 分级 warmup（默认 probe；tier3 全尺寸需显式指定）
+            warmup_level = getattr(args, "veda_warmup", "probe") or "probe"
+            fallback = (attention.attention_comfy_kitchen_int8 if int8_ok
+                        else attention.attention_sub_quad)
+
+            def _veda_probe_call(q, k, v, heads):
+                return override(fallback, q, k, v, heads, skip_reshape=True)
+            try:
+                veda_attn.run_tiered_warmup(
+                    torch, torch.device("cuda:0"), _veda_probe_call, "veda",
+                    warmup_level, log=lambda s: print(s, flush=True))
+            except Exception as e:
+                import traceback
+                print("[veda] warmup 失败，回退 int8: %s: %s"
+                      % (type(e).__name__, e), flush=True)
+                traceback.print_exc()
+                override = None
+            if override is None:
+                print("[veda] warmup fallback: 走 int8 路径", flush=True)
+            return override
+        # 回退到 int8：继续走下面的 int8 分支（override=None）
+
     if attn_choice == "sdpa":
         attention.optimized_attention = rt._wrap_attn_mem_probe(attention.attention_pytorch, "sdpa")
         minimax_model.optimized_attention = attention.optimized_attention
