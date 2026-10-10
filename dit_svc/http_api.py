@@ -200,6 +200,32 @@ def make_handler(runtime, queue, ctx):
             elif path == "/api/jobs/clear":
                 n = queue.clear_queued()
                 self._json({"ok": True, "dropped": n})
+            elif path == "/api/warmup":
+                # {tokens: int 16–40000} 或 {level: probe|tier1|tier2|tier3}；
+                # 进串行队列，结果轮询 /api/jobs/<id>（与视频任务同口径）。
+                payload = self._read_json_body()
+                if payload is None:
+                    self._json({"ok": False, "error": "请求体不是合法 JSON 或过大"}, 400)
+                    return
+                try:
+                    from dit_svc.job_queue import BusyError
+                    from dit_svc.veda_attn import WARMUP_TIERS
+                    tokens = payload.get("tokens")
+                    if tokens is None and payload.get("level"):
+                        tier = WARMUP_TIERS.get(payload.get("level"))
+                        if tier is None:
+                            raise ValueError("level 须为 probe|tier1|tier2|tier3")
+                        tokens = tier[0]
+                    if not isinstance(tokens, int) or not (16 <= tokens <= 40000):
+                        raise ValueError("tokens 须为 16–40000 的整数（或 level 挡位）")
+                    job = queue.submit_warmup(tokens)
+                    self._json({"ok": True, "job_id": job.id, "tokens": tokens}, 201)
+                except BusyError as e:
+                    self._json({"ok": False, "error": str(e)}, 409)
+                except ValueError as e:
+                    self._json({"ok": False, "error": str(e)}, 400)
+                except Exception as e:
+                    self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
             else:
                 self._json({"ok": False, "error": "not found"}, 404)
 

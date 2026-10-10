@@ -10,11 +10,11 @@ import uuid
 class BusyError(Exception):
     """服务未就绪（模型加载中/加载失败）。"""
 
-
 class Job:
-    def __init__(self, params):
+    def __init__(self, params, kind="video"):
         ts = time.strftime("%Y%m%d-%H%M%S")
         self.id = "%s-%s" % (ts, uuid.uuid4().hex[:4])
+        self.kind = kind  # video | warmup
         self.params = params
         self.status = "queued"      # queued | running | done | failed | cancelled
         self.stage = "排队中"
@@ -31,13 +31,15 @@ class Job:
     def public(self, with_log=False):
         d = {
             "id": self.id,
+            "kind": self.kind,
             "status": self.status,
             "stage": self.stage,
             "created": self.created,
             "started": self.started,
             "finished": self.finished,
             "elapsed": round((self.finished or time.time()) - (self.created or time.time()), 1),
-            "prompt": self.params.get("prompt", "")[:120],
+            "prompt": self.params.get("prompt", "")[:120] if self.kind == "video"
+                      else ("warmup n=%s" % self.params.get("tokens")),
             "seed": self.params.get("seed"),
             "mode": self.params.get("mode"),
             "length": self.params.get("length"),
@@ -87,6 +89,26 @@ class QueueManager:
         print("[queue] submitted %s seed=%d" % (job.id, params["seed"]), flush=True)
         return job
 
+    # ---------- warmup 提交（与视频任务同队列串行，互不抢显存） ----------
+    def submit_warmup(self, tokens):
+        if self.runtime.error:
+            raise BusyError("模型加载失败: %s" % self.runtime.error)
+        if not self.runtime.ready:
+            raise BusyError("模型加载中（%s，已 %.0f 秒），请稍后再提交"
+                            % (self.runtime.stage, self.runtime.stage_elapsed()))
+        if self.runtime.attn_override is None:
+            raise ValueError("当前 attention（%s）无 override 可测，warmup 仅支持 sage/w8a8/veda"
+                             % self.runtime.attn)
+        if not isinstance(tokens, int) or not (16 <= tokens <= 40000):
+            raise ValueError("tokens 须为 16–40000 的整数")
+        job = Job({"tokens": tokens}, kind="warmup")
+        job.stage = "warmup 排队中"
+        with self._cond:
+            self.jobs[job.id] = job
+            self.order.append(job.id)
+            self._cond.notify_all()
+        print("[queue] submitted warmup %s tokens=%d" % (job.id, tokens), flush=True)
+        return job
     def drop(self, job_id):
         with self._cond:
             job = self.jobs.get(job_id)
@@ -143,9 +165,12 @@ class QueueManager:
                     continue
                 job.status = "running"
                 job.started = time.time()
-            print("[queue] running %s" % job.id, flush=True)
+            print("[queue] running %s (%s)" % (job.id, job.kind), flush=True)
             try:
-                pipeline.run_job(job, self.ctx)
+                if job.kind == "warmup":
+                    self._run_warmup(job)
+                else:
+                    pipeline.run_job(job, self.ctx)
                 job.status = "done"
                 job.stage = "完成"
             except Exception as e:
@@ -158,3 +183,25 @@ class QueueManager:
                 print("[queue] job %s FAILED: %s" % (job.id, job.error), flush=True)
             finally:
                 job.finished = time.time()
+
+    # ---------- warmup 执行（队列内串行；用当前 override + fallback 落点） ----------
+    def _run_warmup(self, job):
+        from dit_svc import veda_attn
+        runtime = self.runtime
+        torch = runtime.torch
+        tokens = job.params["tokens"]
+        job.stage = "warmup 执行中（n=%d）" % tokens
+        override = runtime.attn_override
+        attention = runtime.attention
+        fallback = getattr(attention, "optimized_attention", None)
+        if fallback is None:
+            raise RuntimeError("无 fallback attention 可用")
+
+        def _call(q, k, v, heads):
+            return override(fallback, q, k, v, heads, skip_reshape=True)
+        result = veda_attn.run_single_warmup(
+            torch, runtime.device, _call, tokens,
+            log=lambda s: (job.log.append(s), print("[queue %s] %s" % (job.id, s), flush=True)))
+        job.timings["warmup"] = result["ms"]
+        job.cond_stats = {"warmup": result}
+        job.log.append("warmup 结果: %s" % result)

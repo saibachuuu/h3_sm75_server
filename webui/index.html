@@ -145,6 +145,32 @@
     <button class="ghost" id="clearBtn">清空排队中的任务</button>
   </section>
 
+  <!-- ============ 注意力自检（warmup：免重启指定负载） ============ -->
+  <section>
+    <h2>注意力自检</h2>
+    <div class="row">
+      <div>
+        <label>挡位（token 量；tier3 ≈ 全尺寸真任务量级）</label>
+        <select id="wuLevel">
+          <option value="probe">probe（256）</option>
+          <option value="tier1">tier1（2048）</option>
+          <option value="tier2">tier2（8192）</option>
+          <option value="tier3">tier3（24500，全尺寸）</option>
+          <option value="custom">自定义…</option>
+        </select>
+      </div>
+      <div>
+        <label>自定义 tokens（16–40000，仅自定义挡位有效）</label>
+        <input type="number" id="wuTokens" value="16384" min="16" max="40000">
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <button id="wuBtn">跑自检</button>
+      </div>
+    </div>
+    <p class="muted" id="wuResult">与生成任务同队列串行，结果进队列列表（含耗时/finite/显存）。仅 sage/w8a8/veda 生效。</p>
+  </section>
+
   <!-- ============ 成果画廊 ============ -->
   <section>
     <h2>生成结果</h2>
@@ -271,6 +297,26 @@ $("clearBtn").addEventListener("click", async () => {
   try { const r = await jpost("/api/jobs/clear", {});
         toast("已清空 " + r.dropped + " 个排队任务", true); poll(); }
   catch (e) { toast(e.message); }
+});
+
+$("wuBtn").addEventListener("click", async () => {
+  const lv = $("wuLevel").value;
+  const body = (lv === "custom")
+    ? { tokens: +$("wuTokens").value }
+    : { level: lv };
+  const btn = $("wuBtn");
+  btn.disabled = true;
+  try {
+    const r = await jpost("/api/warmup", body);
+    $("wuResult").textContent = "已提交自检 " + r.job_id + "（"
+      + r.tokens + " tokens），结果进队列列表…";
+    toast("自检已提交：" + r.job_id + "（" + r.tokens + " tokens）", true);
+    poll();
+  } catch (e) {
+    toast("自检提交失败：" + e.message);
+  } finally {
+    btn.disabled = false;
+  }
 });
 
 /* 取消按钮用事件委托：行元素稳定后只绑一次，重建也不丢 */
