@@ -52,6 +52,7 @@ def main():
                     help="本机 cond server（经 ssh -R 9310 -> 8189 的回调地址）")
     ap.add_argument("--unet", default=DEFAULT_UNET)
     ap.add_argument("--video_vae", default=DEFAULT_VIDEO_VAE)
+    ap.add_argument("--audio_vae", default=DEFAULT_AUDIO_VAE)
     ap.add_argument("--light-vae", action="store_true",
                     help="视频 VAE 用 LynnReal Light 版（decoder 26 层，省 ~0.7GB 权重）")
     ap.add_argument("--attn", choices=["int8", "sage", "w8a8", "sdpa", "veda"], default="int8",
