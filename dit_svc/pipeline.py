@@ -117,11 +117,17 @@ def _run_with_cond(job, ctx, cond_path):
         with torch.no_grad():
             z = runtime.vvae.encode(frame.unsqueeze(0).cuda().float())
         zl = z.to(device="cuda", dtype=compute_dtype)
+        with torch.no_grad():
+            zf = zl.float()
+            enc_probe = {"min": round(float(zf.min()), 4), "max": round(float(zf.max()), 4),
+                         "nan": int(torch.isnan(zf).sum()), "inf": int(torch.isinf(zf).sum())}
+            del zf
+        if enc_probe["nan"] or enc_probe["inf"]:
+            raise RuntimeError("参考帧[%d] VAE 编码输出含 NaN/Inf: %s" % (i, enc_probe))
         ref_latents.append((zl, int(zl.shape[3]), int(zl.shape[4])))
-        job.log.append("ref[%d] frame %s latent %s"
-                       % (i, tuple(frame.shape), tuple(zl.shape)))
+        job.log.append("ref[%d] frame %s latent %s probe=%s"
+                       % (i, tuple(frame.shape), tuple(zl.shape), enc_probe))
         del frame, z
-    encoded_latent = ref_latents[0][0]
     _stage(job, "vae_encode", t0)
     torch.cuda.empty_cache()
 
@@ -221,7 +227,14 @@ def _run_with_cond(job, ctx, cond_path):
         decoded = decoded.reshape(-1, *decoded.shape[-3:])
     if decoded.shape[0] > params["length"]:
         decoded = decoded[:params["length"]]
-    job.log.append("decoded video %s %s" % (tuple(decoded.shape), decoded.dtype))
+    with torch.no_grad():
+        df = decoded.float()
+        dec_probe = {"min": round(float(df.min()), 4), "max": round(float(df.max()), 4),
+                     "nan": int(torch.isnan(df).sum()), "inf": int(torch.isinf(df).sum())}
+        del df
+    job.log.append("decoded video %s %s probe=%s" % (tuple(decoded.shape), decoded.dtype, dec_probe))
+    if dec_probe["nan"] or dec_probe["inf"]:
+        raise RuntimeError("视频 VAE 解码输出含 NaN/Inf: %s" % dec_probe)
     _stage(job, "decode_video", t0)
 
     # ---------- 10. 音频解码（截到 length/24 秒） ----------

@@ -68,6 +68,22 @@ class Runtime:
               % (label, alloc, alloc - prev, reserved, free, total), flush=True)
         self._ledger_prev = alloc
 
+    def _dit_sub_ledger(self, unet, torch):
+        """DiT 内部分项（静态参数量，按顶层子模块分组；与动态 alloc 对照）。"""
+        try:
+            dm = unet.model.diffusion_model
+        except AttributeError:
+            return
+        rows = []
+        total = 0
+        for name, mod in dm.named_children():
+            n = sum(p.numel() * p.element_size() for p in mod.parameters())
+            rows.append((name, n / 1e9))
+            total += n
+        rows.sort(key=lambda r: -r[1])
+        print("[vram] DiT分项(静态%.2fGB): %s" % (
+            total / 1e9, " ".join("%s=%.2f" % r for r in rows[:12])), flush=True)
+
     # ---------- 后台加载 ----------
     def load(self):
         try:
@@ -131,7 +147,7 @@ class Runtime:
         print("[load] DiT loaded in %.1fs, vram: %.2f GB"
               % (time.perf_counter() - t0, torch.cuda.memory_allocated() / 1e9), flush=True)
         self._vram_ledger("DiT权重", torch)
-        self.set_stage("安装 attention 后端 (%s)" % args.attn)
+        self._dit_sub_ledger(unet, torch)
         self.attn_override = _install_attention(
             rt, attention, minimax_model, comfy_kitchen, args.attn,
             args=args, unet=unet)
@@ -188,6 +204,10 @@ class Runtime:
         torch.cuda.empty_cache()
         print("[load] audio VAE in %.1fs" % (time.perf_counter() - t0), flush=True)
         self._vram_ledger("音频VAE", torch)
+
+        # VAE 常驻（offload_device=cpu 只作兜底，不在任务间搬运）
+        vvae.patcher.offload_device = torch.device("cpu")
+        avae.patcher.offload_device = torch.device("cpu")
 
         # ---- 4. sigma shift（采样 guider 用） ----
         from comfy_extras.nodes_minimax_h3 import MiniMaxH3SigmaShift
