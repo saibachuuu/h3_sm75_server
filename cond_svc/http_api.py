@@ -4,8 +4,8 @@
   GET  /health          -> 编码器状态
   GET  /files/<name>    -> 下载缓存的 cond safetensors
   GET  /                -> 用法说明
-  POST /encode          -> JSON {prompt, image_b64, mode, width, height, ref_image_size}
-                           同步编码（首次 ~22s，缓存命中即时），返回 {hash, file, stats}
+  POST /encode          -> JSON {prompt, image_b64s[1-9]|image_b64(兼容), mode, width,
+                           height, ref_image_size}（ref2va 1–9 图，fl2va 仅单图）
 """
 import base64
 import binascii
@@ -108,20 +108,27 @@ def make_handler(service):
 
             try:
                 prompt = payload.get("prompt")
-                image_b64 = payload.get("image_b64")
-                if not isinstance(image_b64, str) or not image_b64:
-                    raise ValueError("缺少 image_b64")
+                b64s = payload.get("image_b64s")
+                if b64s is None:
+                    b64 = payload.get("image_b64")
+                    b64s = [b64] if isinstance(b64, str) and b64 else []
+                if (not isinstance(b64s, list) or not (1 <= len(b64s) <= 9)
+                        or not all(isinstance(s, str) and s for s in b64s)):
+                    raise ValueError("参考图须为 1–9 张（image_b64s；旧单图 image_b64 仍兼容）")
+                if payload.get("mode", DEFAULTS["mode"]) == "fl2va" and len(b64s) != 1:
+                    raise ValueError("fl2va 仅支持单图，多图请用 ref2va")
                 try:
-                    image_bytes = base64.b64decode(image_b64, validate=True)
+                    image_list = [base64.b64decode(s, validate=True) for s in b64s]
                 except (binascii.Error, ValueError):
                     raise ValueError("image_b64 不是合法 base64") from None
                 result = service.encode(
                     prompt=prompt,
-                    image_bytes=image_bytes,
+                    image_bytes=image_list[0],
                     mode=payload.get("mode", DEFAULTS["mode"]),
                     width=int(payload.get("width", DEFAULTS["width"])),
                     height=int(payload.get("height", DEFAULTS["height"])),
                     ref_image_size=payload.get("ref_image_size", DEFAULTS["ref_image_size"]),
+                    image_list=image_list,
                 )
                 result["ok"] = True
                 result["file"] = "/files/" + result["file"]

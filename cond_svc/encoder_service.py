@@ -65,11 +65,12 @@ class EncoderService:
             raise
 
     # ---------- 内容哈希缓存 ----------
-    def _cache_key(self, prompt, image_bytes, mode, width, height, ref_image_size):
+    def _cache_key(self, prompt, image_list, mode, width, height, ref_image_size):
         h = hashlib.sha256()
         h.update(prompt.encode("utf-8"))
-        h.update(b"\x00")
-        h.update(image_bytes)
+        for b in image_list:
+            h.update(b"\x00")
+            h.update(b)
         h.update(("\x00%s\x00%d\x00%d\x00%s" % (mode, width, height, ref_image_size)).encode())
         h.update(os.path.basename(self.model_path).encode("utf-8"))
         return h.hexdigest()
@@ -77,18 +78,34 @@ class EncoderService:
     def _cached_path(self, key):
         return os.path.join(self.cache_dir, key + ".safetensors")
 
+    @staticmethod
+    def _prep_frame(image_bytes, mode, width, height, ref_image_size, comfy_utils):
+        """单图解码 + 按 target_frame_size 缩放。返回 [1,H,W,3] float 0..1（GPU/CPU 由调用方定）。"""
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        arr = np.asarray(img).astype(np.float32) / 255.0
+        frame = torch.from_numpy(arr).unsqueeze(0)
+        raw_h, raw_w = int(frame.shape[1]), int(frame.shape[2])
+        tw, th = target_frame_size(mode, raw_w, raw_h, width, height, ref_image_size)
+        return _resize(frame[:1], tw, th, "disabled", comfy_utils)
+
     # ---------- 编码（同步；内部用 enc.lock 串行化 GPU 段） ----------
+    # ref2va 支持 1–9 张图（顺序即 <Picture i> 编号）；fl2va 仅单图（dit 侧已拦多图）。
     def encode(self, prompt, image_bytes, mode="ref2va", width=640, height=960,
-               ref_image_size="match"):
+               ref_image_size="match", image_list=None):
         if not self.ready:
             raise RuntimeError("编码器未就绪：%s" % (self.load_error or "加载中"))
         prompt = (prompt or "").strip()
         if not prompt:
             raise ValueError("prompt 不能为空")
-        if not image_bytes:
-            raise ValueError("缺少图像输入")
+        if image_list is None:
+            image_list = [image_bytes] if image_bytes else []
+        image_list = [b for b in image_list if b]
+        if not (1 <= len(image_list) <= 9):
+            raise ValueError("参考图须为 1–9 张")
+        if mode == "fl2va" and len(image_list) != 1:
+            raise ValueError("fl2va 仅支持单图，多图请用 ref2va")
 
-        key = self._cache_key(prompt, image_bytes, mode, width, height, ref_image_size)
+        key = self._cache_key(prompt, image_list, mode, width, height, ref_image_size)
         path = self._cached_path(key)
         with self._cache_lock:
             if os.path.isfile(path) and os.path.getsize(path) > 0:
@@ -99,18 +116,18 @@ class EncoderService:
         import comfy.utils as cu  # embed_server 已把 COMFY_DIR 加进 sys.path
 
         t_start = time.perf_counter()
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        arr = np.asarray(img).astype(np.float32) / 255.0
-        frame = torch.from_numpy(arr).unsqueeze(0)  # [1,H,W,3] float 0..1
-        raw_h, raw_w = int(frame.shape[1]), int(frame.shape[2])
-
-        # Qwen 输入尺寸（与 dit 侧 VAE 输入共用 target_frame_size，保持一致）
-        tw, th = target_frame_size(mode, raw_w, raw_h, width, height, ref_image_size)
-        frame_rz = _resize(frame[:1], tw, th, "disabled", cu)
+        qwen_sizes = []
         if mode == "fl2va":
+            frame_rz = self._prep_frame(image_list[0], mode, width, height,
+                                        ref_image_size, cu)
+            qwen_sizes.append([int(frame_rz.shape[1]), int(frame_rz.shape[2])])
             images_arg, ref_items = [frame_rz], None
-        else:  # ref2va
-            images_arg, ref_items = None, [{"type": "image", "data": frame_rz}]
+        else:  # ref2va：每图独立按策略缩放，顺序即 <Picture i>
+            ref_items, images_arg = [], None
+            for b in image_list:
+                rz = self._prep_frame(b, mode, width, height, ref_image_size, cu)
+                qwen_sizes.append([int(rz.shape[1]), int(rz.shape[2])])
+                ref_items.append({"type": "image", "data": rz})
 
         with self.enc.lock:
             if torch.cuda.is_available():
@@ -154,15 +171,15 @@ class EncoderService:
             "cached": False,
             "n_tokens": int(tensor.shape[1]),
             "cond_shape": list(tensor.shape),
+            "n_images": len(image_list),
             "encode_s": round(t_encode, 3),
             "total_s": round(time.perf_counter() - t_start, 3),
-            "image_hw": [raw_h, raw_w],
-            "qwen_hw": [th, tw],
+            "qwen_hw": qwen_sizes,
             "file_bytes": os.path.getsize(path),
         }
-        print("[cond] encoded %s tokens=%d mode=%s %.2fs -> %s"
-              % (key[:12], stats["n_tokens"], mode, t_encode, os.path.basename(path)),
-              flush=True)
+        print("[cond] encoded %s tokens=%d images=%d mode=%s %.2fs -> %s"
+              % (key[:12], stats["n_tokens"], len(image_list), mode, t_encode,
+                 os.path.basename(path)), flush=True)
         return {"hash": key, "file": os.path.basename(path), "cached": False, "stats": stats}
 
     def health(self):

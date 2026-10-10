@@ -40,8 +40,6 @@
   button.ghost { background:transparent; color:var(--dim); border:1px solid var(--line);
                  padding:4px 10px; font-weight:400; font-size:12px; }
   button.ghost:hover { color:var(--fg); border-color:var(--acc); }
-  #imgPreview { max-width:170px; max-height:170px; border-radius:6px; border:1px solid var(--line);
-                display:none; margin-top:6px; }
   .job { display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:7px;
          background:var(--panel2); border:1px solid var(--line); margin-bottom:7px; font-size:13px; }
   .job .id { color:var(--dim); min-width:170px; }
@@ -91,9 +89,9 @@
 
     <div class="row">
       <div>
-        <label>参考图 *（ref2va / fl2va 均需）</label>
-        <input type="file" id="image" accept="image/*">
-        <img id="imgPreview" alt="">
+        <label>参考图 *（ref2va 1–9 张，fl2va 仅 1 张）</label>
+        <input type="file" id="image" accept="image/*" multiple>
+        <div id="imgStrip" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px"></div>
       </div>
       <div>
         <label>模式</label>
@@ -158,7 +156,8 @@
 
 <script>
 const $ = id => document.getElementById(id);
-let imageB64 = null, imageName = "";
+let imageList = []; // [{name, b64}]，顺序即 <Picture i>；fl2va 只取第 1 张
+const IMG_MAX = 9;
 const STATUS_TXT = { queued:"排队中", running:"生成中", done:"完成", failed:"失败", cancelled:"已取消" };
 
 /* ========== 渲染状态：轮询只做原地更新，绝不整块重建 ========== */
@@ -200,16 +199,23 @@ async function loadDefaults() {
 }
 
 $("image").addEventListener("change", () => {
-  const f = $("image").files[0];
-  if (!f) { imageB64 = null; $("imgPreview").style.display = "none"; return; }
-  imageName = f.name;
-  const rd = new FileReader();
-  rd.onload = () => {
-    imageB64 = String(rd.result).split(",")[1];
-    $("imgPreview").src = rd.result;
-    $("imgPreview").style.display = "block";
-  };
-  rd.readAsDataURL(f);
+  const files = Array.from($("image").files || []).slice(0, IMG_MAX);
+  const strip = $("imgStrip");
+  strip.innerHTML = "";
+  imageList = [];
+  if (!files.length) return;
+  files.forEach((f, i) => {
+    const rd = new FileReader();
+    rd.onload = () => {
+      const url = String(rd.result);
+      imageList[i] = { name: f.name, b64: url.split(",")[1] };
+      const im = document.createElement("img");
+      im.src = url; im.title = (i + 1) + ". " + f.name;
+      im.style.cssText = "width:64px;height:64px;object-fit:cover;border-radius:6px;border:1px solid var(--line)";
+      strip.appendChild(im);
+    };
+    rd.readAsDataURL(f);
+  });
 });
 
 /* ---------- 帧数 → 秒数预览（24fps，1 位小数；越界警告并拦截提交） ---------- */
@@ -232,11 +238,16 @@ refreshLen();
 $("submitBtn").addEventListener("click", async () => {
   const prompt = $("prompt").value.trim();
   if (!prompt) return toast("提示词不能为空");
-  if (!imageB64) return toast("请先选择参考图");
+  const mode = $("mode").value;
+  const picked = imageList.filter(Boolean);
+  if (!picked.length) return toast("请先选择参考图");
+  if (picked.length > IMG_MAX) return toast("参考图最多 " + IMG_MAX + " 张");
+  if (mode === "fl2va" && picked.length !== 1)
+    return toast("fl2va 仅支持 1 张图，多图请切 ref2va");
   if (!refreshLen()) return toast("帧数仅支持 " + LEN_MIN + "–" + LEN_MAX + "（当前输入越界）");
   const payload = {
-    prompt, image_b64: imageB64, image_name: imageName,
-    mode: $("mode").value, ref_image_size: $("ref_image_size").value,
+    prompt, image_b64s: picked.map(p => p.b64), image_name: picked[0].name,
+    mode, ref_image_size: $("ref_image_size").value,
     width: +$("width").value, height: +$("height").value, length: +$("length").value,
     steps: +$("steps").value, sampler: $("sampler").value, scheduler: $("scheduler").value,
     seed: +$("seed").value, refine_steps: +$("refine_steps").value,

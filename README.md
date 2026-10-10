@@ -44,6 +44,8 @@ ssh -N -p <port> -L 8190:127.0.0.1:8190 -R 9310:127.0.0.1:8189 sheepserver@<host
 
 - 提示词 + 参考图必填；默认参数即已验收的单 pass 基线（res_multistep/simple、4 步、
   640×960、124 帧、refine_steps=0）；seed 填 -1 随机；
+- 参考图：**ref2va 1–9 张**（顺序即 `<Picture i>` 编号），fl2va 仅 1 张；
+  每图独立缩放 + 逐张 VAE 编码 → `minimax_refs` 多块（参考 token 每步参与，多图更慢）；
 - 队列串行执行（单 GPU），排队中的任务可取消；
 - 画廊直接播放/下载 mp4，"参数"链接是同名 JSON sidecar；
 - 页头芯片诊断：`服务失联`=②没跑、`cond: 隧道不通`=③没开、`cond: 加载中`=等 ①。

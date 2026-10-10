@@ -69,9 +69,14 @@ def validate_job(payload: dict):
         return None, "prompt 不能为空"
     prompt = prompt.strip()
 
-    image_b64 = payload.get("image_b64")
-    if not isinstance(image_b64, str) or not image_b64:
-        return None, "缺少参考图 image_b64（ref2va/fl2va 均需要图像输入）"
+    image_b64s = payload.get("image_b64s")
+    if image_b64s is None:
+        # 兼容旧单图客户端
+        image_b64 = payload.get("image_b64")
+        image_b64s = [image_b64] if isinstance(image_b64, str) and image_b64 else []
+    if (not isinstance(image_b64s, list) or not (1 <= len(image_b64s) <= 9)
+            or not all(isinstance(s, str) and s for s in image_b64s)):
+        return None, "参考图 image_b64s 须为 1–9 张 base64 字符串（旧单图 image_b64 仍兼容）"
 
     def _int(key, lo, hi):
         v = payload.get(key, DEFAULTS.get(key))
@@ -83,13 +88,18 @@ def validate_job(payload: dict):
             return None, f"{key} 超出范围 [{lo}, {hi}]"
         return v, None
 
-    out = {"prompt": prompt, "image_b64": image_b64,
+    out = {"prompt": prompt, "image_b64s": image_b64s,
+           # 首图兼容：dit 本地解码 / sidecar 沿用旧字段名
+           "image_b64": image_b64s[0],
            "image_name": str(payload.get("image_name") or "ref.png")[:200]}
 
     mode = payload.get("mode", DEFAULTS["mode"])
     if mode not in ("ref2va", "fl2va"):
         return None, "mode 只能是 ref2va 或 fl2va"
     out["mode"] = mode
+    if mode == "fl2va" and len(image_b64s) != 1:
+        return None, "fl2va 仅支持单图，多图请用 ref2va"
+
 
     ref_size = payload.get("ref_image_size", DEFAULTS["ref_image_size"])
     if ref_size not in ("match", "max"):

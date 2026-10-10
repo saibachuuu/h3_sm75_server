@@ -48,7 +48,7 @@ def run_job(job, ctx):
     t0 = time.perf_counter()
     cond_bytes, cstats = cond_client.fetch(ctx["cond_url"], {
         "prompt": params["prompt"],
-        "image_b64": params["image_b64"],
+        "image_b64s": params.get("image_b64s") or [params["image_b64"]],
         "mode": params["mode"],
         "width": params["width"],
         "height": params["height"],
@@ -106,29 +106,31 @@ def _run_with_cond(job, ctx, cond_path):
     del cond_tensor
     torch.cuda.empty_cache()
 
-    # ---------- 4. 参考帧：本地解码 image_b64 + 缩放 + VAE 编码 ----------
+    # ---------- 4. 参考帧：本地解码 image_b64s + 缩放 + 逐张 VAE 编码 ----------
+    # ref2va 1–9 张 → minimax_refs 多块（顺序即 <Picture i>）；fl2va 仅单图 → keyframes。
     job.stage = "vae_encode"
     t0 = time.perf_counter()
-    frame = _decode_ref_frame(params, t0)  # CPU [H,W,3] float 0..1，已缩到目标尺寸
-    with torch.no_grad():
-        z = runtime.vvae.encode(frame.unsqueeze(0).cuda().float())
-    encoded_latent = z.to(device="cuda", dtype=compute_dtype)
-    job.log.append("ref frame %s latent %s"
-                   % (tuple(frame.shape), tuple(encoded_latent.shape)))
+    b64s = params.get("image_b64s") or [params["image_b64"]]
+    ref_latents = []  # [(latent, latent_h, latent_w)]
+    for i, b64 in enumerate(b64s):
+        frame = _decode_ref_frame(params, b64)  # CPU [H,W,3] float 0..1，已缩到目标尺寸
+        with torch.no_grad():
+            z = runtime.vvae.encode(frame.unsqueeze(0).cuda().float())
+        zl = z.to(device="cuda", dtype=compute_dtype)
+        ref_latents.append((zl, int(zl.shape[3]), int(zl.shape[4])))
+        job.log.append("ref[%d] frame %s latent %s"
+                       % (i, tuple(frame.shape), tuple(zl.shape)))
+        del frame, z
+    encoded_latent = ref_latents[0][0]
     _stage(job, "vae_encode", t0)
-    del frame, z
     torch.cuda.empty_cache()
 
     # ---------- 5. 组装 positive（区分 ref2va / fl2va） ----------
     job.stage = "build_cond"
     if params["mode"] == "ref2va":
-        ref_block = {
-            "kind": "image",
-            "latent_h": encoded_latent.shape[3],
-            "latent_w": encoded_latent.shape[4],
-            "latent": encoded_latent,
-        }
-        values = {"minimax_token_tags": tags, "minimax_refs": [ref_block]}
+        values = {"minimax_token_tags": tags,
+                  "minimax_refs": [{"kind": "image", "latent_h": lh, "latent_w": lw,
+                                    "latent": zl} for zl, lh, lw in ref_latents]}
     else:
         values = {"minimax_token_tags": tags,
                   "minimax_keyframes": [{"resolved_frame_index": 0, "latent": encoded_latent}]}
@@ -183,8 +185,7 @@ def _run_with_cond(job, ctx, cond_path):
     else:
         out2 = out1
     _stage(job, "sample", t0)
-    del out1, latent, positive, refined, tags, encoded_latent
-    torch.cuda.empty_cache()
+    del out1, latent, positive, refined, tags, encoded_latent, ref_latents
 
     # ---------- 7. 归因探针：latent 坏了就直接失败，不解码 ----------
     job.stage = "probe"
@@ -281,8 +282,7 @@ def _run_with_cond(job, ctx, cond_path):
     # ---------- 12. 参数 sidecar（画廊“参数”链接指向它） ----------
     sidecar = {
         "job_id": job.id,
-        "created": job.created,
-        "params": {k: v for k, v in params.items() if k != "image_b64"},
+        "params": {k: v for k, v in params.items() if k not in ("image_b64", "image_b64s")},
         "cond_stats": job.cond_stats,
         "latent_probe": job.latent_probe,
         "timings": job.timings,
@@ -298,8 +298,8 @@ def _run_with_cond(job, ctx, cond_path):
     rt.log_memory("job done")
 
 
-def _decode_ref_frame(params, t0):
-    """从任务 image_b64 本地解码参考帧：PIL 解码 → 目标尺寸缩放 → CPU float 张量。
+def _decode_ref_frame(params, image_b64):
+    """从单张 image_b64 本地解码参考帧：PIL 解码 → 目标尺寸缩放 → CPU float 张量。
 
     目标尺寸与 cond 侧 Qwen 输入共用 target_frame_size（两侧一致）；缩放用
     comfy.common_upscale lanczos（与 cond 侧 _resize 相同）。返回 [H,W,3] float 0..1。
@@ -309,7 +309,7 @@ def _decode_ref_frame(params, t0):
     from PIL import Image
 
     try:
-        image_bytes = base64.b64decode(params["image_b64"], validate=True)
+        image_bytes = base64.b64decode(image_b64, validate=True)
     except (binascii.Error, ValueError):
         raise ValueError("image_b64 不是合法 base64") from None
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
