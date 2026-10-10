@@ -166,7 +166,8 @@ def make_handler(runtime, queue, ctx):
                     return
                 p = os.path.join(out_dir, name)
                 ctype = ("video/mp4" if name.endswith(".mp4")
-                         else "application/json" if name.endswith(".json") else None)
+                         else "application/json" if name.endswith(".json")
+                         else "image/png" if name.endswith(".png") else None)
                 self._file(p, ctype)
             else:
                 self._json({"ok": False, "error": "not found"}, 404)
@@ -201,6 +202,24 @@ def make_handler(runtime, queue, ctx):
                 try:
                     from dit_svc.job_queue import BusyError
                     job = queue.submit_cond(payload)
+                    self._json({"ok": True, "job_id": job.id}, 201)
+                except BusyError as e:
+                    self._json({"ok": False, "error": str(e)}, 409)
+                except ValueError as e:
+                    self._json({"ok": False, "error": str(e)}, 400)
+                except Exception as e:
+                    self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
+            elif path == "/api/vae_probe":
+                # 只跑视频 VAE 编解码（不进 DiT、不采样）：
+                # {image_b64?, decode?:bool, latent?:noise|zeros, write_mp4?, write_png?,
+                #  mode?, ref_image_size?, width, height, length, fps?, seed?}
+                payload = self._read_json_body()
+                if payload is None:
+                    self._json({"ok": False, "error": "请求体不是合法 JSON 或过大"}, 400)
+                    return
+                try:
+                    from dit_svc.job_queue import BusyError
+                    job = queue.submit_vae_probe(payload)
                     self._json({"ok": True, "job_id": job.id}, 201)
                 except BusyError as e:
                     self._json({"ok": False, "error": str(e)}, 409)

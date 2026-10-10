@@ -14,7 +14,7 @@ class Job:
     def __init__(self, params, kind="video"):
         ts = time.strftime("%Y%m%d-%H%M%S")
         self.id = "%s-%s" % (ts, uuid.uuid4().hex[:4])
-        self.kind = kind  # video | warmup
+        self.kind = kind  # video | warmup | vae_probe
         self.params = params
         self.status = "queued"      # queued | running | done | failed | cancelled
         self.stage = "排队中"
@@ -28,6 +28,14 @@ class Job:
         self.cond_source = None      # 直接喂 cond（/api/jobs/cond）时：{"kind","bytes"/"path","size"}
         self.latent_probe = None
         self.mp4 = None
+        self.files = {}              # 额外产物（如 vae_probe 的 PNG）：名字 -> /outputs/<file>
+
+    def _label(self):
+        """任务列表里显示的一行标签（三种 kind 各有来源）。"""
+        if self.kind == "warmup":
+            return "warmup n=%s" % self.params.get("tokens")
+        return (self.params.get("prompt") or self.params.get("cond_label")
+                or self.params.get("label") or "")[:120]
 
     def public(self, with_log=False):
         d = {
@@ -39,14 +47,14 @@ class Job:
             "started": self.started,
             "finished": self.finished,
             "elapsed": round((self.finished or time.time()) - (self.created or time.time()), 1),
-            "prompt": (self.params.get("prompt") or self.params.get("cond_label") or "")[:120]
-                      if self.kind == "video" else ("warmup n=%s" % self.params.get("tokens")),
+            "prompt": self._label(),
             "seed": self.params.get("seed"),
             "mode": self.params.get("mode"),
             "length": self.params.get("length"),
             "steps": self.params.get("steps"),
             "mp4": self.mp4,
             "output_url": ("/outputs/" + self.mp4) if self.mp4 else None,
+            "files": self.files or None,
             "error": self.error,
             "timings": self.timings,
             "cond_stats": self.cond_stats,
@@ -114,6 +122,27 @@ class QueueManager:
         print("[queue] submitted %s (直接喂 cond: %s, %d 图, %d bytes) seed=%d"
               % (job.id, params["cond_label"], len(params["image_b64s"]),
                  cond["size"], params["seed"]), flush=True)
+        return job
+
+    # ---------- VAE 编解码探针（不进 DiT/采样；把编解码段从采样里剥出来单测） ----------
+    def submit_vae_probe(self, payload):
+        from common.protocol import validate_vae_probe
+
+        self._require_ready()
+        params, err = validate_vae_probe(payload)
+        if err:
+            raise ValueError(err)
+        if params["seed"] is None or params["seed"] < 0:
+            params["seed"] = random.randint(0, 2 ** 63 - 1)
+        job = Job(params, kind="vae_probe")
+        job.stage = "vae 探针排队中"
+        with self._cond:
+            self.jobs[job.id] = job
+            self.order.append(job.id)
+            self._cond.notify_all()
+        print("[queue] submitted %s (vae_probe: encode=%s decode=%s latent=%s)"
+              % (job.id, "image_b64" in params, params.get("decode"), params.get("latent")),
+              flush=True)
         return job
 
     # ---------- warmup 提交（与视频任务同队列串行，互不抢显存） ----------
@@ -194,6 +223,9 @@ class QueueManager:
             try:
                 if job.kind == "warmup":
                     self._run_warmup(job)
+                elif job.kind == "vae_probe":
+                    from dit_svc import vae_probe
+                    vae_probe.run_vae_probe(job, self.ctx)
                 else:
                     pipeline.run_job(job, self.ctx)
                 job.status = "done"

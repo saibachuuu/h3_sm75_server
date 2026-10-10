@@ -79,8 +79,12 @@ POST /api/jobs/cond                  直接喂 cond（不回调 cond server，�
                                      mode, width, height, length, steps, sampler,
                                      scheduler, seed, refine_steps, refine_denoise,
                                      ref_image_size, sigmas?, prompt?} -> {job_id}
+POST /api/vae_probe                   只跑视频 VAE 编解码（不进 DiT、不采样）：
+                                     JSON {image_b64?, decode?=true, latent?, write_mp4?,
+                                     write_png?, mode?, ref_image_size?, width,
+                                     height, length, fps?, seed?} -> {job_id}
 POST /api/jobs/drop {id}             取消排队任务
-GET  /outputs/<id>.mp4|.json         成果（支持 Range）
+GET  /outputs/<id>.mp4|.json|.png    成果（支持 Range）
 ```
 
 ### POST /api/jobs/cond（直接喂 cond）
@@ -120,6 +124,40 @@ curl -X POST http://127.0.0.1:8190/api/jobs/cond -H "Content-Type: application/j
 
 cond server：`GET /health`、`POST /encode`、`GET /files/<hash>.safetensors`。
 
+### POST /api/vae_probe（只跑 VAE 编解码）
+
+把"编解码段"从 220s 级采样里剥出来单测（走同一条串行队列，不建 positive、不进
+sampler）。三个探针，按给的字段自动选：
+
+| 探针 | 触发 | 产出 |
+|---|---|---|
+| encode | 给 `image_b64` | 参考帧目标尺寸缩放 → `vvae.encode` → latent 形状/分布/NaN 探针 + 秒数 |
+| round-trip | `image_b64` + `write_png=true` | latent 解回像素 → MAE / PSNR / max\|diff\| + `<id>.source.png` 与 `<id>.roundtrip.png` |
+| decode | `decode=true`（默认） | 按 `width/height/length` 造生产同几何 latent（`latent=noise` seed 随机 / `zeros`）→ 整段解码 → 逐帧探针 + 峰值显存 + 可选 `<id>.mp4` |
+
+结果写进 `cond_stats.vae_probe`、日志与 `<id>.json`；PNG 走 `/outputs/<id>.source.png`
+与 `/outputs/<id>.roundtrip.png`。**Light VAE vs 官方 VAE 的 A/B**：分别用
+`--light-vae` / 不加启动服务，各发一次同样的 probe，比 `vae.file` +
+`vae.decoder_layers`（26 vs 36）+ `roundtrip.psnr_db` + 两张 PNG 目视。
+
+```bash
+# 只测解码（124 帧 / 640×960，light VAE 出图 mp4）
+curl -X POST http://127.0.0.1:8190/api/vae_probe -H "Content-Type: application/json" \
+  -d '{"decode":true,"latent":"noise","width":640,"height":960,"length":124,"seed":12345}'
+
+# 参考图 encode + round-trip（出两张 PNG 与 PSNR）
+python - <<'PY'
+import base64, json, urllib.request
+b = base64.b64encode(open("ref2va_input.png","rb").read()).decode()
+body = {"image_b64": b, "mode":"ref2va", "ref_image_size":"match",
+        "decode": False, "write_mp4": False, "write_png": True}
+req = urllib.request.Request("http://127.0.0.1:8190/api/vae_probe",
+                             data=json.dumps(body).encode(),
+                             headers={"Content-Type": "application/json"})
+print(urllib.request.urlopen(req, timeout=120).read().decode())
+PY
+```
+
 ## 设计要点
 
 - **模型常驻**：DiT + 双 VAE + token_refiner 均不卸载（refiner 二次 refine 0.01s）；
@@ -133,6 +171,9 @@ cond server：`GET /health`、`POST /encode`、`GET /files/<hash>.safetensors`�
   —— 隧道不通也能出片；该入口参考图可选，没图就不建 ref/keyframe 块。
 - **无 warmup 逻辑**：DiT warmup 已被实测证伪（崩溃跟随全尺寸计算，与"第一次"无关）。
 - **ffmpeg 直出 mp4**：rawvideo 管进 + 临时 wav 管进，h264+AAC，mux 完删临时文件。
+- **VAE 探针**：`/api/vae_probe` 单跑 encode / round-trip / decode（同队列、同 `_frame_probe`
+  口径、解码前同样把 DiT 从加载表摘出），排查解码段与 Light vs 官方 A/B 不必等采样；
+  解码探针用生产同几何 latent，出 mp4 与峰值显存。
 - **latent 探针**：采样输出含 NaN/Inf 直接判失败，不送解码。
 - 依赖 h3-runner 的 `infer_h3_turing.py` / `h3_mlp_chunk.py` 作为库（不修改 runner）。
 

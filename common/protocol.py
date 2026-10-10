@@ -65,6 +65,88 @@ def dumps(obj) -> bytes:
     return json.dumps(obj, ensure_ascii=False).encode("utf-8")
 
 
+def _bool_param(payload, key, default):
+    """宽松布尔：bool / 0,1 / "true|false|yes|no|on|off"。返回 (值, 错误)。"""
+    v = payload.get(key, default)
+    if isinstance(v, bool):
+        return v, None
+    if isinstance(v, int) and v in (0, 1):
+        return bool(v), None
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return True, None
+        if s in ("false", "0", "no", "off"):
+            return False, None
+    return None, "%s 必须是布尔值（true/false）" % key
+
+
+def validate_vae_probe(payload: dict):
+    """校验 POST /api/vae_probe（只跑视频 VAE 编解码，不进 DiT、不采样）。
+
+    两个探针至少选一个：
+      image_b64  给了就做编码探针（+ round-trip 重建对比与 PNG，write_png 控制）
+      decode     true（默认）就按 width/height/length 造 latent 做整段解码探针
+    返回 (cleaned_params, None) 或 (None, 错误信息)。
+    """
+    if not isinstance(payload, dict):
+        return None, "请求体必须是 JSON 对象"
+
+    out = {"label": "vae_probe"}
+    img = payload.get("image_b64")
+    if img is not None:
+        if not isinstance(img, str) or not img.strip():
+            return None, "image_b64 必须是非空 base64 字符串"
+        out["image_b64"] = img.strip()
+        out["image_name"] = str(payload.get("image_name") or "probe.png")[:200]
+
+    mode = payload.get("mode", DEFAULTS["mode"])
+    if mode not in ("ref2va", "fl2va"):
+        return None, "mode 只能是 ref2va 或 fl2va"
+    out["mode"] = mode
+
+    ref_size = payload.get("ref_image_size", DEFAULTS["ref_image_size"])
+    if ref_size not in ("match", "max"):
+        return None, "ref_image_size 只能是 match 或 max"
+    out["ref_image_size"] = ref_size
+
+    def _int(key, lo, hi, default):
+        v = payload.get(key, default)
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            return None, "%s 必须是整数" % key
+        if not (lo <= v <= hi):
+            return None, "%s 超出范围 [%d, %d]" % (key, lo, hi)
+        return v, None
+
+    for key, lo, hi in (("width", 256, 1600), ("height", 256, 1600),
+                        ("length", 16, 400), ("fps", 1, 60)):
+        v, err = _int(key, lo, hi, DEFAULTS.get(key))
+        if err:
+            return None, err
+        out[key] = v
+    v, err = _int("seed", -1, 2 ** 63 - 1, DEFAULTS["seed"])
+    if err:
+        return None, err
+    out["seed"] = v
+    if out["width"] % 32 or out["height"] % 32:
+        return None, "width / height 必须是 32 的倍数"
+
+    latent = payload.get("latent", "noise")
+    if latent not in ("noise", "zeros"):
+        return None, "latent 只能是 noise（seed 随机）或 zeros"
+    out["latent"] = latent
+
+    for key in ("decode", "write_mp4", "write_png"):
+        v, err = _bool_param(payload, key, True)
+        if err:
+            return None, err
+        out[key] = v
+    if not out["decode"] and "image_b64" not in out:
+        return None, "至少要给 image_b64（编码探针）或 decode=true（解码探针）"
+    return out, None
+
 def _image_payloads(payload, mode, min_count, max_count):
     """取参考图 base64 列表（image_b64s，兼容旧单图 image_b64）。返回 (list, 错误)。"""
     b64s = payload.get("image_b64s")

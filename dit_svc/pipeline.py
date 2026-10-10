@@ -82,6 +82,36 @@ def run_job(job, ctx):
             pass
 
 
+def _unhook_dit(runtime, mm, torch):
+    """把 DiT 的 wrapper 从 comfy 加载表摘出（与 runner 同款技巧）：防止 VAE
+    编解码时 comfy 自动把 DiT 挪去 CPU 触发 is_dead NoneType 问题。
+    **不 del** unet —— 服务器要跨任务常驻复用。"""
+    for loaded in list(mm.current_loaded_models):
+        if loaded.model is runtime.unet or loaded.model is runtime.model_shifted:
+            mm.current_loaded_models.remove(loaded)
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def _frame_probe(torch, frames):
+    """逐帧统计 min/max/nan/inf（frames 为 [T,H,W,C] 或 [T,...]）。
+
+    整块 frames.float() 是 124×960×640×3 fp32 ≈ 0.91GB，再加 isnan/isinf 的 bool
+    中间量就能把解码后的余量吃光（10/11 真任务实测 OOM）；逐帧只多一帧的临时量
+    （≈7MB），统计口径与整块一致。vae_probe 复用同一口径。
+    """
+    vmin, vmax, vnan, vinf = float("inf"), float("-inf"), 0, 0
+    with torch.no_grad():
+        for i in range(frames.shape[0]):
+            f = frames[i].float()
+            vmin = min(vmin, float(f.min()))
+            vmax = max(vmax, float(f.max()))
+            vnan += int(torch.isnan(f).sum())
+            vinf += int(torch.isinf(f).sum())
+            del f
+    return {"min": round(vmin, 4), "max": round(vmax, 4), "nan": vnan, "inf": vinf}
+
+
 def _load_direct_cond(job):
     """直接喂 cond（POST /api/jobs/cond）：内联 base64 或 dit 机器上已有的文件。
 
@@ -235,13 +265,7 @@ def _run_with_cond(job, ctx, cond_path):
         raise RuntimeError("采样输出含 NaN/Inf，拒绝送入解码: %s" % probe)
 
     # ---------- 8. comfy 模型簿记：把 DiT 的 wrapper 摘出加载表 ----------
-    #（与 runner 相同的技巧：防止 VAE 解码时 comfy 自动把 DiT 挪去 CPU 触发
-    #  is_dead NoneType 问题；**不 del** unet —— 服务器要跨任务常驻复用）
-    for loaded in list(mm.current_loaded_models):
-        if loaded.model is runtime.unet or loaded.model is runtime.model_shifted:
-            mm.current_loaded_models.remove(loaded)
-    gc.collect()
-    torch.cuda.empty_cache()
+    _unhook_dit(runtime, mm, torch)
     rt.log_memory("job post-sample")
 
     # ---------- 9. 视频解码（DiT 权重常驻，基线已证安全） ----------
@@ -254,19 +278,8 @@ def _run_with_cond(job, ctx, cond_path):
         decoded = decoded.reshape(-1, *decoded.shape[-3:])
     if decoded.shape[0] > params["length"]:
         decoded = decoded[:params["length"]]
-    # 逐帧探针：整块 decoded.float() 是 124×960×640×3 fp32 ≈ 0.91GB，再加
-    # isnan/isinf 的 bool 中间量就能把解码后的余量吃光（10/11 真任务实测 OOM）；
-    # 逐帧只多一帧的临时量（≈7MB），统计口径与整块一致。
-    vmin, vmax, vnan, vinf = float("inf"), float("-inf"), 0, 0
-    with torch.no_grad():
-        for i in range(decoded.shape[0]):
-            f = decoded[i].float()
-            vmin = min(vmin, float(f.min()))
-            vmax = max(vmax, float(f.max()))
-            vnan += int(torch.isnan(f).sum())
-            vinf += int(torch.isinf(f).sum())
-            del f
-    dec_probe = {"min": round(vmin, 4), "max": round(vmax, 4), "nan": vnan, "inf": vinf}
+    # 逐帧探针（口径与 vae_probe 一致；整块 fp32 探针会在 124 帧上 OOM）
+    dec_probe = _frame_probe(torch, decoded)
     job.log.append("decoded video %s %s probe=%s" % (tuple(decoded.shape), decoded.dtype, dec_probe))
     if dec_probe["nan"] or dec_probe["inf"]:
         raise RuntimeError("视频 VAE 解码输出含 NaN/Inf: %s" % dec_probe)
