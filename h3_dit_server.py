@@ -63,6 +63,7 @@ def main():
                     help="Veda 保留率，0=用 bundle 训练默认值 (0,1]")
     ap.add_argument("--veda-warmup", choices=["off", "probe", "tier1", "tier2", "tier3"],
                     default="probe", help="Veda/sage 启动 warmup 负载分级（默认 probe 最小）")
+    ap.add_argument("--out-dir", default=os.path.join(HERE, "outputs"))
     args = ap.parse_args()
 
     # argv 清干净，避免 comfy.cli_args 读到外部参数（embed_h3 同款卫生）
