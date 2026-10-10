@@ -127,41 +127,190 @@ def _self_cuda_us(entry):
     return 0.0
 
 
-def _start_attn_profiler(job, params):
-    """profile_attn=true：对**第一个采样步**开 CUDA profiler（带 python 调用栈）。
+class _AttnWindowProfiler:
+    """只对前 `calls` 次**注意力调用**开 profiler（窗口 = 几次调用，不是整步）。
 
-    只覆盖第一步，避免整单被 profiler 拖慢；栈信息用来回答"这个 kernel 是谁调的"
-    （稀疏内核 vs 稠密回退 vs 打分/打包）。
+    为什么不能用整步窗口：CPU activity + `with_stack` + `record_shapes` 会把每一步里
+    每个算子连同 python 栈与所有张量形状全记下来。2026-10-11 实测：16GB 主机被吃到
+    只剩 2.3GB，且 16 帧的任务（249s）比 124 帧（224s）还慢。缩到单次调用后事件量小
+    两个数量级，仍然能回答"注意力里跑了哪些 kernel、各自多久、谁调的、张量多大"。
+
+    另外装一个**轻量 bf16 matmul 探针**（不依赖 profiler）：命中 bf16 矩阵乘就记一次
+    调用栈 + 所属模块，用来定位 sm75 上走 MAGMA fp32 仿算的那只 GEMM。
+    """
+
+    def __init__(self, runtime, calls=2, limit_bf16=8):
+        self.runtime = runtime
+        self.calls = max(1, int(calls))
+        self.limit_bf16 = limit_bf16
+        self.profs = []
+        self.bf16_hits = []
+        self._restore = []
+        self._n = 0
+
+    # ---------- 安装 / 卸载 ----------
+    def install(self, log):
+        torch = self.runtime.torch
+        from torch.profiler import ProfilerActivity, profile as _profile
+        state = self
+
+        def wrap(fn, label):
+            def profiled(*a, **k):
+                if state._n >= state.calls:
+                    return fn(*a, **k)
+                state._n += 1
+                prof = _profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                                with_stack=True, record_shapes=True)
+                prof.__enter__()
+                try:
+                    return fn(*a, **k)
+                finally:
+                    prof.__exit__(None, None, None)
+                    state.profs.append(prof)
+                    log("attn profiler: 第 %d/%d 次调用已录（%s）" % (state._n, state.calls, label))
+            try:                     # 保留 override 自带属性（prepared_attention_executor 等）
+                profiled.__dict__.update(getattr(fn, "__dict__", {}))
+            except Exception:
+                pass
+            prepared = getattr(fn, "prepared_attention_executor", None)
+            if prepared is not None:
+                profiled.prepared_attention_executor = wrap(prepared, label + ".prepared")
+            return profiled
+
+        def patch(holder, key, label):
+            fn = holder.get(key) if isinstance(holder, dict) else getattr(holder, key, None)
+            if fn is None:
+                return
+            wrapped = wrap(fn, label)
+            if isinstance(holder, dict):
+                holder[key] = wrapped
+                self._restore.append(lambda h=holder, k=key, o=fn: h.__setitem__(k, o))
+            else:
+                setattr(holder, key, wrapped)
+                self._restore.append(lambda h=holder, k=key, o=fn: setattr(h, k, o))
+            log("attn profiler: 已包住 %s" % label)
+
+        patch(getattr(self.runtime, "attention", None), "optimized_attention",
+              "attention.optimized_attention")
+        for name in ("unet", "model_shifted"):
+            model = getattr(self.runtime, name, None)
+            try:
+                topts = model.model_options["transformer_options"]
+            except Exception:
+                continue
+            if isinstance(topts, dict):
+                patch(topts, "optimized_attention_override", name + ".transformer_options.override")
+        self._install_bf16_spy(torch, log)
+
+    def restore(self):
+        for undo in reversed(self._restore):
+            try:
+                undo()
+            except Exception:
+                pass
+        self._restore = []
+
+    # ---------- bf16 matmul 探针 ----------
+    def _install_bf16_spy(self, torch, log):
+        import sys
+        import torch.nn.functional as F
+        hits = self.bf16_hits
+        limit = self.limit_bf16
+
+        def spy(name, target, holder, attr):
+            def wrapped(*a, **k):
+                if len(hits) < limit:
+                    dtypes = [getattr(x, "dtype", None) for x in a]
+                    if any(d is torch.bfloat16 for d in dtypes):
+                        module = None
+                        chain = []
+                        f = sys._getframe(1)
+                        for _ in range(14):
+                            if f is None:
+                                break
+                            chain.append("%s:%d %s"
+                                         % (f.f_code.co_filename.replace("\\", "/").split("/")[-1],
+                                            f.f_lineno, f.f_code.co_name))
+                            if module is None:
+                                slf = f.f_locals.get("self")
+                                if slf is not None and hasattr(slf, "weight") \
+                                        and hasattr(slf, "forward"):
+                                    module = type(slf).__name__
+                            f = f.f_back
+                        rec = {"op": name, "module": module,
+                               "dtypes": [str(d) for d in dtypes],
+                               "shapes": [tuple(x.shape) for x in a if hasattr(x, "shape")][:4],
+                               "stack": chain[:8]}
+                        hits.append(rec)
+                        log("[bf16-spy] %s module=%s dtypes=%s shapes=%s"
+                            % (name, module, rec["dtypes"], rec["shapes"]))
+                    return target(*a, **k)
+                return target(*a, **k)
+            setattr(holder, attr, wrapped)
+            self._restore.append(lambda h=holder, x=attr, o=target: setattr(h, x, o))
+
+        spy("F.linear", F.linear, F, "linear")
+        for attr in ("matmul", "bmm", "baddbmm"):
+            target = getattr(torch, attr, None)
+            if target is not None:
+                spy("torch." + attr, target, torch, attr)
+
+    # ---------- 汇总 ----------
+    def report(self):
+        agg = {}
+        for prof in self.profs:
+            for e in prof.key_averages(group_by_stack_n=6):
+                cur = agg.setdefault(str(e.key), {"ms": 0.0, "n": 0, "shapes": None, "stack": None})
+                cur["ms"] += _self_cuda_us(e) / 1000.0
+                cur["n"] += int(e.count)
+                if cur["shapes"] is None and getattr(e, "input_shapes", None):
+                    cur["shapes"] = list(e.input_shapes)[:2]
+                if cur["stack"] is None and getattr(e, "stack", None):
+                    cur["stack"] = list(e.stack)[:5]
+        lines = ["attn profile（前 %d 次注意力调用；按 self CUDA 排序，共 %d 种 kernel）"
+                 % (len(self.profs), len(agg))]
+        for key, v in sorted(agg.items(), key=lambda kv: -kv[1]["ms"])[:18]:
+            shape_txt = ("; ".join(str(s) for s in (v["shapes"] or [])))[:100] or "-"
+            lines.append("  %-42s %9.2f ms x%-5d %s" % (key[:42], v["ms"], v["n"], shape_txt))
+            for frame in (v["stack"] or [])[:4]:
+                lines.append("        @ %s" % str(frame).replace("\n", " ")[:150])
+        lines.append("bf16 matmul 探针：命中 %d 次（上限 %d）" % (len(self.bf16_hits), self.limit_bf16))
+        for rec in self.bf16_hits:
+            lines.append("  %s module=%s dtypes=%s" % (rec["op"], rec["module"], rec["dtypes"]))
+            lines.append("        shapes=%s" % (rec["shapes"],))
+            for frame in rec["stack"][:6]:
+                lines.append("        @ %s" % frame)
+        return lines
+
+
+def _start_attn_profiler(job, params, runtime):
+    """profile_attn=true：录前 N 次注意力调用的内核明细 + bf16 matmul 调用栈。
+
+    窗口刻意只覆盖**几次注意力调用**（不是整个采样步）：整步 + CPU/栈/形状在 16GB
+    主机上会吃掉 ~10GB 并把任务拖慢到比 124 帧还慢（实测）。
     """
     if not params.get("profile_attn"):
         return None
     try:
-        from torch.profiler import ProfilerActivity, profile as _profile
-        prof = _profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                        with_stack=True, record_shapes=True)
-        prof.__enter__()
-        job.log.append("attn profiler: 已开（第一个采样步；CPU+CUDA activity + python 栈 + 张量形状）")
-        return prof
+        state = _AttnWindowProfiler(runtime, calls=2)
+        state.install(lambda s: job.log.append(s))
+        job.log.append("attn profiler: 已装（只录前 2 次注意力调用；CPU+CUDA+栈+形状）+ bf16 matmul 探针")
+        return state
     except Exception as e:
         job.log.append("attn profiler 启动失败: %s: %s" % (type(e).__name__, e))
         return None
 
 
-def _finish_attn_profiler(job, prof):
-    """收尾：top kernel（含调用栈）写进 job.cond_stats["attn_profile"] 与任务日志。"""
-    if prof is None:
+def _finish_attn_profiler(job, state):
+    """收尾：还原被包的入口，把报告写进 job.cond_stats["attn_profile"] 与任务日志。"""
+    if state is None:
         return
     try:
-        prof.__exit__(None, None, None)
-        rows = sorted(prof.key_averages(group_by_stack_n=6), key=lambda e: -_self_cuda_us(e))
-        lines = ["attn profile（第一个采样步；按 self CUDA 排序，共 %d 种 kernel）" % len(rows)]
-        for e in rows[:16]:
-            shapes = list(getattr(e, "input_shapes", None) or [])
-            shape_txt = "; ".join(str(s) for s in shapes[:2])[:100] if shapes else "-"
-            lines.append("  %-42s %9.2f ms x%-5d %s"
-                         % (str(e.key)[:42], _self_cuda_us(e) / 1000.0, int(e.count), shape_txt))
-            for frame in list(getattr(e, "stack", None) or [])[:4]:
-                lines.append("        @ %s" % str(frame).replace("\n", " ")[:150])
+        state.restore()
+    except Exception as e:
+        job.log.append("attn profiler 还原失败: %s: %s" % (type(e).__name__, e))
+    try:
+        lines = state.report()
         job.cond_stats = job.cond_stats or {}
         job.cond_stats["attn_profile"] = "\n".join(lines)
         job.log.extend(lines)
@@ -287,7 +436,7 @@ def _run_with_cond(job, ctx, cond_path):
     job.log.append("sampling: %s/%s steps=%d seed=%d"
                    % (params["sampler"], params["scheduler"], params["steps"], params["seed"]))
     rt.log_memory("job pre-sample")
-    profiler = _start_attn_profiler(job, params)
+    profiler = _start_attn_profiler(job, params, runtime)
     try:
         out1 = rt.unpack(SamplerCustomAdvanced.execute(
             noise, guider, sampler_obj, sigmas, latent))[0]
