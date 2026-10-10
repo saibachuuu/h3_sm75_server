@@ -26,9 +26,9 @@ from common.protocol import DEFAULT_COND_URL, DEFAULT_DIT_PORT  # noqa: E402
 
 DEFAULT_UNET = r"D:\10Eros_Max_h3_TURBO-hybrid_beta5_w4a8_14gb_optimized.safetensors"
 DEFAULT_VIDEO_VAE = r"D:\minimax_h3_video_vae_int8_convrot.safetensors"
+DEFAULT_VIDEO_VAE_LIGHT = r"D:\minimax_h3_lynnreal_light_vae_int8_convrot.safetensors"
 DEFAULT_AUDIO_VAE = r"D:\minimax_h3_audio_vae_fp32.safetensors"
 DEFAULT_VEDA_BUNDLE = r"D:\minimax_h3_r2va_veda_preview_fp8.safetensors"
-
 
 def find_runner_dir(explicit=None):
     """探测 infer_h3_turing.py 所在目录：显式参数 > ../h3-runner（本机布局） > ..（远程 Desktop 布局）。"""
@@ -52,7 +52,8 @@ def main():
                     help="本机 cond server（经 ssh -R 9310 -> 8189 的回调地址）")
     ap.add_argument("--unet", default=DEFAULT_UNET)
     ap.add_argument("--video_vae", default=DEFAULT_VIDEO_VAE)
-    ap.add_argument("--audio_vae", default=DEFAULT_AUDIO_VAE)
+    ap.add_argument("--light-vae", action="store_true",
+                    help="视频 VAE 用 LynnReal Light 版（decoder 26 层，省 ~0.7GB 权重）")
     ap.add_argument("--attn", choices=["int8", "sage", "w8a8", "sdpa", "veda"], default="int8",
                     help="服务级 attention 后端（int8=已验证默认；sage/w8a8=调试档；veda=dev 实验）")
     ap.add_argument("--veda-bundle", default=DEFAULT_VEDA_BUNDLE,
@@ -67,7 +68,9 @@ def main():
     ap.add_argument("--mlp_chunk", type=int, default=8192)
     ap.add_argument("--out-dir", default=os.path.join(HERE, "outputs"))
     args = ap.parse_args()
-
+    if args.light_vae and args.video_vae == DEFAULT_VIDEO_VAE:
+        args.video_vae = DEFAULT_VIDEO_VAE_LIGHT
+        print("[entry] light VAE: %s" % args.video_vae, flush=True)
     # argv 清干净，避免 comfy.cli_args 读到外部参数（embed_h3 同款卫生）
     sys.argv = [sys.argv[0]]
 

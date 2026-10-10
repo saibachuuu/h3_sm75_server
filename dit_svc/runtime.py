@@ -58,6 +58,16 @@ class Runtime:
     def stage_elapsed(self):
         return time.perf_counter() - self.stage_t0
 
+    def _vram_ledger(self, label, torch):
+        """显存账本：分段打印 alloc/reserved/free + 本段增量（上次调用以来）。"""
+        alloc = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        free, total = (x / 1e9 for x in torch.cuda.mem_get_info())
+        prev = getattr(self, "_ledger_prev", 0.0)
+        print("[vram] %-14s alloc=%.2f (+%.2f) reserved=%.2f free=%.2f/%.2f GB"
+              % (label, alloc, alloc - prev, reserved, free, total), flush=True)
+        self._ledger_prev = alloc
+
     # ---------- 后台加载 ----------
     def load(self):
         try:
@@ -120,7 +130,7 @@ class Runtime:
         torch.cuda.empty_cache()
         print("[load] DiT loaded in %.1fs, vram: %.2f GB"
               % (time.perf_counter() - t0, torch.cuda.memory_allocated() / 1e9), flush=True)
-
+        self._vram_ledger("DiT权重", torch)
         self.set_stage("安装 attention 后端 (%s)" % args.attn)
         self.attn_override = _install_attention(
             rt, attention, minimax_model, comfy_kitchen, args.attn,
@@ -160,12 +170,13 @@ class Runtime:
         self.set_stage("加载视频 VAE（约 34s）")
         t0 = time.perf_counter()
         vsd, vmd = rt.stream_load_safetensors_to_dict(args.video_vae, device="cuda")
-        vvae = comfy.sd.VAE(sd=vsd, metadata=vmd, device=device)
+        vvae = _build_video_vae(comfy, vsd, vmd, device, torch)
         vvae.first_stage_model.requires_grad_(False)
         del vsd
         gc.collect()
         torch.cuda.empty_cache()
-        print("[load] video VAE in %.1fs" % (time.perf_counter() - t0), flush=True)
+        print("[load] video VAE in %.1fs (%s)" % (time.perf_counter() - t0, args.video_vae), flush=True)
+        self._vram_ledger("视频VAE", torch)
 
         self.set_stage("加载音频 VAE（约 8s）")
         t0 = time.perf_counter()
@@ -176,10 +187,7 @@ class Runtime:
         gc.collect()
         torch.cuda.empty_cache()
         print("[load] audio VAE in %.1fs" % (time.perf_counter() - t0), flush=True)
-
-        # VAE 常驻（offload_device=cpu 只作兜底，不在任务间搬运）
-        vvae.patcher.offload_device = torch.device("cpu")
-        avae.patcher.offload_device = torch.device("cpu")
+        self._vram_ledger("音频VAE", torch)
 
         # ---- 4. sigma shift（采样 guider 用） ----
         from comfy_extras.nodes_minimax_h3 import MiniMaxH3SigmaShift
@@ -209,10 +217,57 @@ class Runtime:
         gc.collect()
         torch.cuda.empty_cache()
         rt.log_memory("Runtime ready")
+        self._vram_ledger("READY常驻", torch)
         self.ready = True
         self.stage = "就绪"
         print("[runtime] READY — free VRAM %.2f GB"
               % (torch.cuda.mem_get_info()[0] / 1e9), flush=True)
+
+
+def _build_video_vae(comfy, vsd, vmd, device, torch):
+    """按 checkpoint 实际 decoder 深度构造视频 VAE（Light 26 层 / 官方 36 层自适应）。
+
+    LynnReal light_vae.build_vae 的最小 server 版：只借"深度自适应"思想，
+    不装 FA3/batched decode/compile（sm75 无 FA3）。decoder 构造前临时注入
+    num_layers（上游 ViT3DDecoder 默认 36，本 checkout 的 MiniMaxH3VideoVAE
+    未透传该参数），构造完即还原。
+    tile 几何用 LynnReal 的 Light/官方两档（272/16 vs 256/64）。
+    """
+    import comfy.ldm.minimax.vae as minimax_vae
+
+    depth = 0
+    prefix = "decoder.transformer_blocks."
+    idx = set()
+    for k in vsd:
+        if k.startswith(prefix):
+            head = k[len(prefix):].split(".", 1)[0]
+            if head.isdigit():
+                idx.add(int(head))
+    depth = (max(idx) + 1) if idx else 0
+    light = (depth == 26)
+    tile, overlap = ((272, 16) if light else (256, 64))
+    print("[vae] checkpoint decoder depth=%d (%s) tile=%d/%d"
+          % (depth, "light" if light else "official", tile, overlap), flush=True)
+
+    orig_decoder_init = minimax_vae.ViT3DDecoder.__init__
+    orig_vae_init = minimax_vae.MiniMaxH3VideoVAE.__init__
+
+    def _patched_decoder_init(self, *args, **kwargs):
+        kwargs.setdefault("num_layers", depth or 36)
+        return orig_decoder_init(self, *args, **kwargs)
+
+    def _patched_vae_init(self, *args, **kwargs):
+        kwargs.setdefault("tile_size", tile)
+        kwargs.setdefault("tile_overlap_min", overlap)
+        return orig_vae_init(self, *args, **kwargs)
+
+    minimax_vae.ViT3DDecoder.__init__ = _patched_decoder_init
+    minimax_vae.MiniMaxH3VideoVAE.__init__ = _patched_vae_init
+    try:
+        return comfy.sd.VAE(sd=vsd, metadata=vmd, device=device)
+    finally:
+        minimax_vae.ViT3DDecoder.__init__ = orig_decoder_init
+        minimax_vae.MiniMaxH3VideoVAE.__init__ = orig_vae_init
 
 
 def _install_attention(rt, attention, minimax_model, comfy_kitchen, attn_choice,
