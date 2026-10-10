@@ -118,6 +118,54 @@ def _frame_probe(torch, frames):
     return {"min": round(vmin, 4), "max": round(vmax, 4), "nan": vnan, "inf": vinf}
 
 
+def _self_cuda_us(entry):
+    """torch profiler 的 per-kernel CUDA 时间（兼容新旧字段名）。"""
+    for attr in ("self_device_time_total", "self_cuda_time_total"):
+        v = getattr(entry, attr, None)
+        if v:
+            return float(v)
+    return 0.0
+
+
+def _start_attn_profiler(job, params):
+    """profile_attn=true：对**第一个采样步**开 CUDA profiler（带 python 调用栈）。
+
+    只覆盖第一步，避免整单被 profiler 拖慢；栈信息用来回答"这个 kernel 是谁调的"
+    （稀疏内核 vs 稠密回退 vs 打分/打包）。
+    """
+    if not params.get("profile_attn"):
+        return None
+    try:
+        from torch.profiler import ProfilerActivity, profile as _profile
+        prof = _profile(activities=[ProfilerActivity.CUDA], with_stack=True)
+        prof.__enter__()
+        job.log.append("attn profiler: 已开（只覆盖第一个采样步，带 python 栈）")
+        return prof
+    except Exception as e:
+        job.log.append("attn profiler 启动失败: %s: %s" % (type(e).__name__, e))
+        return None
+
+
+def _finish_attn_profiler(job, prof):
+    """收尾：top kernel（含调用栈）写进 job.cond_stats["attn_profile"] 与任务日志。"""
+    if prof is None:
+        return
+    try:
+        prof.__exit__(None, None, None)
+        rows = sorted(prof.key_averages(group_by_stack_n=4), key=lambda e: -_self_cuda_us(e))
+        lines = ["attn profile（第一个采样步；按 self CUDA 排序，共 %d 种 kernel）" % len(rows)]
+        for e in rows[:14]:
+            lines.append("  %-54s %9.2f ms x%d"
+                         % (str(e.key)[:54], _self_cuda_us(e) / 1000.0, int(e.count)))
+            for frame in list(getattr(e, "stack", None) or [])[:3]:
+                lines.append("        @ %s" % str(frame).replace("\n", " ")[:150])
+        job.cond_stats = job.cond_stats or {}
+        job.cond_stats["attn_profile"] = "\n".join(lines)
+        job.log.extend(lines)
+    except Exception as e:
+        job.log.append("attn profile 汇总失败: %s: %s" % (type(e).__name__, e))
+
+
 def _load_direct_cond(job):
     """直接喂 cond（POST /api/jobs/cond）：内联 base64 或 dit 机器上已有的文件。
 
@@ -236,8 +284,12 @@ def _run_with_cond(job, ctx, cond_path):
     job.log.append("sampling: %s/%s steps=%d seed=%d"
                    % (params["sampler"], params["scheduler"], params["steps"], params["seed"]))
     rt.log_memory("job pre-sample")
-    out1 = rt.unpack(SamplerCustomAdvanced.execute(
-        noise, guider, sampler_obj, sigmas, latent))[0]
+    profiler = _start_attn_profiler(job, params)
+    try:
+        out1 = rt.unpack(SamplerCustomAdvanced.execute(
+            noise, guider, sampler_obj, sigmas, latent))[0]
+    finally:
+        _finish_attn_profiler(job, profiler)
     job.timings["sample_first"] = round(time.perf_counter() - t0, 2)
 
     if params["refine_steps"] > 0:

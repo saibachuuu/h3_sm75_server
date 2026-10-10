@@ -65,6 +65,8 @@ def main():
                     help="Veda 保留率，0=用 bundle 训练默认值 (0,1]")
     ap.add_argument("--veda-warmup", choices=["off", "probe", "tier1", "tier2", "tier3"],
                     default="probe", help="Veda/sage 启动 warmup 负载分级（默认 probe 最小）")
+    ap.add_argument("--veda-debug", action="store_true",
+                    help="Veda 调试日志：tile plan/keep 与每 forward 的 sparse_calls")
     ap.add_argument("--w4a8_backend", choices=["turingutils", "cublas"], default="turingutils")
     ap.add_argument("--mlp_chunk", type=int, default=8192)
     ap.add_argument("--out-dir", default=os.path.join(HERE, "outputs"))

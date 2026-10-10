@@ -226,6 +226,12 @@ def _fill_sampling_params(payload, out):
             [float(s) for s in out["sigmas"].split(",") if s.strip()]
         except ValueError:
             return "sigmas 格式错误（应如 1.0,0.5,0.0）"
+
+    # 可选诊断：把第一个采样步的 CUDA kernel 明细（含 python 调用栈）写进任务日志
+    v, err = _bool_param(payload, "profile_attn", False)
+    if err:
+        return err
+    out["profile_attn"] = v
     return None
 
 

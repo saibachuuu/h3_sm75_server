@@ -283,7 +283,8 @@ def build_veda_override(args, unet, torch, log=print):
     folder_paths.add_model_folder_path("veda", os.path.dirname(os.path.abspath(bundle_path)))
     model = configure(unet, predictor_name=os.path.basename(bundle_path),
                       predictor_precision=precision,
-                      keep_ratio=keep, reference_keep_ratio=keep)
+                      keep_ratio=keep, reference_keep_ratio=keep,
+                      debug=bool(getattr(args, "veda_debug", False)))
     override = model.model_options["transformer_options"]["optimized_attention_override"]
     info = {"bundle": os.path.basename(bundle_path), "precision": precision,
             "keep": keep or bundle.keep_ratio}
