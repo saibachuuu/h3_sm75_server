@@ -192,6 +192,11 @@ class _AttnWindowProfiler:
 
         patch(getattr(self.runtime, "attention", None), "optimized_attention",
               "attention.optimized_attention")
+        try:                     # H3 真正的调用点：comfy.ldm.minimax.model.optimized_attention
+            import comfy.ldm.minimax.model as mm_model
+            patch(mm_model, "optimized_attention", "comfy.ldm.minimax.model.optimized_attention")
+        except Exception as e:
+            log("attn profiler: 包装 minimax 调用点失败: %s: %s" % (type(e).__name__, e))
         for name in ("unet", "model_shifted"):
             model = getattr(self.runtime, name, None)
             try:
