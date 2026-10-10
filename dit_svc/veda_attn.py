@@ -151,6 +151,84 @@ def run_single_warmup(torch, device, attn_fn, tokens, log=print, repeat=1):
     log("[warmup once] done %s" % result)
     return result
 
+def bench_attention(torch, device, veda_call, dense_call, tokens, repeat=3,
+                    profile=False, log=print):
+    """同一对 Q/K/V 上对比 Veda 稀疏 vs 稠密 int8 的注意力耗时（可选 profiler 明细）。
+
+    veda_call / dense_call：fn(q, k, v) -> out，q/k/v 为 (1, heads, tokens, dim) fp16。
+    每档先跑一轮建图（不计时），再跑 repeat 轮取 min/max；每轮校验输出 finite。
+    profile=True 时额外用 torch.profiler 抓 CUDA kernel 明细（按 cuda_time_total 排序），
+    这是把"到底谁吃时间"从推测变成数字的唯一手段。
+    """
+    import time as _time
+    heads, dim = 56, 128  # H3 真实形态
+    parts = []
+    for s in range(0, tokens, 4096):
+        m = min(4096, tokens - s)
+        parts.append(torch.randn(1, heads, m, dim, device=device, dtype=torch.float16))
+    q = torch.cat(parts, dim=2)
+    del parts
+    k = q.clone()
+    v = q.clone()
+
+    def _run(fn):
+        torch.cuda.synchronize()
+        t0 = torch.cuda.Event(enable_timing=True)
+        t1 = torch.cuda.Event(enable_timing=True)
+        t0.record()
+        out = fn(q, k, v)
+        t1.record()
+        torch.cuda.synchronize()
+        ms = t0.elapsed_time(t1)
+        finite = bool(torch.isfinite(out.float()).all())
+        del out
+        return round(ms, 2), finite
+
+    result = {"tokens": tokens, "heads": heads, "dim": dim, "repeat": repeat}
+    measured = {}
+    for name, fn in (("veda", veda_call), ("int8", dense_call)):
+        try:
+            _run(fn)                       # 建图轮：allocator/内核都热起来，不计时
+        except Exception as e:
+            result[name] = {"error": "%s: %s" % (type(e).__name__, e)}
+            log("[bench] %s 预热失败: %s" % (name, e))
+            continue
+        rounds = []
+        for _ in range(max(1, repeat)):
+            ms, finite = _run(fn)
+            if not finite:
+                raise RuntimeError("%s 注意力输出含 NaN/Inf（n=%d）" % (name, tokens))
+            rounds.append(ms)
+            log("[bench %s] n=%d round %d: %.1f ms" % (name, tokens, len(rounds), ms))
+        measured[name] = rounds
+        result[name] = {"rounds": rounds, "ms_min": min(rounds), "ms_max": max(rounds),
+                        "ms_avg": round(sum(rounds) / len(rounds), 2)}
+    if "veda" in measured and "int8" in measured:
+        result["ratio_veda_over_int8"] = round(
+            result["veda"]["ms_min"] / max(result["int8"]["ms_min"], 1e-9), 2)
+    if profile:
+        for name, fn in (("veda", veda_call), ("int8", dense_call)):
+            if name not in measured:
+                continue
+            t0 = _time.perf_counter()
+            try:
+                from torch.profiler import ProfilerActivity, profile as _profile
+                with _profile(activities=[ProfilerActivity.CUDA]) as prof:
+                    fn(q, k, v)
+                    torch.cuda.synchronize()
+                table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=20)
+            except Exception as e:
+                table = "profiler 失败: %s: %s" % (type(e).__name__, e)
+            result[name + "_profile"] = table
+            log("[bench %s] profile (%.1fs):\n%s" % (name, _time.perf_counter() - t0, table))
+    del q, k, v
+    torch.cuda.empty_cache()
+    log("[bench] 汇总: veda=%s int8=%s ratio=%s"
+        % (result.get("veda", {}).get("ms_min"), result.get("int8", {}).get("ms_min"),
+           result.get("ratio_veda_over_int8")))
+    return result
+
+
 def build_veda_override(args, unet, torch, log=print):
     """构建 Veda override。成功返回 (override, bundle_info)；失败抛 RuntimeError（调用方回退 int8）。
 

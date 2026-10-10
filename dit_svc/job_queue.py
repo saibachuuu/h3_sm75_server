@@ -146,7 +146,7 @@ class QueueManager:
         return job
 
     # ---------- warmup 提交（与视频任务同队列串行，互不抢显存） ----------
-    def submit_warmup(self, tokens, repeat=1):
+    def submit_warmup(self, tokens, repeat=1, compare=None, profile=False):
         self._require_ready()
         if self.runtime.attn_override is None:
             raise ValueError("当前 attention（%s）无 override 可测，warmup 仅支持 sage/w8a8/veda"
@@ -155,13 +155,15 @@ class QueueManager:
             raise ValueError("tokens 须为 16–40000 的整数")
         if not isinstance(repeat, int) or not (1 <= repeat <= 50):
             raise ValueError("repeat 须为 1–50 的整数")
-        job = Job({"tokens": tokens, "repeat": repeat}, kind="warmup")
+        job = Job({"tokens": tokens, "repeat": repeat,
+                   "compare": compare, "profile": bool(profile)}, kind="warmup")
         job.stage = "warmup 排队中"
         with self._cond:
             self.jobs[job.id] = job
             self.order.append(job.id)
             self._cond.notify_all()
-        print("[queue] submitted warmup %s tokens=%d x%d" % (job.id, tokens, repeat), flush=True)
+        print("[queue] submitted warmup %s tokens=%d x%d compare=%s profile=%s"
+              % (job.id, tokens, repeat, compare, bool(profile)), flush=True)
         return job
     def drop(self, job_id):
         with self._cond:
@@ -263,3 +265,20 @@ class QueueManager:
         job.timings["warmup"] = result["ms_max"]
         job.cond_stats = {"warmup": result}
         job.log.append("warmup 结果: %s" % result)
+
+        # 可选：同一对 Q/K/V 上跟稠密 int8 对比（veda 档下 optimized_attention 就是 int8）
+        if job.params.get("compare") == "int8":
+            job.stage = "attention bench（veda vs int8, n=%d）" % tokens
+
+            def _veda_call(a, b, c):
+                return override(fallback, a, b, c, a.shape[1], skip_reshape=True)
+
+            def _dense_call(a, b, c):
+                return fallback(a, b, c, a.shape[1], skip_reshape=True)
+
+            bench = veda_attn.bench_attention(
+                torch, runtime.device, _veda_call, _dense_call, tokens,
+                repeat=max(1, min(3, repeat)), profile=bool(job.params.get("profile")),
+                log=lambda s: (job.log.append(s), print("[queue %s] %s" % (job.id, s), flush=True)))
+            job.cond_stats["bench"] = bench
+            job.log.append("bench 汇总: %s" % bench)

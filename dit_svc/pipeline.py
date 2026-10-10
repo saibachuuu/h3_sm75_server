@@ -67,8 +67,7 @@ def run_job(job, ctx):
     job.log.append("cond: %s" % json.dumps(cstats, ensure_ascii=False))
     _stage(job, "cond", t0)
 
-    tmp_dir = os.path.join(ctx["out_dir"], ".tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_dir = tmp_dir_of(ctx["out_dir"])
     cond_path = os.path.join(tmp_dir, job.id + ".cond.safetensors")
     with open(cond_path, "wb") as f:
         f.write(cond_bytes)
@@ -80,6 +79,13 @@ def run_job(job, ctx):
             os.remove(cond_path)
         except OSError:
             pass
+
+
+def tmp_dir_of(out_dir):
+    """out_dir 下的临时目录（cond 文件、mux 前的临时 wav）。"""
+    d = os.path.join(out_dir, ".tmp")
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 def _unhook_dit(runtime, mm, torch):

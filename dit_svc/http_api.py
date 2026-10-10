@@ -259,9 +259,14 @@ def make_handler(runtime, queue, ctx):
                     repeat = payload.get("repeat", 1)
                     if not isinstance(repeat, int) or not (1 <= repeat <= 50):
                         raise ValueError("repeat 须为 1–50 的整数")
-                    job = queue.submit_warmup(tokens, repeat=repeat)
+                    compare = payload.get("compare")
+                    if compare not in (None, "", "int8"):
+                        raise ValueError("compare 只支持 \"int8\"（同一对 Q/K/V 上跟稠密 int8 对比）")
+                    job = queue.submit_warmup(tokens, repeat=repeat, compare=compare or None,
+                                              profile=bool(payload.get("profile")))
                     self._json({"ok": True, "job_id": job.id, "tokens": tokens,
-                                "repeat": repeat}, 201)
+                                "repeat": repeat, "compare": compare or None,
+                                "profile": bool(payload.get("profile"))}, 201)
                 except BusyError as e:
                     self._json({"ok": False, "error": str(e)}, 409)
                 except ValueError as e:

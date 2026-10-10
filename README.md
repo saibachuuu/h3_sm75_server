@@ -87,6 +87,11 @@ POST /api/jobs/drop {id}             取消排队任务
 GET  /outputs/<id>.mp4|.json|.png    成果（支持 Range）
 ```
 
+另：`POST /api/warmup` 自检（`{tokens 16–40000 | level, repeat? 1–50, compare?, profile?}`）——
+`compare:"int8"` 会在**同一对 Q/K/V** 上再跑一遍稠密 int8 做对比，`profile:true` 附带
+`torch.profiler` 的 CUDA kernel 明细（按 `cuda_time_total` 排序）写进任务日志，用来回答
+"稀疏为什么没更快"（`cond_stats.bench`）。
+
 ### POST /api/jobs/cond（直接喂 cond）
 
 调用方自己（离线/本机）算好 cond 后直接提交，任务内**不回调 cond server**，
