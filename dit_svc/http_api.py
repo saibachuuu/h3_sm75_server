@@ -201,7 +201,7 @@ def make_handler(runtime, queue, ctx):
                 n = queue.clear_queued()
                 self._json({"ok": True, "dropped": n})
             elif path == "/api/warmup":
-                # {tokens: int 16–40000} 或 {level: probe|tier1|tier2|tier3}；
+                # {tokens: int 16–40000, repeat?: 1–50} 或 {level, repeat?}；
                 # 进串行队列，结果轮询 /api/jobs/<id>（与视频任务同口径）。
                 payload = self._read_json_body()
                 if payload is None:
@@ -218,8 +218,12 @@ def make_handler(runtime, queue, ctx):
                         tokens = tier[0]
                     if not isinstance(tokens, int) or not (16 <= tokens <= 40000):
                         raise ValueError("tokens 须为 16–40000 的整数（或 level 挡位）")
-                    job = queue.submit_warmup(tokens)
-                    self._json({"ok": True, "job_id": job.id, "tokens": tokens}, 201)
+                    repeat = payload.get("repeat", 1)
+                    if not isinstance(repeat, int) or not (1 <= repeat <= 50):
+                        raise ValueError("repeat 须为 1–50 的整数")
+                    job = queue.submit_warmup(tokens, repeat=repeat)
+                    self._json({"ok": True, "job_id": job.id, "tokens": tokens,
+                                "repeat": repeat}, 201)
                 except BusyError as e:
                     self._json({"ok": False, "error": str(e)}, 409)
                 except ValueError as e:

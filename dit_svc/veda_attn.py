@@ -88,48 +88,62 @@ def run_tiered_warmup(torch, device, attn_fn, impl_name, level, log=print):
     log("[warmup] 到 %s 全过" % level)
 
 
-def run_single_warmup(torch, device, attn_fn, tokens, log=print):
-    """单发 warmup：指定任意 token 数跑一次。返回 dict（ms/finite/amax/vram）。
+def run_single_warmup(torch, device, attn_fn, tokens, log=print, repeat=1):
+    """单发 warmup：指定 token 数跑 repeat 次。返回 dict（每轮 ms/finite/amax + 显存）。
 
     给 POST /api/warmup 用（队列内串行执行，不重启）。失败抛 RuntimeError。
-    上限 40000（超过 packed 上限太多无意义，且防手滑炸卡）。
+    上限 tokens 40000（超过 packed 上限太多无意义，且防手滑炸卡），
+    repeat 上限 50（防长时间占卡；真任务 4 步约等于 repeat=4×56 层）。
+    每轮之间 synchronize + empty_cache（贴近真任务步间状态），NVML 每轮查。
     """
     import math
     if not isinstance(tokens, int) or not (16 <= tokens <= 40000):
         raise ValueError("tokens 须为 16–40000 的整数，当前 %r" % (tokens,))
+    if not isinstance(repeat, int) or not (1 <= repeat <= 50):
+        raise ValueError("repeat 须为 1–50 的整数，当前 %r" % (repeat,))
     heads, dim = 56, 128  # H3 真实形态
-    ok, vram = check_nvml_sane(torch)
+    ok, vram0 = check_nvml_sane(torch)
     if not ok:
-        raise RuntimeError("NVML 异常，中止：%s" % vram)
-    log("[warmup once] n=%d | %s" % (tokens, vram))
-    parts = []
-    for s in range(0, tokens, 4096):
-        m = min(4096, tokens - s)
-        parts.append(torch.randn(1, heads, m, dim, device=device, dtype=torch.float16))
-    q = torch.cat(parts, dim=2)
-    del parts
-    v = q.clone()
-    torch.cuda.synchronize()
-    t0 = torch.cuda.Event(enable_timing=True)
-    t1 = torch.cuda.Event(enable_timing=True)
-    t0.record()
-    out = attn_fn(q, q, v, heads)
-    t1.record()
-    torch.cuda.synchronize()
-    ms = t0.elapsed_time(t1)
-    finite = bool(torch.isfinite(out.float()).all())
-    amax = float(out.float().abs().max())
-    ok2, vram2 = check_nvml_sane(torch)
-    del q, v, out
-    torch.cuda.empty_cache()
-    result = {"tokens": tokens, "ms": round(ms, 1), "finite": finite,
-              "amax": amax if math.isfinite(amax) else None,
-              "vram_before": vram, "vram_after": vram2}
-    log("[warmup once] %s" % result)
-    if not finite or result["amax"] is None:
-        raise RuntimeError("输出非 finite: %s" % result)
-    if not ok2:
-        raise RuntimeError("跑后 NVML 异常：%s" % vram2)
+        raise RuntimeError("NVML 异常，中止：%s" % vram0)
+    log("[warmup once] n=%d x%d | %s" % (tokens, repeat, vram0))
+    rounds = []
+    for i in range(repeat):
+        ok, vram = check_nvml_sane(torch)
+        if not ok:
+            raise RuntimeError("[warmup %d/%d] NVML 异常，中止：%s" % (i + 1, repeat, vram))
+        parts = []
+        for s in range(0, tokens, 4096):
+            m = min(4096, tokens - s)
+            parts.append(torch.randn(1, heads, m, dim, device=device, dtype=torch.float16))
+        q = torch.cat(parts, dim=2)
+        del parts
+        v = q.clone()
+        torch.cuda.synchronize()
+        t0 = torch.cuda.Event(enable_timing=True)
+        t1 = torch.cuda.Event(enable_timing=True)
+        t0.record()
+        out = attn_fn(q, q, v, heads)
+        t1.record()
+        torch.cuda.synchronize()
+        ms = t0.elapsed_time(t1)
+        finite = bool(torch.isfinite(out.float()).all())
+        amax = float(out.float().abs().max())
+        ok2, vram2 = check_nvml_sane(torch)
+        del q, v, out
+        torch.cuda.empty_cache()
+        r = {"ms": round(ms, 1), "finite": finite,
+             "amax": amax if math.isfinite(amax) else None}
+        log("[warmup %d/%d] %s | %s" % (i + 1, repeat, r, vram2))
+        if not finite or r["amax"] is None:
+            raise RuntimeError("[warmup %d/%d] 输出非 finite: %s" % (i + 1, repeat, r))
+        if not ok2:
+            raise RuntimeError("[warmup %d/%d] 跑后 NVML 异常：%s" % (i + 1, repeat, vram2))
+        rounds.append(r)
+    result = {"tokens": tokens, "repeat": repeat, "rounds": rounds,
+              "ms_min": min(r["ms"] for r in rounds),
+              "ms_max": max(r["ms"] for r in rounds),
+              "vram_before": vram0, "vram_after": vram2}
+    log("[warmup once] done %s" % result)
     return result
 
 def build_veda_override(args, unet, torch, log=print):

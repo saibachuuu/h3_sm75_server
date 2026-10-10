@@ -90,7 +90,7 @@ class QueueManager:
         return job
 
     # ---------- warmup 提交（与视频任务同队列串行，互不抢显存） ----------
-    def submit_warmup(self, tokens):
+    def submit_warmup(self, tokens, repeat=1):
         if self.runtime.error:
             raise BusyError("模型加载失败: %s" % self.runtime.error)
         if not self.runtime.ready:
@@ -101,13 +101,15 @@ class QueueManager:
                              % self.runtime.attn)
         if not isinstance(tokens, int) or not (16 <= tokens <= 40000):
             raise ValueError("tokens 须为 16–40000 的整数")
-        job = Job({"tokens": tokens}, kind="warmup")
+        if not isinstance(repeat, int) or not (1 <= repeat <= 50):
+            raise ValueError("repeat 须为 1–50 的整数")
+        job = Job({"tokens": tokens, "repeat": repeat}, kind="warmup")
         job.stage = "warmup 排队中"
         with self._cond:
             self.jobs[job.id] = job
             self.order.append(job.id)
             self._cond.notify_all()
-        print("[queue] submitted warmup %s tokens=%d" % (job.id, tokens), flush=True)
+        print("[queue] submitted warmup %s tokens=%d x%d" % (job.id, tokens, repeat), flush=True)
         return job
     def drop(self, job_id):
         with self._cond:
@@ -190,7 +192,8 @@ class QueueManager:
         runtime = self.runtime
         torch = runtime.torch
         tokens = job.params["tokens"]
-        job.stage = "warmup 执行中（n=%d）" % tokens
+        repeat = job.params.get("repeat", 1)
+        job.stage = "warmup 执行中（n=%d x%d）" % (tokens, repeat)
         override = runtime.attn_override
         attention = runtime.attention
         fallback = getattr(attention, "optimized_attention", None)
@@ -200,8 +203,8 @@ class QueueManager:
         def _call(q, k, v, heads):
             return override(fallback, q, k, v, heads, skip_reshape=True)
         result = veda_attn.run_single_warmup(
-            torch, runtime.device, _call, tokens,
+            torch, runtime.device, _call, tokens, repeat=repeat,
             log=lambda s: (job.log.append(s), print("[queue %s] %s" % (job.id, s), flush=True)))
-        job.timings["warmup"] = result["ms"]
+        job.timings["warmup"] = result["ms_max"]
         job.cond_stats = {"warmup": result}
         job.log.append("warmup 结果: %s" % result)

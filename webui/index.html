@@ -164,6 +164,10 @@
         <input type="number" id="wuTokens" value="16384" min="16" max="40000">
       </div>
       <div>
+        <label>循环次数（1–50；真任务 4 步 ≈ 224 次 attention 调用）</label>
+        <input type="number" id="wuRepeat" value="8" min="1" max="50">
+      </div>
+      <div>
         <label>&nbsp;</label>
         <button id="wuBtn">跑自检</button>
       </div>
@@ -301,16 +305,17 @@ $("clearBtn").addEventListener("click", async () => {
 
 $("wuBtn").addEventListener("click", async () => {
   const lv = $("wuLevel").value;
+  const repeat = Math.max(1, Math.min(50, +$("wuRepeat").value || 1));
   const body = (lv === "custom")
-    ? { tokens: +$("wuTokens").value }
-    : { level: lv };
+    ? { tokens: +$("wuTokens").value, repeat }
+    : { level: lv, repeat };
   const btn = $("wuBtn");
   btn.disabled = true;
   try {
     const r = await jpost("/api/warmup", body);
     $("wuResult").textContent = "已提交自检 " + r.job_id + "（"
-      + r.tokens + " tokens），结果进队列列表…";
-    toast("自检已提交：" + r.job_id + "（" + r.tokens + " tokens）", true);
+      + r.tokens + " tokens x" + r.repeat + "），结果进队列列表…";
+    toast("自检已提交：" + r.job_id + "（" + r.tokens + " tokens x" + r.repeat + "）", true);
     poll();
   } catch (e) {
     toast("自检提交失败：" + e.message);
