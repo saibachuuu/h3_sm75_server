@@ -83,6 +83,9 @@ cond server：`GET /health`、`POST /encode`、`GET /files/<hash>.safetensors`�
 - **模型常驻**：DiT + 双 VAE + token_refiner 均不卸载（refiner 二次 refine 0.01s）；
   实测空闲显存 18.25 GB，解码峰值 20.28/23.62 GB（余量 ~3.3 GB）。
 - **cond 内容哈希缓存**：同 prompt+图+参数免重复编码（命中 <0.1s）。
+- **cond 文件 slim**：只含文本编码器输出（cond/minimax_token_tags…），不带图像像素；
+  参考帧由 dit server 从任务 `image_b64` 本地解码 + 缩放 + VAE 编码
+  （目标尺寸 `common.protocol.target_frame_size`，与 cond 侧 Qwen 输入一致）。
 - **无 warmup 逻辑**：DiT warmup 已被实测证伪（崩溃跟随全尺寸计算，与"第一次"无关）。
 - **ffmpeg 直出 mp4**：rawvideo 管进 + 临时 wav 管进，h264+AAC，mux 完删临时文件。
 - **latent 探针**：采样输出含 NaN/Inf 直接判失败，不送解码。

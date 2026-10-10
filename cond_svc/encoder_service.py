@@ -2,8 +2,10 @@
 
 - 编码逻辑移植自 h3-runner/embed_h3.py，tokenize 调用方式与 embed_server.Encoder 一致；
 - Encoder（Qwen3-VL-32B int4 convrot）在服务启动时加载一次并常驻；
-- 输出 safetensors 契约 = infer_h3_turing.read_cond 所需：
-    cond / minimax_token_tags / ref_image|first_frame / (attention_mask|pooled_output)?
+- 输出 safetensors 契约（slim：只含文本编码器输出，不带图像像素）：
+    cond / minimax_token_tags / (attention_mask|pooled_output)?
+  参考帧像素由 dit server 从任务 image_b64 本地解码（目标尺寸见
+  common.protocol.target_frame_size，两侧共用）；
 
 依赖 embed_server.py（位于 work-on-comfyui 根目录）：import embed_server 会触发其
 COMFY_DIR/sys.path 副作用，因此本模块只在 EncoderService.load() 内 import。
@@ -11,7 +13,6 @@ COMFY_DIR/sys.path 副作用，因此本模块只在 EncoderService.load() 内 i
 import hashlib
 import io
 import json
-import math
 import os
 import sys
 import threading
@@ -22,8 +23,7 @@ import torch
 from PIL import Image
 from safetensors.torch import save_file
 
-CANVAS_MULTIPLE = 32
-REF_IMAGE_SHORT_EDGE = 2048
+from common.protocol import target_frame_size
 
 
 def _resize(image, width, height, crop, comfy_utils):
@@ -104,17 +104,12 @@ class EncoderService:
         frame = torch.from_numpy(arr).unsqueeze(0)  # [1,H,W,3] float 0..1
         raw_h, raw_w = int(frame.shape[1]), int(frame.shape[2])
 
+        # Qwen 输入尺寸（与 dit 侧 VAE 输入共用 target_frame_size，保持一致）
+        tw, th = target_frame_size(mode, raw_w, raw_h, width, height, ref_image_size)
+        frame_rz = _resize(frame[:1], tw, th, "disabled", cu)
         if mode == "fl2va":
-            frame_rz = _resize(frame[:1], width, height, "disabled", cu)
             images_arg, ref_items = [frame_rz], None
         else:  # ref2va
-            if ref_image_size == "match":
-                scale = min(1.0, math.sqrt((width * height) / (raw_w * raw_h)))
-            else:
-                scale = min(1.0, REF_IMAGE_SHORT_EDGE / min(raw_w, raw_h))
-            tw = max(CANVAS_MULTIPLE, round(raw_w * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
-            th = max(CANVAS_MULTIPLE, round(raw_h * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
-            frame_rz = _resize(frame[:1], tw, th, "disabled", cu)
             images_arg, ref_items = None, [{"type": "image", "data": frame_rz}]
 
         with self.enc.lock:
@@ -132,13 +127,9 @@ class EncoderService:
             self.jobs += 1
 
         tensor, values = cond[0][0], cond[0][1]
-        rz = frame_rz[0].contiguous().cpu()  # VAE 参考帧（远程 VAE-encode 用）
         out = {
             "cond": tensor.float().cpu().contiguous(),
             "minimax_token_tags": values["minimax_token_tags"].cpu().contiguous(),
-            "first_frame": rz,
-            # clone：safetensors save_file 拒绝共享存储的张量，两字段必须各占一份
-            "ref_image": rz.clone(),
         }
         for k in ("attention_mask", "pooled_output"):
             if values.get(k) is not None:
@@ -166,7 +157,7 @@ class EncoderService:
             "encode_s": round(t_encode, 3),
             "total_s": round(time.perf_counter() - t_start, 3),
             "image_hw": [raw_h, raw_w],
-            "resized_hw": [int(frame_rz.shape[1]), int(frame_rz.shape[2])],
+            "qwen_hw": [th, tw],
             "file_bytes": os.path.getsize(path),
         }
         print("[cond] encoded %s tokens=%d mode=%s %.2fs -> %s"

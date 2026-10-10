@@ -32,9 +32,27 @@ SAMPLERS = (
 )
 SCHEDULERS = ("simple", "normal", "karras", "exponential", "sgm_uniform", "beta", "linear")
 
-# cond 文件契约：与 embed_h3.py 输出一致，infer_h3_turing.read_cond 可直接消费
+# cond 文件契约（slim：只含文本编码器输出，不带图像像素；参考帧由 dit 侧
+# 从任务 image_b64 本地解码 + VAE 编码）
 COND_KEYS_REQUIRED = ("cond", "minimax_token_tags")
-COND_KEYS_FRAME = ("first_frame", "ref_image")  # 至少存在其一
+
+# 参考帧目标尺寸（cond 侧 Qwen 输入与 dit 侧 VAE 输入共用，保持一致）
+CANVAS_MULTIPLE = 32
+REF_IMAGE_SHORT_EDGE = 2048
+
+
+def target_frame_size(mode, raw_w, raw_h, width, height, ref_image_size="match"):
+    """返回 (tw, th)。fl2va 直接对齐画布；ref2va 按策略等比缩小后向 32 对齐。"""
+    import math
+    if mode == "fl2va":
+        return int(width), int(height)
+    if ref_image_size == "match":
+        scale = min(1.0, math.sqrt((width * height) / (raw_w * raw_h)))
+    else:
+        scale = min(1.0, REF_IMAGE_SHORT_EDGE / min(raw_w, raw_h))
+    tw = max(CANVAS_MULTIPLE, round(raw_w * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+    th = max(CANVAS_MULTIPLE, round(raw_h * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+    return tw, th
 
 
 def dumps(obj) -> bytes:

@@ -1,4 +1,4 @@
-"""单任务流水线：cond → refine → VAE 编码 → 采样 → 解码 → ffmpeg mp4。
+"""单任务流水线：cond → refine → 参考帧本地解码+VAE 编码 → 采样 → 解码 → ffmpeg mp4。
 
 移植自 infer_h3_turing.py 的 main() 后半段，三处刻意不同：
   1. **无 warmup**（DiT 部分 warmup 已按需求删除）；
@@ -6,17 +6,24 @@
   3. 输出直接 pipe 进 ffmpeg 出 mp4 —— 不落 PNG 帧序列、不落 wav（wav 仅作
      ffmpeg 的临时输入，mux 后即删）。
 
+cond 文件是 slim 的（只含文本编码器输出）；参考帧由本机从任务 image_b64
+本地解码 + 缩放（目标尺寸与 cond 侧 Qwen 输入共用 target_frame_size）后
+送 VAE 编码。
+
 解码与 DiT 常驻的显存关系已被 10/9 基线日志证明安全（解码峰值 16.70/17.10GB，
 refiner 常驻 +1.52GB 后 ≈18.6GB < 22.5GB）。
 """
+import base64
+import binascii
 import gc
+import io
 import json
 import os
 import subprocess
 import time
 import traceback
 
-from common.protocol import COND_KEYS_FRAME, COND_KEYS_REQUIRED
+from common.protocol import COND_KEYS_REQUIRED, target_frame_size
 
 
 def _stage(job, name, t0):
@@ -77,20 +84,16 @@ def _run_with_cond(job, ctx, cond_path):
 
     from safetensors.torch import load_file
 
-    # ---------- 2. 读 cond（契约校验） ----------
+    # ---------- 2. 读 cond（slim 契约：只含文本编码器输出） ----------
     job.stage = "load_cond"
     t0 = time.perf_counter()
     sd = load_file(cond_path)
     missing = [k for k in COND_KEYS_REQUIRED if k not in sd]
     if missing:
         raise RuntimeError("cond 文件缺少必需字段: %s" % missing)
-    frame_key = next((k for k in COND_KEYS_FRAME if k in sd), None)
-    if frame_key is None:
-        raise RuntimeError("cond 文件缺少 ref_image/first_frame")
     cond_tensor = sd["cond"].to(device="cuda", dtype=compute_dtype)
     tags = sd["minimax_token_tags"].cuda().long()
-    frame = sd[frame_key].cuda().float()
-    job.log.append("cond tensor %s frame %s" % (tuple(cond_tensor.shape), tuple(frame.shape)))
+    job.log.append("cond tensor %s tags %s" % (tuple(cond_tensor.shape), tuple(tags.shape)))
     _stage(job, "load_cond", t0)
 
     # ---------- 3. 文本 refine（refiner 常驻，逐任务跑） ----------
@@ -103,13 +106,15 @@ def _run_with_cond(job, ctx, cond_path):
     del cond_tensor
     torch.cuda.empty_cache()
 
-    # ---------- 4. 参考帧 VAE 编码 ----------
+    # ---------- 4. 参考帧：本地解码 image_b64 + 缩放 + VAE 编码 ----------
     job.stage = "vae_encode"
     t0 = time.perf_counter()
+    frame = _decode_ref_frame(params, t0)  # CPU [H,W,3] float 0..1，已缩到目标尺寸
     with torch.no_grad():
-        z = runtime.vvae.encode(frame.unsqueeze(0))
+        z = runtime.vvae.encode(frame.unsqueeze(0).cuda().float())
     encoded_latent = z.to(device="cuda", dtype=compute_dtype)
-    job.log.append("ref latent %s" % (tuple(encoded_latent.shape),))
+    job.log.append("ref frame %s latent %s"
+                   % (tuple(frame.shape), tuple(encoded_latent.shape)))
     _stage(job, "vae_encode", t0)
     del frame, z
     torch.cuda.empty_cache()
@@ -293,7 +298,29 @@ def _run_with_cond(job, ctx, cond_path):
     rt.log_memory("job done")
 
 
-def tmp_dir_of(out_dir):
-    d = os.path.join(out_dir, ".tmp")
-    os.makedirs(d, exist_ok=True)
-    return d
+def _decode_ref_frame(params, t0):
+    """从任务 image_b64 本地解码参考帧：PIL 解码 → 目标尺寸缩放 → CPU float 张量。
+
+    目标尺寸与 cond 侧 Qwen 输入共用 target_frame_size（两侧一致）；缩放用
+    comfy.common_upscale lanczos（与 cond 侧 _resize 相同）。返回 [H,W,3] float 0..1。
+    """
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    try:
+        image_bytes = base64.b64decode(params["image_b64"], validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError("image_b64 不是合法 base64") from None
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    arr = np.asarray(img).astype(np.float32) / 255.0
+    frame = torch.from_numpy(arr).unsqueeze(0)  # [1,H,W,3]
+    raw_h, raw_w = int(frame.shape[1]), int(frame.shape[2])
+
+    tw, th = target_frame_size(params["mode"], raw_w, raw_h,
+                               params["width"], params["height"],
+                               params.get("ref_image_size", "match"))
+    import comfy.utils as cu
+    samples = frame[..., :3].movedim(-1, 1)
+    samples = cu.common_upscale(samples, tw, th, "lanczos", "disabled")
+    return samples.movedim(1, -1)[0]

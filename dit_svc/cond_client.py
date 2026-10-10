@@ -26,8 +26,8 @@ def fetch(cond_url, payload, timeout=1800):
             resp = json.loads(r.read().decode("utf-8"))
     except urllib.error.URLError as e:
         raise RuntimeError(
-            "连不上本机 cond server（%s）——远程回调依赖 ssh -R 隧道，请用 "
-            "\"ssh -R 9310:localhost:8189 ...\" 连接后再提交任务（原始错误: %s）" % (base, e)
+            "连不上本机 cond server（%s）——远程回调依赖 ssh -R 隧道（见 tunnel.ps1），"
+            "请开隧道后再提交任务（原始错误: %s）" % (base, e)
         ) from e
     if not resp.get("ok"):
         raise RuntimeError("cond server 编码失败: %s" % resp.get("error", "未知错误"))

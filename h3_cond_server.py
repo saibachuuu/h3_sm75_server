@@ -6,7 +6,8 @@
 职责：
   - 启动时加载 Qwen3-VL-32B int4 文本编码器并**常驻**（一次 ~几十秒）；
   - POST /encode 同步编码 ref2va/fl2va 条件（首次 ~22s，内容哈希缓存命中即时）；
-  - 输出 safetensors 契约 = infer_h3_turing.read_cond 所需（含 ref_image/first_frame）。
+  - 输出 slim safetensors（仅文本编码器输出：cond/minimax_token_tags[/attention_mask|pooled_output]，
+    不带图像像素；参考帧由 dit server 从任务 image_b64 本地解码 + VAE 编码）。
 
 远程 dit server 方案 A 的回调路径：ssh -R 9310:127.0.0.1:8189 之后（或跑 tunnel.ps1），
 远程访问 http://127.0.0.1:9310 即本服务。
