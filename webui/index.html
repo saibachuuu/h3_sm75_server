@@ -113,8 +113,8 @@
           <input type="number" id="width" value="640" step="32" min="256" max="1600">
           <input type="number" id="height" value="960" step="32" min="256" max="1600">
         </div>
-        <label>帧数（24 fps）</label>
-        <input type="number" id="length" value="124" min="16" max="400">
+        <label>帧数（24 fps）<span id="lenPreview" class="muted"></span></label>
+        <input type="number" id="length" value="124" min="124" max="362">
       </div>
     </div>
 
@@ -212,10 +212,28 @@ $("image").addEventListener("change", () => {
   rd.readAsDataURL(f);
 });
 
+/* ---------- 帧数 → 秒数预览（24fps，1 位小数；越界警告并拦截提交） ---------- */
+const LEN_MIN = 124, LEN_MAX = 362, FPS = 24;
+function refreshLen() {
+  const n = +$("length").value;
+  const el = $("lenPreview");
+  if (!Number.isInteger(n) || n < LEN_MIN || n > LEN_MAX) {
+    el.textContent = " ⚠ 仅支持 " + LEN_MIN + "–" + LEN_MAX + " 帧";
+    el.style.color = "var(--err)";
+    return false;
+  }
+  el.textContent = " ≈ " + (n / FPS).toFixed(1) + "s";
+  el.style.color = "";
+  return true;
+}
+$("length").addEventListener("input", refreshLen);
+refreshLen();
+
 $("submitBtn").addEventListener("click", async () => {
   const prompt = $("prompt").value.trim();
   if (!prompt) return toast("提示词不能为空");
   if (!imageB64) return toast("请先选择参考图");
+  if (!refreshLen()) return toast("帧数仅支持 " + LEN_MIN + "–" + LEN_MAX + "（当前输入越界）");
   const payload = {
     prompt, image_b64: imageB64, image_name: imageName,
     mode: $("mode").value, ref_image_size: $("ref_image_size").value,
