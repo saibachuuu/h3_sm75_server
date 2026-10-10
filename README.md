@@ -60,9 +60,18 @@ h3_cond_server.py
 h3_dit_server.py
   --port 8190  --cond-url http://127.0.0.1:9310
   --unet D:\10Eros_Max_h3_TURBO-hybrid_beta5_w4a8_14gb_optimized.safetensors
-  --attn int8|sage|w8a8|sdpa   ← 服务级；sage/w8a8 仅调试（sage 全尺寸 0/2 崩溃）
+  --attn int8|sage|w8a8|sdpa|veda   ← 服务级；sage/w8a8 仅调试（sage 全尺寸 0/2 崩溃）
+  --light-vae                 视频 VAE 换 LynnReal Light（26 层，省 ~0.7GB）
+  --veda-bundle D:\minimax_h3_r2va_veda_preview_fp8.safetensors
+  --veda-precision bf16|w8a8  --veda-keep 0(=bundle 默认) --veda-warmup off|probe|tier1..3
+  --veda-debug                Veda 调试日志（tile plan/keep + 每 forward 的 sparse_calls）
   --w4a8_backend turingutils   --mlp_chunk 8192  --runner-dir(自动探测)
 ```
+
+> ⚠️ Veda 的启动 warmup 与 `/api/warmup compare` 走的是**合成调用**（没有
+> `transformer_options["minimax_h3_layout"]`）→ `integration.py:45-47` 会判 dense，
+> 量到的是**稠密回退**而不是 `veda_sparse_online_attn`。要在真路径上归因，
+> 用 `profile_attn: true` 的任务（见下）配合 `--veda-debug`。
 
 ## API（供脚本化提交）
 
@@ -73,12 +82,14 @@ GET  /api/jobs                       任务列表
 GET  /api/jobs/<id>                  任务详情（含日志尾部）
 POST /api/jobs                       JSON {prompt, image_b64, mode, width, height,
                                      length, steps, sampler, scheduler, seed,
-                                     refine_steps, ref_image_size, sigmas?} -> {job_id}
+                                     refine_steps, ref_image_size, sigmas?, profile_attn?}
+                                     -> {job_id}
 POST /api/jobs/cond                  直接喂 cond（不回调 cond server，不需要隧道）：
                                      JSON {cond_b64 | cond_file, image_b64s? 0–9,
                                      mode, width, height, length, steps, sampler,
                                      scheduler, seed, refine_steps, refine_denoise,
-                                     ref_image_size, sigmas?, prompt?} -> {job_id}
+                                     ref_image_size, sigmas?, profile_attn?,
+                                     prompt?} -> {job_id}
 POST /api/vae_probe                   只跑视频 VAE 编解码（不进 DiT、不采样）：
                                      JSON {image_b64?, decode?=true, latent?, write_mp4?,
                                      write_png?, mode?, ref_image_size?, width,
@@ -128,6 +139,13 @@ curl -X POST http://127.0.0.1:8190/api/jobs/cond -H "Content-Type: application/j
 ```
 
 cond server：`GET /health`、`POST /encode`、`GET /files/<hash>.safetensors`。
+
+### 诊断：profile_attn: true
+
+任务里带 `profile_attn: true`（`/api/jobs` 与 `/api/jobs/cond` 都支持）→ 只对**第一个采样步**
+开 `torch.profiler`（CUDA activity + python 调用栈），top-14 kernel 与调用栈写进
+`cond_stats.attn_profile`（同时进任务日志）。配合 `--veda-debug` 就能在**真路径**上回答
+"`veda_sparse_online_attn` 到底跑没跑、时间花在稀疏内核还是打分/打包/搬运"。
 
 ### POST /api/vae_probe（只跑 VAE 编解码）
 
