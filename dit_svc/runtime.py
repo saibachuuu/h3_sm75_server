@@ -127,69 +127,6 @@ class Runtime:
             traceback.print_exc()
             raise
 
-    # veda warmup 分级（tokens）。tier3=全尺寸 24.5k 是 sage 崩溃量级，
-    # 仅手动指定才跑。这是 **dense 回退 + 通路** 验证，不是稀疏率验证。
-    WARMUP_TIERS_VEDA = {"probe": 256, "tier1": 2048,
-                         "tier2": 8192, "tier3": 24500}
-
-    def _veda_warmup(self, rt, attention, torch, unet, patch, level, fallback):
-        """veda 分级 warmup（路线 B）。
-
-        与旧 dev 分支的本质区别：旧分支用 `override(fallback, q,k,v, heads,
-        skip_reshape=True)` **裸调** override —— 没有 transformer_options，
-        fork/star7 的 gate 第一行就判 dense，所以 3.8/80/312/602ms 全是
-        稠密回退的数（根因三）。
-
-        本实现：带全 transformer_options 调一次 override（真实 H3 形态
-        1x56xNx128 fp16、mask=None、skip_reshape=True），让 gate 的每道门
-        都有机会过；并把 star7 VedaPatch.run.calls 打出来。失败抛
-        RuntimeError，调用方回退 int8。
-        """
-        if level == "off":
-            print("[warmup] veda 跳过（--veda-warmup off）", flush=True)
-            return
-        if level not in self.WARMUP_TIERS_VEDA:
-            raise ValueError("未知 warmup 级别: %s" % level)
-        ok, vram = veda_attn_star7.check_nvml_sane(torch)
-        if not ok:
-            raise RuntimeError("[warmup %s] NVML 异常，中止：%s" % (level, vram))
-        tokens = self.WARMUP_TIERS_VEDA[level]
-        heads, dim = 56, 128
-        print("[warmup veda probe] n=%d | %s" % (tokens, vram), flush=True)
-        parts = []
-        for s in range(0, tokens, 4096):
-            m = min(4096, tokens - s)
-            parts.append(torch.randn(1, heads, m, dim, device="cuda:0",
-                                     dtype=torch.float16))
-        q = torch.cat(parts, dim=2)
-        del parts
-        k, v = q.clone(), q.clone()
-        torch.cuda.synchronize()
-        options = unet.model_options.get("transformer_options", {})
-        override = options.get("optimized_attention_override")
-        if override is None:
-            raise RuntimeError("[warmup veda] unet.model_options 里没有 override")
-        opts = dict(options)
-        opts["block_index"] = 1        # 让 layer 元数据这道门有值
-        try:
-            out = override(fallback, q, k, v, heads, mask=None, skip_reshape=True,
-                           transformer_options=opts)
-        except Exception as e:  # noqa: BLE001 - warmup 失败即回退
-            raise RuntimeError("[warmup veda probe] override 调用失败: %s: %s"
-                               % (type(e).__name__, e))
-        torch.cuda.synchronize()
-        finite = bool(torch.isfinite(out.float()).all())
-        del q, k, v, out
-        torch.cuda.empty_cache()
-        calls = dict(patch.run.calls) if patch is not None else {}
-        print("[warmup veda probe] n=%d finite=%s calls=%s | vram=%s"
-              % (tokens, finite, calls, vram), flush=True)
-        if not finite:
-            raise RuntimeError("[warmup veda probe] 输出非 finite")
-        # 口径：随机噪声 + 合成 options 仍可能被判 dense（没有真实 packed
-        # layout / conditioning payload），所以这里的 ms 不是稀疏加速比；
-        # 稀疏是否真跑只看真任务累计（/api/status.veda_calls）。
-
     def _load(self):
         rt = self.rt
         args = self.args
@@ -246,7 +183,7 @@ class Runtime:
         self._dit_sub_ledger(unet, torch)
         if getattr(args, "dump_module_dtypes", False):
             self._dump_module_dtypes(unet)
-        result = self._install_attention(
+        result = _install_attention(
             rt, attention, minimax_model, comfy_kitchen, args.attn,
             args=args, unet=unet)
         if args.attn == "veda":
