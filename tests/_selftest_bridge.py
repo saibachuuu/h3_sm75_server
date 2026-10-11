@@ -152,7 +152,11 @@ import dit_svc.veda_star7 as vs  # noqa: E402
 # 所以要在 veda.comfy_patch 模块上打桩才有意义。
 vcp.apply = _apply_stub
 
-patched, handle, info = vs.install(unet, Args(), torch=None, log=print)
+# install() 返回 (patch, info) 二元组；runtime 的解包必须一致（第三次线上事故教训）
+handle, info = vs.install(unet, Args(), torch=None, log=print)
+assert hasattr(handle, "run") and hasattr(handle, "install"), \
+    "handle 应是 VedaPatch（有 run 统计与 install 方法）"
+assert info["keep_tiles"] == 32.0
 print("   calls:", calls)
 print("   info :", info)
 assert calls[0][0] == "load_bundle"

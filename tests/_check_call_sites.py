@@ -67,6 +67,41 @@ def check(path=PATH) -> int:
                       % (fn.name, node.lineno, node.attr))
                 return 4
 
+    # ---- 第三次线上事故（2026-10-11）：接口签名不一致 ----
+    # `veda_star7.install` 返回 2 元组，runtime 里却解包 3 个 -> 线上
+    # ValueError: too many values to unpack（DiT 加载 124s 之后）。
+    # 静态检查：两个文件的元组长度必须一致。
+    veda_path = os.path.join(os.path.dirname(PATH), "veda_star7.py")
+    with io.open(veda_path, encoding="utf-8") as f:
+        veda_tree = ast.parse(f.read())
+    install_fn = next(n for n in veda_tree.body
+                      if isinstance(n, ast.FunctionDef) and n.name == "install")
+    returns = [n for n in ast.walk(install_fn) if isinstance(n, ast.Return)
+               and n.value is not None]
+    arity = set()
+    for r in returns:
+        arity.add(len(r.value.elts) if isinstance(r.value, ast.Tuple) else 1)
+    # 注意：调用点在**模块级函数** `_install_attention` 里（不是 Runtime 方法），
+    # 所以这里必须 walk 整个模块树而不是只 walk class Runtime。
+    call_arities = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) \
+                and isinstance(node.value.func, ast.Attribute) \
+                and node.value.func.attr == "install" \
+                and isinstance(node.value.func.value, ast.Name) \
+                and node.value.func.value.id == "veda_star7":
+            t = node.targets[0]
+            call_arities.add(len(t.elts) if isinstance(t, ast.Tuple) else 1)
+    if not call_arities:
+        print("FATAL: runtime.py 里找不到 veda_star7.install(...) 调用点")
+        return 7
+    if arity and call_arities and arity != call_arities:
+        print("FATAL: veda_star7.install 返回 %s 元组，runtime 解包 %s 个"
+              % (sorted(arity), sorted(call_arities)))
+        return 6
+    print("ok: veda_star7.install 签名一致（return %s / 解包 %s）"
+          % (sorted(arity), sorted(call_arities)))
+
     methods = sorted(n.name for n in ast.walk(runtime)
                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
     print("OK runtime.py 调用点一致（Runtime methods: %s）" % methods)

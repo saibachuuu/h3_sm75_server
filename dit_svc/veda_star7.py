@@ -220,4 +220,4 @@ def install(unet, args, torch, log=print, probe_log=None):
         "callbacks": sorted(callbacks),
     }
     log("[veda] active: implementation=star7-cuda-int8(sm75) | %s" % info["budget"])
-    return unet, patch, info
+    return patch, info
