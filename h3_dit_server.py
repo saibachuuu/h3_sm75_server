@@ -72,6 +72,14 @@ def main():
                     help="保持全量注意力的 DiT block 索引，如 '0,1,49'（0 基）")
     ap.add_argument("--veda-dense-steps", default="",
                     help="保持全量注意力的采样步索引，如 '0'（0 基，第一步）")
+    ap.add_argument("--veda-tile-precision", choices=["fp32", "fp16"], default="fp32",
+                    help="VEDA 打分（tile_logits 三个 bmm）精度：fp32=上游默认行为；"
+                         "fp16 走 sm75 HMMA（实验项，需同参 A/B 验证画质；"
+                         "sm75 的 bf16 本来就无张量核，fp16 是硬件快路）")
+    ap.add_argument("--veda-chunk-share", type=int, default=16,
+                    help="VEDA head chunk 大小 = 剩余显存 // N（上游默认 16）。"
+                         "显存富余（如当前 ~3.8GB）时调小（如 8）可减少 kernel "
+                         "launch 次数；=1 表示一次吃完剩余显存，慎用")
     ap.add_argument("--veda-warmup", choices=["off", "probe", "tier1", "tier2", "tier3"],
                     default="probe", help="Veda/sage 启动 warmup 负载分级（默认 probe 最小）")
     ap.add_argument("--veda-debug", action="store_true",
@@ -124,6 +132,8 @@ def main():
                  args.veda_keep_tiles or "bundle默认",
                  args.veda_dense_layers or "-",
                  args.veda_dense_steps or "-"), flush=True)
+        print(" veda tuning tile_precision=%s chunk_share=%d（上游默认 fp32/16）"
+              % (args.veda_tile_precision, args.veda_chunk_share), flush=True)
     print(" 本机隧道（一条命令开双向）:", flush=True)
     print("   ssh -p <port> -L %d:localhost:%d -R 9310:localhost:8189 sheepserver@<host>"
           % (args.port, args.port), flush=True)

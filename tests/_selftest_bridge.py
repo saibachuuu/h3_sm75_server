@@ -136,10 +136,14 @@ def fake_apply(model, bundle, settings, node_id):
 
 
 veda_star7.load_bundle = fake_load
-# resolve_backend 需要 GPU（DLL + self_test），测试桩跳过，返回 backend 信息
-veda_star7.resolve_backend = lambda torch, log=print: vs7.BACKEND_INFO.update(
-    resolved=True, ok=True, display="Star7 VEDA INT8 Tensor Core (SM75)",
-    report="star7-cuda-int8: ok")
+# resolve_backend 需要 GPU（DLL + self_test），测试桩跳过；签名与生产一致
+# （教训：stub 必须兼容 kwargs，否则就是"测试与生产不一致地绿"）
+veda_star7.resolve_backend = lambda torch, log=print, args=None: types.SimpleNamespace(
+    backend=types.SimpleNamespace(chunk_share=16, display="stub"),
+    report="stub")
+vs7.BACKEND_INFO.update(resolved=True, ok=True,
+                        display="Star7 VEDA INT8 Tensor Core (SM75)",
+                        report="star7-cuda-int8: ok")
 
 
 def _apply_stub(model, bundle, settings, node_id):

@@ -38,14 +38,16 @@ def _ensure_import_path(here: str) -> None:
         sys.path.insert(0, here)
 
 
-def resolve_backend(torch, log=print) -> dict:
+def resolve_backend(torch, log=print, args=None):
     """启动即加载 SM75 稀疏后端并做数值自检（fail fast）。
 
     star7 的 backends.resolve() 会：加载 DLL（sha256 + ABI 校验）-> base.self_test()
     （含"kernel 是否忽略了 block mask"的检查）。这一步放在服务启动时，
     而不是等第一个真任务的第一次稀疏调用才暴露失败。
+    args 非空时同步应用 --veda-chunk-share（见 veda/server_tuning.py）。
     """
     from veda import backends
+    from veda import server_tuning
     from dit_svc import veda_attn_star7
 
     info = hardware_device_info(torch)
@@ -62,6 +64,19 @@ def resolve_backend(torch, log=print) -> dict:
     if resolution.backend is None:
         raise RuntimeError("SM75 稀疏后端不可用（self_test 未过）: %s" % report)
     log("[veda-backend] self_test passed: %s" % resolution.backend.display)
+
+    tuning = {}
+    if args is not None:
+        share = int(getattr(args, "veda_chunk_share", 16) or 16)
+        if share != 16:
+            tuning["chunk_share"] = share
+            server_tuning.set_chunk_share(resolution.backend, share, log=log)
+        else:
+            log("[veda-tuning] chunk_share=%d（上游默认，未改）" % share)
+    if tuning:
+        resolve_backend.tuning = tuning
+    else:
+        resolve_backend.tuning = {}
     return resolution
 
 
@@ -190,10 +205,18 @@ def install(unet, args, torch, log=print, probe_log=None):
     # 0) star7 诊断接出（每个 run 的 Attention computed % 摘要靠它可见）
     veda_attn_star7.install_logger(log=log)
 
-    # 1) SM75 后端：加载 DLL + 数值 self_test，启动即 fail fast
-    resolve_backend(torch, log=log)
+    # 1) SM75 后端：加载 DLL + 数值 self_test + 应用 --veda-chunk-share，
+    #    启动即 fail fast
+    resolution = resolve_backend(torch, log=log, args=args)
 
-    # 2) 参数与 bundle
+    # 2) 可选调参：打分精度（默认 fp32=上游行为；见 veda/server_tuning.py）
+    from veda import server_tuning
+    tuning = server_tuning.configure(
+        tile_precision=str(getattr(args, "veda_tile_precision", "fp32") or "fp32"),
+        chunk_share=int(getattr(args, "veda_chunk_share", 16) or 16),
+        backend=resolution.backend, log=log)
+
+    # 3) 参数与 bundle
     settings = settings_from_args(args, log=log)
     loaded = load_bundle(args, log=log)
     check_model_dims(unet, loaded, log=log)
@@ -218,6 +241,7 @@ def install(unet, args, torch, log=print, probe_log=None):
                        else "ratio=%.4f" % loaded.generated.ratio),
         "backend": veda_attn_star7.BACKEND_INFO.get("display"),
         "callbacks": sorted(callbacks),
+        "tuning": tuning,
     }
     log("[veda] active: implementation=star7-cuda-int8(sm75) | %s" % info["budget"])
     return patch, info
