@@ -10,17 +10,29 @@ WEBUI_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 MAX_BODY = 96 * 1024 * 1024
 
 
+_RUNTIME_HOLDER = {}   # make_handler 时登记 runtime（_veda_probe_snapshot 用）
+
+
 def _veda_probe_snapshot():
-    """--veda-debug 的运行期探针（准入判定统计 / 稀疏真跑次数）。"""
+    """--veda-debug 的运行期探针（路线 B：star7 VedaPatch 统计）。
+
+    active=False 表示 veda 未启用或已回退 int8；calls 里 'sparse' 是稀疏
+    真跑次数，其余键是 dense 原因；compute_fraction 是相对全量注意力的占比。
+    """
     try:
-        from dit_svc import veda_attn
-        return dict(veda_attn.VEDA_PROBE) or None
+        runtime = _RUNTIME_HOLDER.get("runtime")
+        patch = getattr(runtime, "veda_patch", None) if runtime is not None else None
+        if patch is None:
+            return None
+        from dit_svc.veda_attn_star7 import snapshot
+        return snapshot(patch) or None
     except Exception:
         return None
 
 
 def make_handler(runtime, queue, ctx):
     out_dir = ctx["out_dir"]
+    _RUNTIME_HOLDER["runtime"] = runtime
 
     class DitHandler(BaseHTTPRequestHandler):
         server_version = "h3DitServer/1.0"
@@ -257,13 +269,15 @@ def make_handler(runtime, queue, ctx):
                     return
                 try:
                     from dit_svc.job_queue import BusyError
-                    from dit_svc.veda_attn import WARMUP_TIERS
+                    from dit_svc.veda_attn_star7 import WARMUP_TIERS_VEDA as WARMUP_TIERS
                     tokens = payload.get("tokens")
                     if tokens is None and payload.get("level"):
                         tier = WARMUP_TIERS.get(payload.get("level"))
                         if tier is None:
                             raise ValueError("level 须为 probe|tier1|tier2|tier3")
-                        tokens = tier[0]
+                        # 路线 B 起 tiers 的值就是 token 数（int）；旧格式是
+                        # (tokens, desc) tuple，这里两种都兼容。
+                        tokens = tier[0] if isinstance(tier, (tuple, list)) else tier
                     if not isinstance(tokens, int) or not (16 <= tokens <= 40000):
                         raise ValueError("tokens 须为 16–40000 的整数（或 level 挡位）")
                     repeat = payload.get("repeat", 1)

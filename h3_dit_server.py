@@ -59,10 +59,19 @@ def main():
                     help="服务级 attention 后端（int8=已验证默认；sage/w8a8=调试档；veda=dev 实验）")
     ap.add_argument("--veda-bundle", default=DEFAULT_VEDA_BUNDLE,
                     help="Veda predictor bundle (.safetensors)，--attn veda 时必填")
-    ap.add_argument("--veda-precision", choices=["w8a8", "bf16"], default="bf16",
-                    help="Veda 打分器精度（远程 kernel 缺 w8a8 符号，默认 bf16；sm75 上走 FP32 仿算）")
+    ap.add_argument("--veda-keep-tiles", type=int, default=0,
+                    help="每个 query tile 保留的 key tile 数（star7 预算语义）；"
+                         "0=用 bundle 训练默认值（r2va bundle 是 32）")
+    ap.add_argument("--veda-ref-keep-tiles", type=int, default=-1,
+                    help="reference 块（首尾帧/参考图/视频）每 query tile 保留的 key "
+                         "tile 数；-1=跟随 --veda-keep-tiles")
     ap.add_argument("--veda-keep", type=float, default=0.0,
-                    help="Veda 保留率，0=用 bundle 训练默认值 (0,1]")
+                    help="按比例的保留率 (0,1]（star7 Budget.ratio 语义）；"
+                         "与 --veda-keep-tiles 二选一，tiles 优先")
+    ap.add_argument("--veda-dense-layers", default="",
+                    help="保持全量注意力的 DiT block 索引，如 '0,1,49'（0 基）")
+    ap.add_argument("--veda-dense-steps", default="",
+                    help="保持全量注意力的采样步索引，如 '0'（0 基，第一步）")
     ap.add_argument("--veda-warmup", choices=["off", "probe", "tier1", "tier2", "tier3"],
                     default="probe", help="Veda/sage 启动 warmup 负载分级（默认 probe 最小）")
     ap.add_argument("--veda-debug", action="store_true",
@@ -109,6 +118,12 @@ def main():
     print(" H3 DiT server | WebUI: http://%s:%d/" % (args.host, args.port), flush=True)
     print(" attention=%s  w4a8=%s  mlp_chunk=%d  cond=%s"
           % (args.attn, args.w4a8_backend, args.mlp_chunk, args.cond_url), flush=True)
+    if args.attn == "veda":
+        print(" veda bundle=%s keep_tiles=%s dense_layers=%r dense_steps=%r"
+              % (os.path.basename(args.veda_bundle),
+                 args.veda_keep_tiles or "bundle默认",
+                 args.veda_dense_layers or "-",
+                 args.veda_dense_steps or "-"), flush=True)
     print(" 本机隧道（一条命令开双向）:", flush=True)
     print("   ssh -p <port> -L %d:localhost:%d -R 9310:localhost:8189 sheepserver@<host>"
           % (args.port, args.port), flush=True)

@@ -63,17 +63,43 @@ h3_dit_server.py
   --attn int8|sage|w8a8|sdpa|veda   ← 服务级；sage/w8a8 仅调试（sage 全尺寸 0/2 崩溃）
   --light-vae                 视频 VAE 换 LynnReal Light（26 层，省 ~0.7GB）
   --veda-bundle D:\minimax_h3_r2va_veda_preview_fp8.safetensors
-  --veda-precision bf16|w8a8  --veda-keep 0(=bundle 默认) --veda-warmup off|probe|tier1..3
-  --veda-debug                Veda 调试日志（tile plan/keep + 每 forward 的 sparse_calls）
-                              ＋ Veda 准入探针（/api/status.veda_probe）＋ 接管第三方 logger
+  --veda-keep-tiles 0         每 query tile 保留的 key tile 数；0=bundle 训练默认
+                              （r2va bundle 是 32；--veda-keep 0.15 可改用比例预算）
+  --veda-ref-keep-tiles -1    reference 块预算，-1=跟随 target
+  --veda-dense-layers ""      保持全量注意力的 block，如 "0,1,49"
+  --veda-dense-steps ""       保持全量注意力的采样步，如 "0"
+  --veda-warmup off|probe|tier1..3
+  --veda-debug                tile plan/keep + 每 forward 的稀疏/dense 计数
   --dump-module-dtypes        加载后打印 DiT 带权模块的 dtype/quant 台账（查 bf16 仿算层）
   --w4a8_backend turingutils   --mlp_chunk 8192  --runner-dir(自动探测)
 ```
 
-> ⚠️ Veda 的启动 warmup 与 `/api/warmup compare` 走的是**合成调用**（没有
-> `transformer_options["minimax_h3_layout"]`）→ `integration.py:45-47` 会判 dense，
-> 量到的是**稠密回退**而不是 `veda_sparse_online_attn`。要在真路径上归因，
-> 用 `profile_attn: true` 的任务（见下）配合 `--veda-debug`。
+### Veda（路线 B：vendored star7 实现）
+
+`--attn veda` 现在跑的是 **vendored 的 star7 VEDA**（`h3_sm75_server/veda/`，
+来自 `minimax-h3-chunk-star7@e03ee50`），不再依赖 `comfyui_turing_utils` 的
+Veda 适配层。两者差别是结构性的：
+
+| | 旧（fork `configure()`） | 现在（star7 vendored） |
+|---|---|---|
+| 载体 | 只从 clone 抠 override 函数回塞原对象，layout provider / schedule / config 全丢 → gate 恒 dense | `VedaPatch` 自带全部伴生状态；gate 只读 comfy core 每次都发布的 `minimax_h3_layout` + `block_index` |
+| 调用点 | `minimax_model.optimized_attention` 被模块级改指到 dense kernel，override 永不被咨询 | 不碰模块级名字，走 comfy 分发器（`wrap_attn` 保证 override 优先） |
+| SM75 kernel | 依赖 pip 轮 `_sage_qattn_sm75.pyd` 导出 6 个 `veda_*` 符号 | 自带 `bin/win_amd64/star7_veda_sm75_v1.dll`（ctypes C ABI + sha256 + ABI 校验），完全不碰 Triton |
+
+**运行期只信这两个数**（`GET /api/status`）：
+- `veda_calls.sparse` —— 稀疏真跑次数（≈ 层数 × 步数 量级才算真在工作）；
+- `veda_calls.compute_fraction` —— 相对全量注意力实际算了的比例（0.1~0.2 正常）。
+
+启动 warmup / `POST /api/warmup` 是**合成调用**（无真实 packed layout），
+star7 的 gate 会判 dense，所以 warmup/bench 的 ms 数只是 **dense 回退**口径，
+不是稀疏加速比。要在真路径上归因，跑带 `profile_attn: true` 的真任务并看
+`cond_stats.attn_profile` 的 kernel 明细。
+
+`STAR7_VEDA_SM75_BIN` 环境变量可覆盖 DLL/manifest 所在目录（默认
+`<repo>/bin`）。
+
+> 附带收益：Dense 回退底座由 `attention.optimized_attention` 决定，
+> veda 档下它就是 comfy-kitchen int8（与 `--attn int8` 同一条已验证路径）。
 
 ## API（供脚本化提交）
 

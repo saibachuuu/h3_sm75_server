@@ -1,0 +1,9 @@
+{
+  "abi_version": 1,
+  "compute_capability": "7.5",
+  "windows_x64": {
+    "file": "win_amd64/star7_veda_sm75_v1.dll",
+    "sha256": "9f8505625369346b8ea242b52e6fcdb08d5c8a4870725141b5b1d9e48620dbea",
+    "size": 793088
+  }
+}

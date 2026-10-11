@@ -15,6 +15,8 @@ import sys
 import time
 import traceback
 
+from dit_svc import veda_attn_star7  # noqa: F401  veda NVML/warmup 工具
+
 
 def find_ffmpeg():
     """远程 ffmpeg：优先 imageio_ffmpeg 自带二进制（ComfyUI python_embeded 已带 7.1）。"""
@@ -46,6 +48,7 @@ class Runtime:
         self.avae = None
         self.diff_model = None
         self.attn_override = None
+        self.veda_patch = None      # --attn veda 时：star7 VedaPatch（运行期统计）
         self.ffmpeg = None
         self.attn = args.attn
 
@@ -124,6 +127,69 @@ class Runtime:
             traceback.print_exc()
             raise
 
+    # veda warmup 分级（tokens）。tier3=全尺寸 24.5k 是 sage 崩溃量级，
+    # 仅手动指定才跑。这是 **dense 回退 + 通路** 验证，不是稀疏率验证。
+    WARMUP_TIERS_VEDA = {"probe": 256, "tier1": 2048,
+                         "tier2": 8192, "tier3": 24500}
+
+    def _veda_warmup(self, rt, attention, torch, unet, patch, level, fallback):
+        """veda 分级 warmup（路线 B）。
+
+        与旧 dev 分支的本质区别：旧分支用 `override(fallback, q,k,v, heads,
+        skip_reshape=True)` **裸调** override —— 没有 transformer_options，
+        fork/star7 的 gate 第一行就判 dense，所以 3.8/80/312/602ms 全是
+        稠密回退的数（根因三）。
+
+        本实现：带全 transformer_options 调一次 override（真实 H3 形态
+        1x56xNx128 fp16、mask=None、skip_reshape=True），让 gate 的每道门
+        都有机会过；并把 star7 VedaPatch.run.calls 打出来。失败抛
+        RuntimeError，调用方回退 int8。
+        """
+        if level == "off":
+            print("[warmup] veda 跳过（--veda-warmup off）", flush=True)
+            return
+        if level not in self.WARMUP_TIERS_VEDA:
+            raise ValueError("未知 warmup 级别: %s" % level)
+        ok, vram = veda_attn_star7.check_nvml_sane(torch)
+        if not ok:
+            raise RuntimeError("[warmup %s] NVML 异常，中止：%s" % (level, vram))
+        tokens = self.WARMUP_TIERS_VEDA[level]
+        heads, dim = 56, 128
+        print("[warmup veda probe] n=%d | %s" % (tokens, vram), flush=True)
+        parts = []
+        for s in range(0, tokens, 4096):
+            m = min(4096, tokens - s)
+            parts.append(torch.randn(1, heads, m, dim, device="cuda:0",
+                                     dtype=torch.float16))
+        q = torch.cat(parts, dim=2)
+        del parts
+        k, v = q.clone(), q.clone()
+        torch.cuda.synchronize()
+        options = unet.model_options.get("transformer_options", {})
+        override = options.get("optimized_attention_override")
+        if override is None:
+            raise RuntimeError("[warmup veda] unet.model_options 里没有 override")
+        opts = dict(options)
+        opts["block_index"] = 1        # 让 layer 元数据这道门有值
+        try:
+            out = override(fallback, q, k, v, heads, mask=None, skip_reshape=True,
+                           transformer_options=opts)
+        except Exception as e:  # noqa: BLE001 - warmup 失败即回退
+            raise RuntimeError("[warmup veda probe] override 调用失败: %s: %s"
+                               % (type(e).__name__, e))
+        torch.cuda.synchronize()
+        finite = bool(torch.isfinite(out.float()).all())
+        del q, k, v, out
+        torch.cuda.empty_cache()
+        calls = dict(patch.run.calls) if patch is not None else {}
+        print("[warmup veda probe] n=%d finite=%s calls=%s | vram=%s"
+              % (tokens, finite, calls, vram), flush=True)
+        if not finite:
+            raise RuntimeError("[warmup veda probe] 输出非 finite")
+        # 口径：随机噪声 + 合成 options 仍可能被判 dense（没有真实 packed
+        # layout / conditioning payload），所以这里的 ms 不是稀疏加速比；
+        # 稀疏是否真跑只看真任务累计（/api/status.veda_calls）。
+
     def _load(self):
         rt = self.rt
         args = self.args
@@ -180,13 +246,23 @@ class Runtime:
         self._dit_sub_ledger(unet, torch)
         if getattr(args, "dump_module_dtypes", False):
             self._dump_module_dtypes(unet)
-        self.attn_override = _install_attention(
+        result = self._install_attention(
             rt, attention, minimax_model, comfy_kitchen, args.attn,
             args=args, unet=unet)
-        if self.attn_override is not None:
-            unet.model_options.setdefault("transformer_options", {})[
-                "optimized_attention_override"] = self.attn_override
-            print("[attention] %s override installed on unet.model_options" % args.attn, flush=True)
+        if args.attn == "veda":
+            # 路线 B：veda_star7.install() 已把 override + ON_PREPARE_STATE /
+            # ON_CLEANUP 回调就地装在 unet.model_options 上（不走 clone，
+            # 保持单一对象给常驻引用 / _unhook_dit / _AttnWindowProfiler 用）。
+            # result 是 veda handle（VedaPatch，不是函数）；None = 已回退 int8。
+            self.attn_override = None
+            print("[attention] veda handle=%s"
+                  % ("patch" if result is not None else "None(已回退int8)"), flush=True)
+        else:
+            self.attn_override = result
+            if self.attn_override is not None:
+                unet.model_options.setdefault("transformer_options", {})[
+                    "optimized_attention_override"] = self.attn_override
+                print("[attention] %s override installed on unet.model_options" % args.attn, flush=True)
 
         # ---- 2. 两个 VAE（权重留 CPU，按需上卡，之后常驻） ----
         from collections import Counter
@@ -246,7 +322,18 @@ class Runtime:
         model_shifted = rt.unpack(MiniMaxH3SigmaShift.execute(unet, 12.0, 3.0))[0]
         model_shifted.model.manual_cast_dtype = torch.bfloat16
         model_shifted.offload_device = device
-        if self.attn_override is not None:
+        if args.attn == "veda":
+            # veda：ModelPatcher.clone() 会深拷 model_options 并复制
+            # callbacks/wrappers（comfy/model_patcher.py:431-505），所以
+            # sigma-shift 的 clone 自带 override 与 ON_PREPARE_STATE 回调；
+            # 这里再显式 install 一次只是双保险（install() 幂等：
+            # current in self.installed 即返回）。
+            if self.veda_patch is not None:
+                self.veda_patch.install(
+                    model_shifted.model_options.setdefault("transformer_options", {}))
+                print("[attention] veda override installed on model_shifted.model_options",
+                      flush=True)
+        elif self.attn_override is not None:
             model_shifted.model_options.setdefault("transformer_options", {})[
                 "optimized_attention_override"] = self.attn_override
             print("[attention] %s override installed on model_shifted.model_options" % args.attn,
@@ -322,11 +409,77 @@ def _build_video_vae(comfy, vsd, vmd, device, torch):
         minimax_vae.MiniMaxH3VideoVAE.__init__ = orig_vae_init
 
 
+class _VedaWarmupShim:
+    """给模块级 _install_attention 用的 warmup 转接头。
+
+    _install_attention 是模块级函数（被 Runtime._load 以 rt/attention 等
+    注入参数调用），拿不到 self，所以 warmup 逻辑放这个小类里；真正的
+    Runtime._veda_warmup 是同一套逻辑的方法形态（见类定义）。
+    """
+
+    def run(self, torch, unet, patch, level, fallback):
+        if level == "off":
+            print("[warmup] veda 跳过（--veda-warmup off）", flush=True)
+            return
+        tiers = {"probe": 256, "tier1": 2048, "tier2": 8192, "tier3": 24500}
+        if level not in tiers:
+            raise ValueError("未知 warmup 级别: %s" % level)
+        ok, vram = veda_attn_star7.check_nvml_sane(torch)
+        if not ok:
+            raise RuntimeError("[warmup %s] NVML 异常，中止：%s" % (level, vram))
+        tokens = tiers[level]
+        heads, dim = 56, 128
+        print("[warmup veda probe] n=%d | %s" % (tokens, vram), flush=True)
+        parts = []
+        for s in range(0, tokens, 4096):
+            m = min(4096, tokens - s)
+            parts.append(torch.randn(1, heads, m, dim, device="cuda:0",
+                                     dtype=torch.float16))
+        q = torch.cat(parts, dim=2)
+        del parts
+        k, v = q.clone(), q.clone()
+        torch.cuda.synchronize()
+        options = unet.model_options.get("transformer_options", {})
+        override = options.get("optimized_attention_override")
+        if override is None:
+            raise RuntimeError("[warmup veda] unet.model_options 里没有 override")
+        opts = dict(options)
+        opts["block_index"] = 1
+        try:
+            out = override(fallback, q, k, v, heads, mask=None, skip_reshape=True,
+                           transformer_options=opts)
+        except Exception as e:  # noqa: BLE001 - warmup 失败即回退
+            raise RuntimeError("[warmup veda probe] override 调用失败: %s: %s"
+                               % (type(e).__name__, e))
+        torch.cuda.synchronize()
+        finite = bool(torch.isfinite(out.float()).all())
+        del q, k, v, out
+        torch.cuda.empty_cache()
+        calls = dict(patch.run.calls) if patch is not None else {}
+        print("[warmup veda probe] n=%d finite=%s calls=%s | vram=%s"
+              % (tokens, finite, calls, vram), flush=True)
+        if not finite:
+            raise RuntimeError("[warmup veda probe] 输出非 finite")
+        # 口径说明：随机噪声 + 合成 options 仍可能被判 dense（无真实 packed
+        # layout / conditioning payload），所以 ms 不是稀疏加速比；稀疏是否
+        # 真跑只看真任务累计（/api/status.veda_calls）。
+
+
 def _install_attention(rt, attention, minimax_model, comfy_kitchen, attn_choice,
                        args=None, unet=None):
-    """移植 infer_h3_turing 的 attention 选择（不含 warmup）。返回 sage/w8a8/veda 的 override。
+    """移植 infer_h3_turing 的 attention 选择（不含 warmup）。返回 sage/w8a8/override 或 veda handle。
 
-    veda（dev 实验）失败一律回退 int8；sdpa/int8/sage/w8a8 行为与 master 一致。
+    veda（路线 B：vendored star7 实现）失败一律回退 int8；
+    sdpa/int8/sage/w8a8 行为与 master 一致。
+
+    veda 与 sage/w8a8 的本质差别：sage/w8a8 本想直连 dense kernel，而 veda 的
+    override 是唯一入口 —— H3 的真实调用点
+    （comfy.ldm.minimax.model.optimized_attention，comfy/ldm/minimax/model.py:200）
+    只有经过 comfy 分发器（comfy/ldm/modules/attention.py:200-238 的
+    wrap_attn）才会咨询 transformer_options["optimized_attention_override"]。
+    所以 veda 档**绝不**把调用点模块级改指到 dense kernel（那正是旧 dev 分支
+    veda 恒 dense 的根因二）；这里设 attention.optimized_attention 只是为了让
+    **dense 回退**（Veda 拒绝的调用）走 int8 而不是裸 SDPA。
     """
     import torch
 
@@ -336,25 +489,27 @@ def _install_attention(rt, attention, minimax_model, comfy_kitchen, attn_choice,
     print("[attention] device capability %s | comfy_kitchen int8 available: %s"
           % (capability, int8_ok), flush=True)
 
-    override = None
+    handle = None
     if attn_choice == "veda":
-        # dev 实验：Veda 稀疏 attention。任何失败 → 回退 int8（安全默认），绝不带病跑。
+        # 路线 B：vendored star7 VEDA（自带 SM75 CUDA DLL + Triton 无关 core）。
         try:
-            from dit_svc import veda_attn
-            override, veda_info = veda_attn.build_veda_override(
-                args, unet, torch=torch,
+            from dit_svc import veda_star7
+            handle, veda_info = veda_star7.install(
+                unet, args, torch=torch,
                 log=lambda s: print(s, flush=True))
         except Exception as e:
             import traceback
             print("[veda] 初始化失败，回退 int8: %s: %s"
                   % (type(e).__name__, e), flush=True)
             traceback.print_exc()
-            override, veda_info = None, None
-        if override is None:
+            handle, veda_info = None, None
+        if handle is None:
             print("[veda] fallback: 走 int8 路径", flush=True)
         else:
             print("[veda] active: %s" % veda_info, flush=True)
-            # int8 作 fallback 落点（Veda 稠密回退/非 H3 调用时用）
+            # int8 作 dense 回退底座（Veda 拒绝的调用：非 H3 调用 / dense 层 /
+            # layout 不符）。注意：override 仍在 model_options 里，H3 前向
+            # 照样经 wrap_attn 咨询它；这里换的只是"没 override 时的默认"。
             if int8_ok:
                 attention.optimized_attention = rt._wrap_attn_mem_probe(
                     attention.attention_comfy_kitchen_int8, "veda-dense")
@@ -366,23 +521,19 @@ def _install_attention(rt, attention, minimax_model, comfy_kitchen, attn_choice,
             warmup_level = getattr(args, "veda_warmup", "probe") or "probe"
             fallback = (attention.attention_comfy_kitchen_int8 if int8_ok
                         else attention.attention_sub_quad)
-
-            def _veda_probe_call(q, k, v, heads):
-                return override(fallback, q, k, v, heads, skip_reshape=True)
             try:
-                veda_attn.run_tiered_warmup(
-                    torch, torch.device("cuda:0"), _veda_probe_call, "veda",
-                    warmup_level, log=lambda s: print(s, flush=True))
+                warmup = _VedaWarmupShim()
+                warmup.run(torch, unet, handle, warmup_level, fallback)
             except Exception as e:
                 import traceback
                 print("[veda] warmup 失败，回退 int8: %s: %s"
                       % (type(e).__name__, e), flush=True)
                 traceback.print_exc()
-                override = None
-            if override is None:
+                handle = None
+            if handle is None:
                 print("[veda] warmup fallback: 走 int8 路径", flush=True)
-            return override
-        # 回退到 int8：继续走下面的 int8 分支（override=None）
+            return handle
+        # 回退到 int8：继续走下面的 int8 分支（handle=None）
 
     if attn_choice == "sdpa":
         attention.optimized_attention = rt._wrap_attn_mem_probe(attention.attention_pytorch, "sdpa")

@@ -1,15 +1,16 @@
-"""dev 分支：Veda 稀疏 attention 接入 + 分级 warmup（防崩溃）。
+"""veda warmup/bench 的执行框架（与 attention 实现无关的"定时+校验"部分）。
 
-设计约束（用户要求 + sage 事故教训）：
-  1. 任何 warmup 负载必须分级可控，默认只跑最小 probe；
-  2. 高负载 warmup 必须能跳过（--veda-warmup off），且每级之间显式同步 + 显存水位检查；
-  3. Veda 初始化失败必须回退到 int8（安全默认），绝不让服务带病跑；
-  4. NVML 全零/断流 = 驱动已病（sage 事故判据），warmup 中检测到直接中止并报错。
+路线 B 变更（2026-10-11）：fork 专属逻辑（build_veda_override /
+install_veda_probe / gate_snapshot / VEDA_PROBE）已全部移除：
+  * bridge 现在在 dit_svc/veda_star7.py；
+  * override 的就地安装与统计在 star7 的 VedaPatch（见
+    h3_sm75_server/veda/comfy_patch.py）；
+  * 探针统计走 dit_svc/veda_attn_star7.snapshot()。
 
-Veda 依赖（wjie98 _clone_svdint4）：
-  - Python 侧：comfyui_turing_utils.adapters.minimax.veda.{integration, predictor, engine}
-  - kernel 侧：_sage_qattn_sm75.pyd 含 veda_* 符号（0.43.0 已有，见 pybind_sm75.cpp）
-  - bundle：本地 .safetensors（ComfyUI/models/veda/ 或 --veda-bundle 指定，无自动下载）
+保留的 run_single_warmup / bench_attention 由 /api/warmup 使用。
+**口径警告**：POST /api/warmup 以裸调（无 transformer_options）执行，
+Veda 的 gate 必然判 dense，所以 ms 数是 dense 回退耗时，不是稀疏加速比；
+稀疏是否真跑请看 /api/status.veda_calls。
 """
 
 # warmup 分级：每级 = (名, q_tokens, 说明)。负载逐级放大，默认只跑 probe。
@@ -21,71 +22,16 @@ WARMUP_TIERS = {
 }
 WARMUP_ORDER = ["probe", "tier1", "tier2", "tier3"]
 
-# Veda 需要的 kernel 符号（integration.configure 的 required 列表）
-VEDA_SYMBOLS = ("veda_sparse_online_attn", "veda_gather_pool", "veda_scatter_tiles",
-                "veda_pack_routes", "veda_prepare_scores", "veda_finish_selection")
-
 
 def check_nvml_sane(torch):
-    """NVML 健康检查：sage 事故中学到的判据——全零/断流 = 驱动已病。返回 (ok, 说明)。"""
+    """NVML 健康检查：sage 事故判据——全零/断流 = 驱动已病。返回 (ok, 说明)。"""
     try:
         free, total = torch.cuda.mem_get_info()
         if free == 0 or total == 0:
             return False, "NVML 返回全零（free=%d total=%d），驱动可能已病，中止" % (free, total)
         return True, "free=%.2fGB total=%.2fGB" % (free / 1e9, total / 1e9)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return False, "NVML 调用失败（断流？）: %s" % e
-
-
-def run_tiered_warmup(torch, device, attn_fn, impl_name, level, log=print):
-    """分级 warmup：从 probe 逐级跑到 level，每级同步 + 水位检查 + NVML 检查。
-
-    attn_fn(q, k, v, heads) 为待测 attention（含 skip_reshape=True 调用形态）。
-    任一级失败/水位异常即抛 RuntimeError，调用方回退。level='off' 直接返回。
-    """
-    import math
-    if level == "off":
-        log("[warmup] 跳过（--veda-warmup off）")
-        return
-    if level not in WARMUP_TIERS:
-        raise ValueError("未知 warmup 级别: %s（可选 off/probe/tier1/tier2/tier3）" % level)
-    target = WARMUP_ORDER.index(level)
-    heads, dim = 56, 128  # H3 真实形态
-    for name in WARMUP_ORDER[:target + 1]:
-        n, desc = WARMUP_TIERS[name]
-        ok, vram = check_nvml_sane(torch)
-        if not ok:
-            raise RuntimeError("[warmup %s] NVML 异常，中止：%s" % (name, vram))
-        log("[warmup %s] n=%d（%s）| %s" % (name, n, desc, vram))
-        # 分块构造，避免一次性大分配误伤：每 4k tokens 一块拼起来
-        parts = []
-        for s in range(0, n, 4096):
-            m = min(4096, n - s)
-            parts.append(torch.randn(1, heads, m, dim, device=device, dtype=torch.float16))
-        q = torch.cat(parts, dim=2)
-        del parts
-        k = q
-        v = q.clone()
-        torch.cuda.synchronize()
-        t0 = torch.cuda.Event(enable_timing=True)
-        t1 = torch.cuda.Event(enable_timing=True)
-        t0.record()
-        out = attn_fn(q, k, v, heads)
-        t1.record()
-        torch.cuda.synchronize()
-        ms = t0.elapsed_time(t1)
-        finite = bool(torch.isfinite(out.float()).all())
-        amax = float(out.float().abs().max())
-        ok, vram2 = check_nvml_sane(torch)
-        log("[warmup %s] %.1fms finite=%s amax=%.4g | %s"
-            % (name, ms, finite, amax, vram2))
-        del q, k, v, out
-        torch.cuda.empty_cache()
-        if not finite or not math.isfinite(amax):
-            raise RuntimeError("[warmup %s] 输出非 finite，中止" % name)
-        if not ok:
-            raise RuntimeError("[warmup %s] 跑后 NVML 异常，中止：%s" % (name, vram2))
-    log("[warmup] 到 %s 全过" % level)
 
 
 def run_single_warmup(torch, device, attn_fn, tokens, log=print, repeat=1):
@@ -151,14 +97,18 @@ def run_single_warmup(torch, device, attn_fn, tokens, log=print, repeat=1):
     log("[warmup once] done %s" % result)
     return result
 
+
 def bench_attention(torch, device, veda_call, dense_call, tokens, repeat=3,
                     profile=False, log=print):
-    """同一对 Q/K/V 上对比 Veda 稀疏 vs 稠密 int8 的注意力耗时（可选 profiler 明细）。
+    """同一对 Q/K/V 上对比两组 attention 的耗时（可选 profiler 明细）。
 
     veda_call / dense_call：fn(q, k, v) -> out，q/k/v 为 (1, heads, tokens, dim) fp16。
     每档先跑一轮建图（不计时），再跑 repeat 轮取 min/max；每轮校验输出 finite。
     profile=True 时额外用 torch.profiler 抓 CUDA kernel 明细（按 cuda_time_total 排序），
     这是把"到底谁吃时间"从推测变成数字的唯一手段。
+
+    **口径警告**：若两组调用都没有 transformer_options，则 veda 一侧测的是
+    dense 回退，ratio≈1 是必然（不是 bug，是 gate 行为）。
     """
     import time as _time
     heads, dim = 56, 128  # H3 真实形态
@@ -229,219 +179,53 @@ def bench_attention(torch, device, veda_call, dense_call, tokens, repeat=3,
     return result
 
 
-VEDA_PROBE = {}   # --veda-debug 的运行期探针（/api/status 里可见）
+def run_tiered_warmup(torch, device, attn_fn, impl_name, level, log=print):
+    """分级 warmup：从 probe 逐级跑到 level，每级同步 + 水位检查 + NVML 检查。
 
-
-def _enable_turing_logs(log=print):
-    """把第三方库的 INFO/DEBUG 日志接到 stdout。
-
-    它们用 logging.getLogger("comfyui-turing-utils.<component>")，默认只有 WARNING+
-    会经 lastResort 漏出来，而 Veda 的 plan/keep/sparse_calls 全是 INFO —— 平时一条
-    都看不到，这也是"有没有真的进稀疏分支"一直判不了的原因之一。
+    attn_fn(q, k, v, heads) 为待测 attention（含 skip_reshape=True 调用形态）。
+    任一级失败/水位异常即抛 RuntimeError，调用方回退。level='off' 直接返回。
+    注意：无 transformer_options 的调用只验证 dense 回退通路与 allocator 热态。
     """
-    try:
-        import logging
-        import sys
-        lg = logging.getLogger("comfyui-turing-utils")
-        lg.setLevel(logging.DEBUG)
-        if not any(isinstance(h, logging.StreamHandler) for h in lg.handlers):
-            h = logging.StreamHandler(sys.stdout)
-            h.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
-            lg.addHandler(h)
-        lg.propagate = False
-        log("[veda-probe] turing-utils 日志已接到 stdout（DEBUG）")
-    except Exception as e:
-        log("[veda-probe] 日志接管失败: %s: %s" % (type(e).__name__, e))
-
-
-def gate_snapshot(options, query_tokens):
-    """原样抓下 Veda 准入判断的输入（纯读 dict，不 import 第三方）。
-
-    对应 integration.py:45-47 的门：`layer is not None and packed is not None
-    and packed.seq_len == query_tokens`，外加 sparse_runtime 的 schedule.is_dense。
-    """
-    options = options or {}
-    packed = options.get("minimax_h3_layout")
-    lay = options.get("turing_utils_attention_layout")
-    seq_len = getattr(packed, "seq_len", None)
-    dense = None
-    sched = options.get("turing_utils_veda_schedule")
-    if sched is not None and hasattr(sched, "is_dense"):
-        try:
-            dense = bool(sched.is_dense(options))
-        except Exception as e:
-            dense = "err:%s" % type(e).__name__
-    return {
-        "has_minimax_h3_layout": packed is not None,
-        "layout_seq_len": seq_len,
-        "query_tokens": query_tokens,
-        "seq_len_ok": seq_len == query_tokens,
-        "has_attention_layout_key": isinstance(lay, dict),
-        "layer_index": lay.get("layer_index") if isinstance(lay, dict) else None,
-        "strategy": options.get("turing_utils_attention_strategy"),
-        "schedule_dense": dense,
-        "veda_option_keys": sorted(k for k in options
-                                   if "turing" in k or "minimax" in k)[:12],
-    }
-
-
-def _probe_reason(snap):
-    """把快照压成一个可去重的"为什么 dense / 可稀疏"标签。"""
-    if not snap["has_minimax_h3_layout"]:
-        return "no minimax_h3_layout"
-    if not snap["seq_len_ok"]:
-        return "seq_len %r != query_tokens %r" % (snap["layout_seq_len"], snap["query_tokens"])
-    if not snap["has_attention_layout_key"] or snap["layer_index"] is None:
-        return "no layer_index (turing_utils_attention_layout)"
-    if snap["schedule_dense"]:
-        return "schedule.is_dense"
-    return "sparse-eligible"
-
-
-def install_veda_probe(override, args, log=print):
-    """--veda-debug：给 Veda override 套准入探针（两个入口都包，含 attend 真调用计数）。
-
-    记录进 VEDA_PROBE（/api/status 可读）：
-      legacy_calls / container_calls  —— 走了哪条调用路径
-      reasons                          —— 每种判定（含"为什么 dense"）各出现几次
-      first                            —— 每种判定的首次完整快照（不被日志刷掉）
-      sparse_attend_calls              —— engine.attend 真被执行几次（= 稀疏真跑的次数）
-    """
-    if override is None or not getattr(args, "veda_debug", False):
-        return override
-    VEDA_PROBE.clear()
-    VEDA_PROBE.update({"legacy_calls": 0, "container_calls": 0, "sparse_attend_calls": 0,
-                       "reasons": {}, "first": {}})
-    _enable_turing_logs(log=log)
-    try:
-        import os
-        os.environ.setdefault("COMFYUI_TURING_UTILS_PROFILE", "1")
-    except Exception:
-        pass
-    try:
-        from comfyui_turing_utils.adapters.minimax.veda import integration as vi
-        if not getattr(vi, "_h3_veda_probe_wrapped", False):
-            orig_attend = vi.attend
-
-            def attend_probe(*a, **k):
-                VEDA_PROBE["sparse_attend_calls"] += 1
-                return orig_attend(*a, **k)
-            vi.attend = attend_probe
-            vi._h3_veda_probe_wrapped = True
-    except Exception as e:
-        log("[veda-probe] attend 计数包装失败: %s: %s" % (type(e).__name__, e))
-
-    def _record(kind, snap):
-        VEDA_PROBE[kind + "_calls"] += 1
-        reason = _probe_reason(snap)
-        VEDA_PROBE["reasons"][reason] = VEDA_PROBE["reasons"].get(reason, 0) + 1
-        key = kind + "|" + reason
-        if key not in VEDA_PROBE["first"]:
-            VEDA_PROBE["first"][key] = snap
-            log("[veda-probe] %s 首次判定=%s 快照=%s" % (kind, reason, snap))
-
-    def _wrap_legacy(fn):
-        def probe(fallback, q, k, v, heads, mask=None, attn_precision=None,
-                  skip_reshape=False, skip_output_reshape=False, **kw):
-            try:
-                opts = kw.get("transformer_options") or {}
-                tokens = q.shape[2] if skip_reshape else q.shape[1]
-                snap = gate_snapshot(opts, tokens)
-                snap["mask"] = mask is not None
-                _record("legacy", snap)
-            except Exception as e:
-                log("[veda-probe] legacy 快照失败: %s: %s" % (type(e).__name__, e))
-            return fn(fallback, q, k, v, heads, mask=mask, attn_precision=attn_precision,
-                      skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kw)
-        return probe
-
-    def _wrap_prepared(fn):
-        def probe(request):
-            try:
-                opts = getattr(request, "transformer_options", None) or {}
-                snap = gate_snapshot(opts, getattr(request, "query_tokens", None))
-                snap["mask"] = getattr(request, "mask", None) is not None
-                snap["is_causal"] = bool(getattr(request, "is_causal", False))
-                snap["tensor_layout"] = getattr(request, "tensor_layout", None)
-                snap["scale"] = getattr(request, "scale", None)
-                _record("container", snap)
-            except Exception as e:
-                log("[veda-probe] container 快照失败: %s: %s" % (type(e).__name__, e))
-            return fn(request)
-        return probe
-
-    wrapped = _wrap_legacy(override)
-    try:                                    # 保留原 override 的自带属性（implementation 等）
-        wrapped.__dict__.update(getattr(override, "__dict__", {}))
-    except Exception:
-        pass
-    prepared = getattr(override, "prepared_attention_executor", None)
-    if prepared is not None:
-        wrapped.prepared_attention_executor = _wrap_prepared(prepared)
-    log("[veda-probe] 已装：legacy/container 双入口 + attend 计数（见 /api/status.veda_probe）")
-    return wrapped
-
-
-def build_veda_override(args, unet, torch, log=print):
-    """构建 Veda override。成功返回 (override, bundle_info)；失败抛 RuntimeError（调用方回退 int8）。
-
-    步骤：sys.path → 符号检查 → bundle 加载 → 维度对齐 → configure → 最小 probe。
-    注意：configure 需要 model 级对象；server 侧只有 unet（ModelPatcher），
-    这里复用 wjie98 的 make_override + VedaConfig，绕过 ComfyUI 节点层。
-    """
-    import os
-    import sys
-
-    bundle_path = getattr(args, "veda_bundle", None)
-    if not bundle_path or not os.path.isfile(bundle_path):
-        raise RuntimeError("--attn veda 需要 --veda-bundle 指向本地 predictor bundle "
-                           "(.safetensors)，未找到: %r" % bundle_path)
-    precision = getattr(args, "veda_precision", "w8a8") or "w8a8"
-    keep = float(getattr(args, "veda_keep", 0.0) or 0.0)
-    if keep != 0.0 and not (0.0 < keep <= 1.0):
-        raise RuntimeError("--veda-keep 须为 0（用 bundle 默认）或 (0,1]，当前 %r" % keep)
-
-    # TURING_UTILS_DIR 复用 runner 的探测（与 sage/w8a8 同源）
-    import infer_h3_turing as rt
-    if rt.TURING_UTILS_DIR not in sys.path:
-        sys.path.insert(0, rt.TURING_UTILS_DIR)
-
-    from comfyui_turing_utils.kernel_api import kernel_extension_has_symbol
-    missing = [s for s in VEDA_SYMBOLS
-               if not kernel_extension_has_symbol(s, "_sage_qattn_sm75")]
-    if missing:
-        raise RuntimeError("kernel 缺 Veda 符号 %s（需重建 Turing Utils kernel）" % missing)
-
-    from comfyui_turing_utils.adapters.minimax.veda.predictor import load_bundle
-    bundle = load_bundle(bundle_path, precision)
-    log("[veda] bundle: %d层 x %d头 x d%d keep=%.4f precision=%s"
-        % (bundle.num_layers, bundle.num_heads, bundle.head_dim,
-           bundle.keep_ratio, precision))
-
-    blocks = unet.model.diffusion_model.blocks
-    if len(blocks) != bundle.num_layers or any(
-            b.attn.heads != bundle.num_heads or b.attn.head_dim != bundle.head_dim
-            for b in blocks):
-        raise RuntimeError("Veda bundle 维度（%d层/%d头/d%d）与当前 DiT（%d层/%d头/d%d）不匹配" %
-                           (bundle.num_layers, bundle.num_heads, bundle.head_dim,
-                            len(blocks), blocks[0].attn.heads, blocks[0].attn.head_dim))
-
-    # 走 integration.configure（与 ComfyUI 节点同路径，含 layout provider 安装）。
-    # configure 只认 folder_paths 里的 "veda" 目录：把 bundle 所在目录临时注册，
-    # 这样 --veda-bundle 传任意完整路径都能用（portable embed 版无 models/veda）。
-    from comfyui_turing_utils.adapters.minimax.veda.integration import (
-        configure, register_predictor_folder)
-    import folder_paths
-    register_predictor_folder()
-    folder_paths.add_model_folder_path("veda", os.path.dirname(os.path.abspath(bundle_path)))
-    model = configure(unet, predictor_name=os.path.basename(bundle_path),
-                      predictor_precision=precision,
-                      keep_ratio=keep, reference_keep_ratio=keep,
-                      debug=bool(getattr(args, "veda_debug", False)))
-    override = model.model_options["transformer_options"]["optimized_attention_override"]
-    info = {"bundle": os.path.basename(bundle_path), "precision": precision,
-            "keep": keep or bundle.keep_ratio}
-    log("[veda] override 就绪: %s" % getattr(
-        override, "turing_utils_attention_implementation", "?"))
-    override = install_veda_probe(override, args, log=log)
-    return override, info
+    import math
+    if level == "off":
+        log("[warmup] 跳过（--veda-warmup off）")
+        return
+    if level not in WARMUP_TIERS:
+        raise ValueError("未知 warmup 级别: %s（可选 off/probe/tier1/tier2/tier3）" % level)
+    target = WARMUP_ORDER.index(level)
+    heads, dim = 56, 128  # H3 真实形态
+    for name in WARMUP_ORDER[:target + 1]:
+        n, desc = WARMUP_TIERS[name]
+        ok, vram = check_nvml_sane(torch)
+        if not ok:
+            raise RuntimeError("[warmup %s] NVML 异常，中止：%s" % (name, vram))
+        log("[warmup %s] n=%d（%s）| %s" % (name, n, desc, vram))
+        # 分块构造，避免一次性大分配误伤：每 4k tokens 一块拼起来
+        parts = []
+        for s in range(0, n, 4096):
+            m = min(4096, n - s)
+            parts.append(torch.randn(1, heads, m, dim, device=device, dtype=torch.float16))
+        q = torch.cat(parts, dim=2)
+        del parts
+        k = q
+        v = q.clone()
+        torch.cuda.synchronize()
+        t0 = torch.cuda.Event(enable_timing=True)
+        t1 = torch.cuda.Event(enable_timing=True)
+        t0.record()
+        out = attn_fn(q, k, v, heads)
+        t1.record()
+        torch.cuda.synchronize()
+        ms = t0.elapsed_time(t1)
+        finite = bool(torch.isfinite(out.float()).all())
+        amax = float(out.float().abs().max())
+        ok, vram2 = check_nvml_sane(torch)
+        log("[warmup %s] %.1fms finite=%s amax=%.4g | %s"
+            % (name, ms, finite, amax, vram2))
+        del q, k, v, out
+        torch.cuda.empty_cache()
+        if not finite or not math.isfinite(amax):
+            raise RuntimeError("[warmup %s] 输出非 finite，中止" % name)
+        if not ok:
+            raise RuntimeError("[warmup %s] 跑后 NVML 异常，中止：%s" % (name, vram2))
+    log("[warmup] 到 %s 全过（dense 回退口径）" % level)

@@ -251,11 +251,19 @@ class QueueManager:
         tokens = job.params["tokens"]
         repeat = job.params.get("repeat", 1)
         job.stage = "warmup 执行中（n=%d x%d）" % (tokens, repeat)
+        # veda 路线 B 下 runtime.attn_override 是 None（handle 是 VedaPatch）；
+        # 真正的 override 装在 unet.model_options 里（就地安装，不走 clone）。
         override = runtime.attn_override
+        if override is None and runtime.attn == "veda" and runtime.unet is not None:
+            override = runtime.unet.model_options.get("transformer_options", {}).get(
+                "optimized_attention_override")
         attention = runtime.attention
         fallback = getattr(attention, "optimized_attention", None)
-        if fallback is None:
-            raise RuntimeError("无 fallback attention 可用")
+        if override is None or fallback is None:
+            raise RuntimeError("无 override/fallback attention 可用（attn=%s）" % runtime.attn)
+        # 注意：这里是无 transformer_options 的裸调，gate 必然判 dense ——
+        # 所以下面的 ms 数是 **dense 回退** 的耗时，不是稀疏加速比。
+        # 稀疏是否真跑只看 veda_calls（真任务累计，见 /api/status）。
 
         def _call(q, k, v, heads):
             return override(fallback, q, k, v, heads, skip_reshape=True)
@@ -264,7 +272,10 @@ class QueueManager:
             log=lambda s: (job.log.append(s), print("[queue %s] %s" % (job.id, s), flush=True)))
         job.timings["warmup"] = result["ms_max"]
         job.cond_stats = {"warmup": result}
-        job.log.append("warmup 结果: %s" % result)
+        from dit_svc.veda_attn_star7 import snapshot
+        job.cond_stats["veda_calls"] = snapshot(runtime.veda_patch)
+        job.log.append("warmup 结果(dense回退口径): %s" % result)
+        job.log.append("veda 累计: %s" % job.cond_stats["veda_calls"])
 
         # 可选：同一对 Q/K/V 上跟稠密 int8 对比（veda 档下 optimized_attention 就是 int8）
         if job.params.get("compare") == "int8":
