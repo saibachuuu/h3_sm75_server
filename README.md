@@ -86,9 +86,20 @@ Veda 适配层。两者差别是结构性的：
 | 调用点 | `minimax_model.optimized_attention` 被模块级改指到 dense kernel，override 永不被咨询 | 不碰模块级名字，走 comfy 分发器（`wrap_attn` 保证 override 优先） |
 | SM75 kernel | 依赖 pip 轮 `_sage_qattn_sm75.pyd` 导出 6 个 `veda_*` 符号 | 自带 `bin/win_amd64/star7_veda_sm75_v1.dll`（ctypes C ABI + sha256 + ABI 校验），完全不碰 Triton |
 
-**运行期只信这两个数**（`GET /api/status`）：
-- `veda_calls.sparse` —— 稀疏真跑次数（≈ 层数 × 步数 量级才算真在工作）；
-- `veda_calls.compute_fraction` —— 相对全量注意力实际算了的比例（0.1~0.2 正常）。
+**运行期只信这几个数**（`GET /api/status` 的 `veda_calls`）：
+
+| 字段 | 期望 | 含义 |
+|---|---|---|
+| `backend` | `Star7 VEDA INT8 Tensor Core (SM75)` | SM75 DLL 已加载且 **self_test 过**（启动即自检，不是等第一单） |
+| `cumulative.sparse` | > 0（≈ 层数×步数） | **稀疏真跑次数（跨任务累计，在 run 清零前抓取）** |
+| `cumulative.compute_fraction_last` | 0.1~0.3 | 最近一单相对全量注意力实际算了百分之几 |
+| `cumulative.reasons` | 少量 `other attention` | dense 的原因分布（为什么没走稀疏） |
+| `cumulative.failed` | null | 稀疏路径没抛过异常 |
+| `current.sparse` | 空闲时 0 | 正在跑的 run（任务进行中才非 0） |
+
+star7 每个采样 run 结束还会在 stdout 打一行正版摘要
+`Attention computed X% of full attention (Y% skipped)`（logger 已接出），
+任务日志里也会有一行 `veda: ... 累计 sparse=...`。
 
 启动 warmup / `POST /api/warmup` 是**合成调用**（无真实 packed layout），
 star7 的 gate 会判 dense，所以 warmup/bench 的 ms 数只是 **dense 回退**口径，

@@ -14,18 +14,20 @@ _RUNTIME_HOLDER = {}   # make_handler 时登记 runtime（_veda_probe_snapshot �
 
 
 def _veda_probe_snapshot():
-    """--veda-debug 的运行期探针（路线 B：star7 VedaPatch 统计）。
+    """veda 工况探针（路线 B）。
 
-    active=False 表示 veda 未启用或已回退 int8；calls 里 'sparse' 是稀疏
-    真跑次数，其余键是 dense 原因；compute_fraction 是相对全量注意力的占比。
+    返回结构（见 veda_attn_star7.status_report）：
+      active / backend / backend_report（启动自检结果）
+      cumulative —— 跨 run 累计（sparse 次数、dense 原因、compute_fraction）；
+                    在 patch.on_cleanup 清零**之前**抓取，所以任务结束后仍在
+      current    —— 当前进行中的 run（空闲时全 0）
+    返回 None 表示 veda 未启用（或已回退 int8 且 backend 未加载）。
     """
     try:
         runtime = _RUNTIME_HOLDER.get("runtime")
         patch = getattr(runtime, "veda_patch", None) if runtime is not None else None
-        if patch is None:
-            return None
-        from dit_svc.veda_attn_star7 import snapshot
-        return snapshot(patch) or None
+        from dit_svc.veda_attn_star7 import status_report
+        return status_report(patch)
     except Exception:
         return None
 

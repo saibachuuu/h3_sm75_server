@@ -272,10 +272,10 @@ class QueueManager:
             log=lambda s: (job.log.append(s), print("[queue %s] %s" % (job.id, s), flush=True)))
         job.timings["warmup"] = result["ms_max"]
         job.cond_stats = {"warmup": result}
-        from dit_svc.veda_attn_star7 import snapshot
-        job.cond_stats["veda_calls"] = snapshot(runtime.veda_patch)
+        from dit_svc.veda_attn_star7 import status_report
+        job.cond_stats["veda_calls"] = status_report(runtime.veda_patch)
         job.log.append("warmup 结果(dense回退口径): %s" % result)
-        job.log.append("veda 累计: %s" % job.cond_stats["veda_calls"])
+        job.log.append("veda 工况: %s" % job.cond_stats["veda_calls"])
 
         # 可选：同一对 Q/K/V 上跟稠密 int8 对比（veda 档下 optimized_attention 就是 int8）
         if job.params.get("compare") == "int8":

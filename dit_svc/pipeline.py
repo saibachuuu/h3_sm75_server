@@ -37,6 +37,37 @@ def _stage(job, name, t0):
     print("[job %s] stage %s took %.2fs" % (job.id, name, dt), flush=True)
 
 
+def _append_veda_status(job, runtime):
+    """把 Veda 工况写进 job.cond_stats.veda_calls + 任务日志（vea 档才生效）。
+
+    结构见 veda_attn_star7.status_report：
+      backend / backend_report（启动自检）/ cumulative（跨 run 累计）/ current。
+    非 veda 档或读取失败只记日志，不影响任务。
+    """
+    if getattr(runtime, "attn", None) != "veda":
+        return
+    try:
+        from dit_svc.veda_attn_star7 import status_report
+        report = status_report(getattr(runtime, "veda_patch", None))
+    except Exception as e:  # noqa: BLE001
+        job.log.append("veda status 读取失败: %s: %s" % (type(e).__name__, e))
+        return
+    if report is None:
+        job.log.append("veda: 未启用（或已回退 int8）")
+        return
+    job.cond_stats = job.cond_stats or {}
+    job.cond_stats["veda_calls"] = report
+    cum = report.get("cumulative") or {}
+    cur = report.get("current") or {}
+    job.log.append(
+        "veda: backend=%s | 累计 sparse=%s dense=%s runs=%s "
+        "compute_fraction_last=%s kept_last=%s | current sparse=%s%s"
+        % (report.get("backend"), cum.get("sparse"), cum.get("dense"),
+           cum.get("runs"), cum.get("compute_fraction_last"),
+           cum.get("kept_fraction_last"), cur.get("sparse"),
+           (" | failed=%s" % cum.get("failed")) if cum.get("failed") else ""))
+
+
 def run_job(job, ctx):
     """ctx = {"runtime": Runtime, "cond_url": str, "out_dir": str, "entry_args": argparse.Namespace}"""
     runtime = ctx["runtime"]
@@ -464,6 +495,9 @@ def _run_with_cond(job, ctx, cond_path):
         out2 = out1
     _stage(job, "sample", t0)
     del out1, latent, positive, refined, tags, ref_latents
+    # Veda 工况（每个采样 run 结束时 star7 的 cleanup 已把统计抓进累计，
+    # 这里读的是"含本任务"的口径；稀疏真跑次数看 veda.calls.sparse）
+    _append_veda_status(job, runtime)
 
     # ---------- 7. 归因探针：latent 坏了就直接失败，不解码 ----------
     job.stage = "probe"

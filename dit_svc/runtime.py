@@ -255,6 +255,7 @@ class Runtime:
             # 保持单一对象给常驻引用 / _unhook_dit / _AttnWindowProfiler 用）。
             # result 是 veda handle（VedaPatch，不是函数）；None = 已回退 int8。
             self.attn_override = None
+            self.veda_patch = result
             print("[attention] veda handle=%s"
                   % ("patch" if result is not None else "None(已回退int8)"), flush=True)
         else:
