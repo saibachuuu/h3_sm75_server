@@ -73,6 +73,7 @@
   <h1>H3 SM75 生成服务</h1>
   <span id="chipReady" class="chip">连接中…</span>
   <span id="chipAttn"   class="chip">attn: –</span>
+  <span id="chipVeda"   class="chip" style="display:none">veda: –</span>
   <span id="chipCond"   class="chip">cond: –</span>
   <span id="chipVram"   class="chip">显存: –</span>
   <span id="chipQueue"  class="chip">队列: –</span>
@@ -356,6 +357,29 @@ function renderStatus(s) {
   }
 
   setChip($("chipAttn"), "attn: " + s.attn + " / w4a8: " + s.w4a8_backend);
+  // Veda 工况（路线 B）：启动自检 + 跨 run 累计的稀疏次数 / 算力占比。
+  // 只信这个 chip + /api/status.veda_calls；warmup 的 ms 是 dense 回退口径。
+  const v = s.veda_calls;
+  const chipVeda = $("chipVeda");
+  if (!v) {
+    chipVeda.style.display = "none";
+  } else if (!v.active) {
+    chipVeda.style.display = "";
+    setChip(chipVeda, "veda: 已回退 int8（见服务日志）", "bad");
+  } else {
+    chipVeda.style.display = "";
+    const cum = v.cumulative || {};
+    if (cum.failed) {
+      setChip(chipVeda, "veda: 稀疏失败 " + cum.failed, "bad");
+    } else if (cum.runs > 0) {
+      setChip(chipVeda, "veda: sparse=" + cum.sparse + "（" + cum.runs + " run）" +
+        (cum.compute_fraction_last != null
+          ? " · 算力 " + Math.round(100 * cum.compute_fraction_last) + "%" : ""),
+        cum.sparse > 0 ? "ok" : "warn");
+    } else {
+      setChip(chipVeda, "veda: " + (v.backend || "…") + " · 等首单", "ok");
+    }
+  }
   const c = s.cond;
   if (c && c.ok) setChip($("chipCond"), "cond: 就绪" + (c.cache_hits ? "（缓存 " + c.cache_hits + "）" : ""), "ok");
   else if (c && c.reachable === false) setChip($("chipCond"), "cond: 隧道不通", "bad");

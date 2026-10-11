@@ -10,10 +10,10 @@ WEBUI_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 MAX_BODY = 96 * 1024 * 1024
 
 
-_RUNTIME_HOLDER = {}   # make_handler 时登记 runtime（_veda_probe_snapshot 用）
+_RUNTIME_HOLDER = {}   # make_handler 时登记 runtime（_veda_calls_snapshot 用）
 
 
-def _veda_probe_snapshot():
+def _veda_calls_snapshot():
     """veda 工况探针（路线 B）。
 
     返回结构（见 veda_attn_star7.status_report）：
@@ -153,7 +153,7 @@ def make_handler(runtime, queue, ctx):
                 "vram": vram,
                 "counts": snap["counts"],
                 "running": snap["running"],
-                "veda_probe": _veda_probe_snapshot(),
+                "veda_calls": _veda_calls_snapshot(),
                 "server_uptime": round(__import__("time").time() - runtime.started_at, 1),
             }
 
