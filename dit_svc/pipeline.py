@@ -579,14 +579,20 @@ def _run_with_cond(job, ctx, cond_path):
     rt.save_wav(tmp_wav, audio["waveform"], sr)
     n_frames, hh, ww, _ = decoded.shape
     fps = int(params.get("fps", 24) or 24)
+    # 注意：**不能用 -shortest**。音频被截成 int(round(length/24*sr)) 样本，比视频帧栅格
+    # 尾部短约 10 微秒（124 帧：165333 样本 = 5.16665625s vs 124/24 = 5.16666667s），
+    # -shortest 会以音频边界收尾，把最后一帧丢掉 —— 每一单成片都比 length 少 1 帧，
+    # 而导演台的接力素材 tail0 恰好就是被丢的那一帧（观众在上一镜里没见过它）。
+    # 这里改成显式钉死帧数，不依赖任何时长比较。
     cmd = [
         runtime.ffmpeg, "-y",
         "-f", "rawvideo", "-pix_fmt", "rgb24",
         "-s", "%dx%d" % (ww, hh), "-r", str(fps), "-i", "pipe:0",
         "-i", tmp_wav,
         "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-frames:v", str(n_frames),
         "-c:a", "aac", "-b:a", "192k",
-        "-shortest", mp4_path,
+        mp4_path,
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
