@@ -107,7 +107,7 @@ def run_director(job, ctx):
         t0 = time.time()
 
         # ---- 组装参考图：[上段尾帧…] + [自带图…]，ref2va 截到 9 张 ----
-        own = list(shot.get("image_b64s") or [])
+        own = list(shot.get("image_b64s") or [])[:9]
         want_prev = bool(shot.get("ref_prev")) and i > 0 and bool(prev_tail_b64)
         pfr = int(shot.get("ref_prev_frames") or 0)
         used_prev = 0
@@ -115,11 +115,18 @@ def run_director(job, ctx):
             refs = [prev_tail_b64[0]]                    # fl2va 只能 1 张 → 取最后那一帧
             used_prev = 1
         elif want_prev:
-            take = prev_tail_b64[:pfr] if pfr > 0 else []
-            refs = (take + own)[:9]
+            # 自带图是用户在提示词里按 <Picture i> 明确引用的，**不能被尾帧挤掉**；
+            # 所以自带图先占位，尾帧只吃剩下的名额（不够就少取，并把差额显式暴露出去）。
+            room = max(0, 9 - len(own))
+            take = prev_tail_b64[:min(pfr, room)] if (pfr > 0 and room > 0) else []
+            if pfr > len(take):
+                job.log.append(
+                    "[镜头 %d/%d] 上段尾帧只取到 %d/%d 张（自带参考图 %d 张占位，"
+                    "上限 9 张）" % (i + 1, total, len(take), pfr, len(own)))
+            refs = take + own
             used_prev = len(take)
         else:
-            refs = own[:9]
+            refs = own
         shot["used_prev_frames"] = used_prev
 
         if not refs:
