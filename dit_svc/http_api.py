@@ -4,10 +4,21 @@ import os
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from common.protocol import DEFAULTS, SAMPLERS, SCHEDULERS, dumps
+from common.protocol import DEFAULTS, DIRECTOR_MAX_SHOTS, SAMPLERS, SCHEDULERS, dumps
 
 WEBUI_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webui")
 MAX_BODY = 96 * 1024 * 1024
+
+# 导演台（镜头序列）前端默认值与上限；契约见仓库外 _ada_director_api.md
+DIRECTOR_DEFAULTS = {
+    "ref_prev_frames": 1,
+    "concat": True,
+    "on_error": "stop",
+    "max_shots": DIRECTOR_MAX_SHOTS,
+    "max_ref_images": 9,
+    "length_min": 124,
+    "length_max": 362,
+}
 
 
 _RUNTIME_HOLDER = {}   # make_handler 时登记 runtime（_veda_calls_snapshot 用）
@@ -173,7 +184,8 @@ def make_handler(runtime, queue, ctx):
                 except Exception as e:
                     self._json({"ok": False, "error": str(e)}, 500)
             elif path == "/api/defaults":
-                self._json({"defaults": DEFAULTS, "sampler": SAMPLERS, "scheduler": SCHEDULERS})
+                self._json({"defaults": DEFAULTS, "sampler": SAMPLERS,
+                            "scheduler": SCHEDULERS, "director": DIRECTOR_DEFAULTS})
             elif path == "/api/jobs":
                 self._json(queue.snapshot())
             elif path.startswith("/api/jobs/"):
@@ -217,7 +229,7 @@ def make_handler(runtime, queue, ctx):
             elif path == "/api/jobs/cond":
                 # 直接喂 cond：{cond_b64 | cond_file, image_b64s? 0–9, mode, width,
                 # height, length, steps, sampler, scheduler, seed, refine_steps,
-                # refine_denoise, ref_image_size, sigmas?, fps?, prompt?}
+                # refine_denoise, ref_image_size, sigmas?, profile_attn?, prompt?}
                 # cond_file 相对路径按 out_dir 解析；任务内不回调 cond server。
                 payload = self._read_json_body()
                 if payload is None:
@@ -226,6 +238,26 @@ def make_handler(runtime, queue, ctx):
                 try:
                     from dit_svc.job_queue import BusyError
                     job = queue.submit_cond(payload)
+                    self._json({"ok": True, "job_id": job.id}, 201)
+                except BusyError as e:
+                    self._json({"ok": False, "error": str(e)}, 409)
+                except ValueError as e:
+                    self._json({"ok": False, "error": str(e)}, 400)
+                except Exception as e:
+                    self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
+            elif path == "/api/director":
+                # 导演台：镜头序列。{global: {mode, width, height, steps, sampler,
+                # scheduler, refine_steps, refine_denoise, sigmas?, seed,
+                # ref_prev_frames, concat, on_error}, shots: [{prompt, length,
+                # seed?, ref_prev, ref_prev_frames?, image_b64s, image_names?}]}
+                # 后续镜头可参考上一镜头的尾帧（帧级接力）。
+                payload = self._read_json_body()
+                if payload is None:
+                    self._json({"ok": False, "error": "请求体不是合法 JSON 或过大"}, 400)
+                    return
+                try:
+                    from dit_svc.job_queue import BusyError
+                    job = queue.submit_director(payload)
                     self._json({"ok": True, "job_id": job.id}, 201)
                 except BusyError as e:
                     self._json({"ok": False, "error": str(e)}, 409)

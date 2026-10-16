@@ -534,6 +534,26 @@ def _run_with_cond(job, ctx, cond_path):
         raise RuntimeError("视频 VAE 解码输出含 NaN/Inf: %s" % dec_probe)
     _stage(job, "decode_video", t0)
 
+    # ---------- 9b. 尾帧 PNG（导演台「后续镜头参考旧有镜头」的接力素材） ----------
+    # dump_tail_frames > 0 时把结尾 N 帧存成 <id>.tail0.png（tail0 = 最后一帧）…
+    # 直接用刚解码好的帧落图，不再跑 ffmpeg 抽帧（帧本来就在内存里）。
+    n_tail = int(params.get("dump_tail_frames") or 0)
+    if n_tail > 0:
+        import numpy as np
+        from PIL import Image
+        tail_dir = ctx["out_dir"]
+        os.makedirs(tail_dir, exist_ok=True)
+        n_tail = max(0, min(n_tail, 9, int(decoded.shape[0])))
+        tail_urls = []
+        for k in range(n_tail):
+            src = decoded[decoded.shape[0] - 1 - k]
+            u8 = src.float().clamp(0, 1).mul(255).to(torch.uint8).cpu().numpy()
+            name = "%s.tail%d.png" % (job.id, k)
+            Image.fromarray(np.asarray(u8)).save(os.path.join(tail_dir, name))
+            tail_urls.append("/outputs/" + name)
+        job.files["tail_pngs"] = tail_urls
+        job.log.append("尾帧: %s" % ", ".join(os.path.basename(u) for u in tail_urls))
+
     # ---------- 10. 音频解码（截到 length/24 秒） ----------
     job.stage = "decode_audio"
     t0 = time.perf_counter()

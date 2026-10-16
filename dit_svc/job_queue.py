@@ -1,5 +1,4 @@
 """串行任务队列（单 GPU，一次只跑一个；手动逐个提交）。"""
-import json
 import random
 import threading
 import time
@@ -14,7 +13,7 @@ class Job:
     def __init__(self, params, kind="video"):
         ts = time.strftime("%Y%m%d-%H%M%S")
         self.id = "%s-%s" % (ts, uuid.uuid4().hex[:4])
-        self.kind = kind  # video | warmup | vae_probe
+        self.kind = kind  # video | warmup | vae_probe | director
         self.params = params
         self.status = "queued"      # queued | running | done | failed | cancelled
         self.stage = "排队中"
@@ -29,9 +28,11 @@ class Job:
         self.latent_probe = None
         self.mp4 = None
         self.files = {}              # 额外产物（如 vae_probe 的 PNG）：名字 -> /outputs/<file>
+        self.shots = None            # 导演台序列（kind="director"）：镜头列表
+        self.concat_mp4 = None       # 导演台序列的总片文件名（拼接成功时才有）
 
     def _label(self):
-        """任务列表里显示的一行标签（三种 kind 各有来源）。"""
+        """任务列表里显示的一行标签（四种 kind 各有来源）。"""
         if self.kind == "warmup":
             return "warmup n=%s" % self.params.get("tokens")
         return (self.params.get("prompt") or self.params.get("cond_label")
@@ -61,6 +62,10 @@ class Job:
             "latent_probe": self.latent_probe,
             "log_tail": self.log[-40:],
         }
+        if self.shots is not None:      # 导演台序列：逐镜头进度给前端
+            d["shots"] = self.shots
+            d["concat_mp4"] = self.concat_mp4
+            d["concat_url"] = ("/outputs/" + self.concat_mp4) if self.concat_mp4 else None
         if not with_log:
             d.pop("log_tail")
         return d
@@ -122,6 +127,48 @@ class QueueManager:
         print("[queue] submitted %s (直接喂 cond: %s, %d 图, %d bytes) seed=%d"
               % (job.id, params["cond_label"], len(params["image_b64s"]),
                  cond["size"], params["seed"]), flush=True)
+        return job
+
+    # ---------- 导演台：镜头序列（后续镜头参考上一镜头的尾帧） ----------
+    def submit_director(self, payload):
+        from common.protocol import validate_director
+
+        self._require_ready()
+        spec, err = validate_director(payload)
+        if err:
+            raise ValueError(err)
+        gp, shots = spec["global"], spec["shots"]
+
+        # 每镜头的完整参数在执行时才组装（director.run_director）；这里只把
+        # 序列级参数与镜头清单挂到任务上，public() 直接吐给前端。
+        for s in shots:
+            s["status"] = "pending"
+            s["stage"] = ""
+            s["elapsed"] = 0.0
+            s["mp4"] = None
+            s["output_url"] = None
+            s["tail_urls"] = []
+            s["used_prev_frames"] = 0
+            s["own_ref_count"] = len(s["image_b64s"])
+            s["error"] = None
+
+        params = {
+            "prompt": shots[0]["prompt"],       # 列表里的标签用首镜头提示词
+            "global": gp,
+            "mode": gp.get("mode"),
+            "length": shots[0]["length"],
+            "steps": gp.get("steps"),
+            "seed": gp.get("seed"),
+        }
+        job = Job(params, kind="director")
+        job.shots = shots
+        job.stage = "序列排队中"
+        with self._cond:
+            self.jobs[job.id] = job
+            self.order.append(job.id)
+            self._cond.notify_all()
+        print("[queue] submitted %s (director: %d 镜头, mode=%s, 引用上段帧数=%s)"
+              % (job.id, len(shots), gp.get("mode"), gp.get("ref_prev_frames")), flush=True)
         return job
 
     # ---------- VAE 编解码探针（不进 DiT/采样；把编解码段从采样里剥出来单测） ----------
@@ -228,6 +275,9 @@ class QueueManager:
                 elif job.kind == "vae_probe":
                     from dit_svc import vae_probe
                     vae_probe.run_vae_probe(job, self.ctx)
+                elif job.kind == "director":
+                    from dit_svc import director
+                    director.run_director(job, self.ctx)
                 else:
                     pipeline.run_job(job, self.ctx)
                 job.status = "done"

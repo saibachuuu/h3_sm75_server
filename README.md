@@ -133,6 +133,11 @@ POST /api/vae_probe                   只跑视频 VAE 编解码（不进 DiT、
                                      JSON {image_b64?, decode?=true, latent?, write_mp4?,
                                      write_png?, mode?, ref_image_size?, width,
                                      height, length, fps?, seed?} -> {job_id}
+POST /api/director                   导演台：镜头序列（后续镜头参考上一镜头尾帧）
+                                     JSON {global:{mode,width,height,steps,sampler,
+                                     scheduler,seed,ref_prev_frames,concat,on_error},
+                                     shots:[{prompt,length,ref_prev,ref_prev_frames,
+                                     image_b64s,image_names}]} -> {job_id}
 POST /api/jobs/drop {id}             取消排队任务
 GET  /outputs/<id>.mp4|.json|.png    成果（支持 Range）
 ```
@@ -232,6 +237,48 @@ req = urllib.request.Request("http://127.0.0.1:8190/api/vae_probe",
 print(urllib.request.urlopen(req, timeout=120).read().decode())
 PY
 ```
+
+### POST /api/director（导演台：镜头序列）
+
+一次提交 N 个镜头（每个镜头 = 一条 mp4），在队列里**串行**逐个生成，产物可选拼成总片。
+
+```json
+{
+  "global": {"mode": "ref2va", "width": 640, "height": 960, "steps": 4,
+             "sampler": "res_multistep", "scheduler": "simple", "seed": 700,
+             "ref_prev_frames": 1, "concat": true, "on_error": "stop"},
+  "shots": [
+    {"prompt": "镜头1 雨中回头", "length": 124, "image_b64s": ["<base64>"]},
+    {"prompt": "镜头2 推门进屋", "length": 124},
+    {"prompt": "镜头3 猫跳上桌", "length": 140, "ref_prev": false, "image_b64s": ["<base64>"]}
+  ]
+}
+```
+
+**「后续镜头参考旧有镜头」= 帧级接力**：镜头 k 生成时按 `dump_tail_frames` 把结尾
+若干帧存成 `outputs/<seqid>-s<k>.tail0.png`（tail0 = 最后一帧），镜头 k+1 若
+`ref_prev=true` 就把这些 PNG 作为自己的参考图（`image_b64s`）**前置注入**，再跑一次
+普通生成。`ref_prev_frames` 决定取几张（0–9；`global` 给默认、每镜头可覆盖）。
+
+- 参考图组装：`[上段尾帧…] + [该镜头自带图…]`，`ref2va` 截到 9 张；`fl2va` 每镜头
+  只能 1 张 → 优先取上段最后一帧。
+- 每个镜头最终必须有 ≥1 张参考图：**首镜头必须自带图**；后续镜头「自带图 ≥1」或
+  「开了引用上段」二选一。
+- `seed`：`global.seed >= 0` 时第 k 个镜头用 `seed + k - 1`；`< 0` 每镜头各自随机。
+- `on_error`：`stop`（默认）某镜头失败即中止、其余标 `skipped`；`continue` 跳过失败
+  镜头继续（断链后后续镜头自动退化为不引用）。
+- 产出：逐镜头 `outputs/<seqid>-s<k>.mp4`（+ 同名 `.json`、`.tail*.png`）；全部成功后
+  拼总片 `outputs/<seqid>.mp4`（先 `-c copy` 无损，失败退回重编码；`concat=false` 不拼）。
+- 进度：`GET /api/jobs` 里该任务 `kind == "director"`，额外带 `shots[]`（逐镜头
+  `status/stage/elapsed/mp4/output_url/tail_urls/used_prev_frames`）与 `concat_url`。
+  取消排队中的序列仍用 `POST /api/jobs/drop {id}`。
+
+> **与 ComfyUI 导演台插件的差别**：插件是「上一段 AV latent 尾窗 + 5 帧相位对齐」的
+> **硬锁**接续（要改采样器内部）；本服务落在 API 层，做的是**帧级接力**（上一段真实
+> 解码帧当下一段参考图）。画面/人物/光线能延续，但不是严格焊死的无缝续接。
+
+单镜头任务（`/api/jobs`、`/api/jobs/cond`）也可用 `dump_tail_frames`（0–9，默认 0）
+单独存尾帧，产物同名字加 `files.tail_pngs`。
 
 ## 设计要点
 

@@ -58,6 +58,34 @@
                    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
   .card a { color:var(--acc); text-decoration:none; margin-right:10px; }
   details summary { cursor:pointer; color:var(--dim); font-size:12px; margin-top:8px; }
+  /* ---------- 导演台（镜头序列） ---------- */
+  input[type=checkbox] { width:auto; accent-color:var(--acc); }
+  label.cb { display:flex; align-items:center; gap:6px; color:var(--fg); margin:8px 0 3px; }
+  .shot { background:var(--panel2); border:1px solid var(--line); border-radius:8px;
+          padding:10px 12px; margin-bottom:10px; }
+  .shot.running { border-color:var(--warn); }
+  .shot.done    { border-color:var(--ok); }
+  .shot.failed  { border-color:var(--err); }
+  .shot .head { display:flex; align-items:center; gap:9px; }
+  .shot .no { font-weight:600; }
+  .shot .ops { margin-left:auto; display:flex; gap:6px; }
+  .shot textarea { min-height:54px; }
+  .badge { font-size:12px; padding:2px 9px; border-radius:20px; border:1px solid var(--line);
+           color:var(--dim); background:var(--panel); white-space:nowrap; }
+  .badge.running { color:#241703; background:var(--warn); border-color:var(--warn); }
+  .badge.done    { color:#0c1a12; background:var(--ok);   border-color:var(--ok); }
+  .badge.failed  { color:#2a0b0a; background:var(--err);  border-color:var(--err); }
+  .shStrip, .thumbs { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; align-items:center; }
+  .shStrip img, .tailthumb { width:64px; height:96px; object-fit:cover; border-radius:6px;
+                             border:1px solid var(--line); background:#000; }
+  .tailthumb { width:64px; height:64px; }
+  .thumbs a { font-size:12px; }
+  .shot .out { margin-top:8px; display:flex; gap:10px; flex-wrap:wrap; align-items:baseline; }
+  .shot .err { color:var(--err); font-size:12px; }
+  .dirbar { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:6px; }
+  .seqid { color:var(--dim); font-size:12px; }
+  .shLinks { margin-top:5px; }
+  .shLinks a { color:var(--acc); text-decoration:none; margin-right:10px; }
   #toast { position:fixed; right:18px; top:64px; z-index:99; display:flex; flex-direction:column; gap:8px; }
   .toast { background:#2a1210; border:1px solid var(--err); color:#ffb3b0; padding:9px 14px;
            border-radius:7px; max-width:380px; font-size:13px; }
@@ -136,6 +164,54 @@
 
     <p class="muted" id="attnNote">attention 后端为服务级配置（启动时固定，当前为 int8）。</p>
     <button id="submitBtn">提交生成任务</button>
+  </section>
+
+  <!-- ============ 导演台（镜头序列） ============ -->
+  <section>
+    <h2>导演台（镜头序列）</h2>
+    <p class="muted">按顺序串行生成多个镜头（每个镜头一条带音频 mp4）；后续镜头可选把上一镜头的尾帧当自己的参考图（帧级接力），全部成功后自动拼一条总片。</p>
+
+    <div class="grid">
+      <div><label>模式（整条序列共用）</label>
+        <select id="dirMode">
+          <option value="ref2va">ref2va（参考图条件）</option>
+          <option value="fl2va">fl2va（首帧锚定）</option>
+        </select>
+      </div>
+      <div><label>参考图尺寸策略</label>
+        <select id="dirRefImageSize">
+          <option value="match">match（对齐画布面积）</option>
+          <option value="max">max（短边上限 2048）</option>
+        </select>
+      </div>
+      <div><label>宽 × 高（32 倍数）</label>
+        <div class="grid">
+          <input type="number" id="dirWidth" value="640" step="32" min="256" max="1600">
+          <input type="number" id="dirHeight" value="960" step="32" min="256" max="1600">
+        </div>
+      </div>
+      <div><label>采样步数</label><input type="number" id="dirSteps" value="4" min="1" max="50"></div>
+      <div><label>采样器</label><select id="dirSampler"></select></div>
+      <div><label>调度器</label><select id="dirScheduler"></select></div>
+      <div><label>seed 基准（-1 = 每镜头随机）</label><input type="number" id="dirSeed" value="12345"></div>
+      <div><label>段间引用帧数（0–9）</label><input type="number" id="dirRpf" value="1" min="0" max="9"></div>
+      <div><label>出错时</label>
+        <select id="dirOnError">
+          <option value="stop">stop（停止，其余跳过）</option>
+          <option value="continue">continue（跳过失败镜头继续）</option>
+        </select>
+      </div>
+    </div>
+    <label class="cb"><input type="checkbox" id="dirConcat" checked> 结束后拼接总片</label>
+    <p class="muted" id="dirModeNote"></p>
+
+    <div id="shotList"></div>
+
+    <div class="dirbar">
+      <button class="ghost" id="dirAddBtn">+ 添加镜头</button>
+      <button id="dirSubmitBtn">提交镜头序列</button>
+      <span class="seqid" id="dirStatus">尚未提交序列</span>
+    </div>
   </section>
 
   <!-- ============ 队列 ============ -->
@@ -226,6 +302,26 @@ async function loadDefaults() {
     };
     fill($("sampler"), d.sampler, d.defaults.sampler);
     fill($("scheduler"), d.scheduler, d.defaults.scheduler);
+    /* 导演台：同一批采样器/调度器；默认值来自 /api/defaults 的 director 块 */
+    fill($("dirSampler"), d.sampler, d.defaults.sampler);
+    fill($("dirScheduler"), d.scheduler, d.defaults.scheduler);
+    if (d.director) {
+      DIR_DEF = d.director;
+      DIR_MAX_SHOTS = d.director.max_shots || DIR_MAX_SHOTS;
+      DIR_MAX_REFS = d.director.max_ref_images || DIR_MAX_REFS;
+      if (d.director.ref_prev_frames != null) $("dirRpf").value = d.director.ref_prev_frames;
+      if (d.director.concat != null) $("dirConcat").checked = !!d.director.concat;
+      if (d.director.on_error) $("dirOnError").value = d.director.on_error;
+      if (d.director.length_min != null) dirShots.forEach(sh => { sh.length = d.director.length_min; });
+      renumberShots();
+    }
+    if (d.defaults) {
+      $("dirWidth").value = d.defaults.width; $("dirHeight").value = d.defaults.height;
+      $("dirSteps").value = d.defaults.steps; $("dirSeed").value = d.defaults.seed;
+      $("dirMode").value = d.defaults.mode || "ref2va";
+      $("dirRefImageSize").value = d.defaults.ref_image_size || "match";
+    }
+    refreshModeNote();
   } catch (e) {}
 }
 
@@ -493,14 +589,22 @@ function addCard(j) {
   const c = document.createElement("div");
   c.className = "card";
   const t = j.timings || {};
+  // 导演台序列：总片入画廊，附每个镜头的单独链接
+  const isDir = (j.kind === "director" && Array.isArray(j.shots));
+  const dirHead = isDir ? ("序列 " + j.shots.length + " 镜｜总片") : "";
+  const dirLinks = isDir
+    ? ('<div class="shLinks">' + j.shots.map((s, i) => (s.output_url
+         ? '<a href="' + s.output_url + '" target="_blank">镜' + (i + 1) + '</a>' : "")).join("") + '</div>')
+    : "";
   c.innerHTML =
     '<video controls preload="metadata" src="' + j.output_url + '"></video>' +
     '<div class="meta"><div class="p">' + esc(j.prompt) + '</div>' +
+    dirHead + (dirHead ? '｜' : "") +
     'seed ' + j.seed + '｜' + (j.length || "?") + ' 帧｜' + (j.steps || "?") + ' 步｜' +
     (t.sample_first ? ("采样 " + t.sample_first + "s") : "") +
     (t.mux ? ("｜mux " + t.mux + "s") : "") +
     '<div style="margin-top:5px"><a href="' + j.output_url + '" download>下载 mp4</a>' +
-    '<a href="/outputs/' + j.id + '.json" target="_blank">参数</a></div></div>';
+    '<a href="/outputs/' + j.id + '.json" target="_blank">参数</a></div>' + dirLinks + '</div>';
   $("gallery").insertBefore(c, $("gallery").firstChild); // 最新在前
   galIds.add(j.id);
 }
@@ -508,6 +612,332 @@ function addCard(j) {
 function renderGallery(snap) {
   const done = snap.jobs.filter(j => j.status === "done" && j.mp4 && !galIds.has(j.id));
   if (done.length) { $("galEmpty").style.display = "none"; done.forEach(addCard); }
+}
+
+/* ================= 导演台（镜头序列） =================
+   结构变化（增删/移动/复制）才动 DOM；轮询只做文字/徽标/缩略图的原地更新。 */
+let DIR_DEF = null;                       // /api/defaults 的 director 块
+let DIR_MAX_SHOTS = 24, DIR_MAX_REFS = 9;
+let dirJobId = null;                      // 最近一次提交的序列 id
+let shotSeq = 0;
+const dirShots = [];                      // [{key,prompt,length,ref_prev,ref_prev_frames,images,node,refs,tsig}]
+const SHOT_ST_TXT = { pending:"待命", running:"生成中", done:"完成", failed:"失败", skipped:"跳过" };
+
+function setText(el, t) { if (el && el.textContent !== t) el.textContent = t; }
+function shotLenMin() { return (DIR_DEF && DIR_DEF.length_min) || LEN_MIN; }
+function shotLenMax() { return (DIR_DEF && DIR_DEF.length_max) || LEN_MAX; }
+function refsPerShot() { return $("dirMode").value === "fl2va" ? 1 : DIR_MAX_REFS; }
+
+function buildShotNode(sh) {
+  const node = document.createElement("div");
+  node.className = "shot";
+  node.innerHTML =
+    '<div class="head"><span class="no"></span><span class="badge pending">待命</span>' +
+      '<span class="ops">' +
+        '<button class="ghost" data-op="up" title="上移">上移</button>' +
+        '<button class="ghost" data-op="down" title="下移">下移</button>' +
+        '<button class="ghost" data-op="dup" title="复制">复制</button>' +
+        '<button class="ghost" data-op="del" title="删除">删除</button>' +
+      '</span></div>' +
+    '<label>提示词 *</label>' +
+    '<textarea class="shPrompt" placeholder="描述这个镜头要生成的内容…"></textarea>' +
+    '<div class="grid">' +
+      '<div><label>帧数（<span class="muted shLenPrev"></span>）</label>' +
+        '<input type="number" class="shLen" value="124" step="1"></div>' +
+      '<div><label>取帧数（0–9，留空 = 序列默认）</label>' +
+        '<input type="number" class="shRpf" min="0" max="9" placeholder="跟随序列"></div>' +
+      '<div><label>引用上段</label>' +
+        '<label class="cb"><input type="checkbox" class="shRefPrev"> 用上一镜头尾帧</label>' +
+        '<div class="muted shNoPrev">首镜头无上段</div></div>' +
+    '</div>' +
+    '<label>该镜头自带参考图（1–' + DIR_MAX_REFS + ' 张）</label>' +
+    '<input type="file" class="shFile" accept="image/*" multiple>' +
+    '<div class="shStrip"></div>' +
+    '<div class="out"><span class="shInfo muted"></span><span class="err shErr"></span></div>' +
+    '<div class="thumbs"></div>';
+
+  const r = sh.refs = {
+    node, no: node.querySelector(".no"), badge: node.querySelector(".badge"),
+    ta: node.querySelector(".shPrompt"), len: node.querySelector(".shLen"),
+    lenPrev: node.querySelector(".shLenPrev"),
+    rpf: node.querySelector(".shRpf"), refPrev: node.querySelector(".shRefPrev"),
+    noPrev: node.querySelector(".shNoPrev"), file: node.querySelector(".shFile"),
+    strip: node.querySelector(".shStrip"), info: node.querySelector(".shInfo"),
+    err: node.querySelector(".shErr"), thumbs: node.querySelector(".thumbs"),
+  };
+  sh.node = node;
+
+  r.ta.value = sh.prompt;
+  r.ta.addEventListener("input", () => { sh.prompt = r.ta.value; });
+  r.len.value = sh.length;
+  r.len.addEventListener("input", () => { sh.length = +r.len.value || 0; refreshShotLen(sh); });
+  r.rpf.value = (sh.ref_prev_frames == null ? "" : sh.ref_prev_frames);
+  r.rpf.addEventListener("input", () => {
+    sh.ref_prev_frames = (r.rpf.value === "" ? null : +r.rpf.value);
+  });
+  r.refPrev.checked = !!sh.ref_prev;
+  r.refPrev.addEventListener("change", () => { sh.ref_prev = r.refPrev.checked; });
+  r.file.addEventListener("change", () => readShotFiles(sh));
+  node.querySelector('[data-op=up]').addEventListener("click", () => moveShot(sh, -1));
+  node.querySelector('[data-op=down]').addEventListener("click", () => moveShot(sh, 1));
+  node.querySelector('[data-op=dup]').addEventListener("click", () => duplicateShot(sh));
+  node.querySelector('[data-op=del]').addEventListener("click", () => deleteShot(sh));
+  renderShotStrip(sh);
+  return node;
+}
+
+function newShot(data) {
+  const sh = Object.assign({ key:"sh" + (++shotSeq), prompt:"", length:shotLenMin(),
+                             ref_prev:true, ref_prev_frames:null, images:[], tsig:"" }, data || {});
+  buildShotNode(sh);
+  return sh;
+}
+
+function readShotFiles(sh) {
+  const max = refsPerShot();
+  const all = Array.from(sh.refs.file.files || []);
+  if (all.length > max)
+    toast("每镜头最多 " + max + " 张参考图" + ($("dirMode").value === "fl2va" ? "（fl2va 仅 1 张）" : ""));
+  const use = all.slice(0, max);
+  sh.images = use.map(f => ({ name: f.name }));
+  renderShotStrip(sh);
+  use.forEach((f, i) => {
+    const rd = new FileReader();
+    rd.onload = () => {
+      sh.images[i] = { name: f.name, b64: String(rd.result).split(",")[1], url: String(rd.result) };
+      renderShotStrip(sh);
+    };
+    rd.readAsDataURL(f);
+  });
+}
+
+function renderShotStrip(sh) {
+  const strip = sh.refs.strip;
+  strip.textContent = "";
+  if (!sh.images.length) {
+    const s = document.createElement("span");
+    s.className = "muted"; s.textContent = "未选参考图";
+    strip.appendChild(s);
+    return;
+  }
+  sh.images.forEach((im, i) => {
+    if (im.url) {
+      const el = document.createElement("img");
+      el.src = im.url; el.title = (i + 1) + ". " + im.name;
+      strip.appendChild(el);
+    } else {
+      const s = document.createElement("span");
+      s.className = "muted"; s.textContent = im.name;
+      strip.appendChild(s);
+    }
+  });
+}
+
+function refreshShotLen(sh) {
+  const n = +sh.length, lo = shotLenMin(), hi = shotLenMax();
+  const el = sh.refs.lenPrev;
+  if (!Number.isInteger(n) || n < lo || n > hi) {
+    setText(el, "仅 " + lo + "–" + hi + " 帧");
+    el.className = "muted"; el.style.color = "var(--err)";
+    return false;
+  }
+  setText(el, "≈ " + (n / FPS).toFixed(1) + "s");
+  el.style.color = "";
+  return true;
+}
+
+function renumberShots() {
+  dirShots.forEach((sh, i) => {
+    const r = sh.refs, first = i === 0;
+    setText(r.no, "镜 " + (i + 1));
+    r.len.min = shotLenMin(); r.len.max = shotLenMax();
+    r.refPrev.disabled = first;
+    r.refPrev.title = first ? "首镜头无上段" : "";
+    r.noPrev.style.display = first ? "" : "none";
+    // 首镜头永远显示为“不引用上段”（提交时也强制 false），但不破坏用户存的值：
+    // 镜头被移回后面时，用户原来的勾选会重新出现。
+    r.refPrev.checked = first ? false : !!sh.ref_prev;
+    if (r.len.value !== String(sh.length)) r.len.value = sh.length;
+    refreshShotLen(sh);
+  });
+  $("dirSubmitBtn").disabled = dirShots.length === 0;
+}
+
+function addShot(data) {
+  if (dirShots.length >= DIR_MAX_SHOTS) { toast("最多 " + DIR_MAX_SHOTS + " 个镜头"); return null; }
+  const sh = newShot(data);
+  dirShots.push(sh);
+  $("shotList").appendChild(sh.node);
+  renumberShots();
+  return sh;
+}
+
+function deleteShot(sh) {
+  const i = dirShots.indexOf(sh);
+  if (i < 0) return;
+  dirShots.splice(i, 1);
+  sh.node.remove();
+  renumberShots();
+}
+
+function moveShot(sh, d) {
+  const i = dirShots.indexOf(sh), j = i + d;
+  if (i < 0 || j < 0 || j >= dirShots.length) return;
+  dirShots.splice(i, 1);
+  dirShots.splice(j, 0, sh);
+  const list = $("shotList");
+  dirShots.forEach(s => list.appendChild(s.node));   // 仅重排已有节点，表单内容不丢
+  renumberShots();
+}
+
+function duplicateShot(sh) {
+  const i = dirShots.indexOf(sh);
+  if (i < 0) return;
+  if (dirShots.length >= DIR_MAX_SHOTS) return toast("最多 " + DIR_MAX_SHOTS + " 个镜头");
+  const c = newShot({ prompt: sh.prompt, length: sh.length, ref_prev: sh.ref_prev,
+                      ref_prev_frames: sh.ref_prev_frames, images: sh.images.slice() });
+  dirShots.splice(i + 1, 0, c);
+  $("shotList").insertBefore(c.node, sh.node.nextSibling);
+  renumberShots();
+}
+
+function refreshModeNote() {
+  const fl = $("dirMode").value === "fl2va";
+  setText($("dirModeNote"), fl
+    ? "fl2va：每镜头只能用 1 张图（优先上段尾帧）。"
+    : "ref2va：每镜头自带参考图最多 " + DIR_MAX_REFS + " 张；勾选「引用上段」的镜头会先拼接上一镜头的尾帧。");
+}
+
+$("dirMode").addEventListener("change", refreshModeNote);
+$("dirAddBtn").addEventListener("click", () => {
+  const prev = dirShots[dirShots.length - 1];
+  addShot({ length: prev ? prev.length : shotLenMin() });
+});
+
+$("dirSubmitBtn").addEventListener("click", async () => {
+  if (!dirShots.length) return toast("至少要有 1 个镜头");
+  const mode = $("dirMode").value, perShot = refsPerShot();
+  const lo = shotLenMin(), hi = shotLenMax();
+  const w = +$("dirWidth").value, h = +$("dirHeight").value;
+  if (!Number.isInteger(w) || !Number.isInteger(h) || w < 256 || w > 1600 || h < 256 || h > 1600
+      || w % 32 || h % 32)
+    return toast("宽高须为 256–1600 且是 32 的倍数");
+  const gRpf = +$("dirRpf").value;
+  const shots = [];
+  for (let i = 0; i < dirShots.length; i++) {
+    const sh = dirShots[i];
+    const prompt = (sh.prompt || "").trim();
+    if (!prompt) return toast("镜 " + (i + 1) + "：提示词不能为空");
+    const len = +sh.length;
+    if (!Number.isInteger(len) || len < lo || len > hi)
+      return toast("镜 " + (i + 1) + "：帧数仅支持 " + lo + "–" + hi);
+    const own = sh.images.filter(x => x && x.b64).slice(0, perShot);
+    const usePrev = i > 0 && !!sh.ref_prev;
+    if (!own.length && !usePrev)
+      return toast("镜 " + (i + 1) + "：需要 1 张自带参考图，或勾选「引用上段」");
+    if (mode === "fl2va" && i === 0 && !own.length)
+      return toast("fl2va：镜 1 必须有 1 张参考图");
+    shots.push({
+      prompt, length: len, seed: null,
+      ref_prev: i === 0 ? false : !!sh.ref_prev,
+      ref_prev_frames: (sh.ref_prev_frames === null || sh.ref_prev_frames === undefined
+                        ? null : +sh.ref_prev_frames),
+      image_b64s: own.map(x => x.b64), image_names: own.map(x => x.name),
+    });
+  }
+  const payload = { global: {
+    mode, ref_image_size: $("dirRefImageSize").value,
+    width: w, height: h, steps: +$("dirSteps").value,
+    sampler: $("dirSampler").value, scheduler: $("dirScheduler").value,
+    refine_steps: 0, refine_denoise: 0.85, sigmas: null,
+    seed: +$("dirSeed").value,
+    ref_prev_frames: Number.isFinite(gRpf) ? gRpf : 1,
+    concat: $("dirConcat").checked, on_error: $("dirOnError").value,
+  }, shots };
+  const btn = $("dirSubmitBtn");
+  btn.disabled = true;
+  try {
+    const r = await jpost("/api/director", payload);
+    dirJobId = r.job_id;
+    toast("已提交序列：" + r.job_id + "（" + shots.length + " 镜）", true);
+    poll();
+  } catch (e) {
+    toast("序列提交失败：" + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+/* ---------- 每镜头进度：轮询原地更新（徽标/文字/缩略图，不重建节点） ---------- */
+function pickDirectorJob(list) {
+  const dirs = list.filter(j => j.kind === "director");
+  if (!dirs.length) return null;
+  if (dirJobId) { const hit = dirs.find(j => j.id === dirJobId); if (hit) return hit; }
+  return dirs[0];                       // 列表最新在前 → 默认展示最近一条序列
+}
+
+function setBadge(el, st, txt) {
+  const want = "badge " + st;
+  if (el.className !== want) el.className = want;
+  setText(el, txt);
+}
+
+function updateShotProgress(sh, s) {
+  const r = sh.refs;
+  const st = s ? (s.status || "pending") : "pending";
+  setBadge(r.badge, st, SHOT_ST_TXT[st] || st);
+  const cls = "shot" + (st === "running" ? " running" : st === "done" ? " done"
+                       : st === "failed" ? " failed" : "");
+  if (sh.node.className !== cls) sh.node.className = cls;
+
+  if (!s) {                                  // 该镜头还没有进度（未提交 / 序号越界）
+    setText(r.info, "");
+    setText(r.err, "");
+    if (sh.tsig !== "") { sh.tsig = ""; r.thumbs.textContent = ""; }
+    return;
+  }
+  let info = "自带图 " + (s.own_ref_count || 0) + " 张";
+  if (s.ref_prev) info += "｜上段接力 " + (s.used_prev_frames || 0) + "/" + (s.ref_prev_frames || 0) + " 帧";
+  else if (s.index > 0) info += "｜不引用上段";
+  if (s.seed != null) info += "｜seed " + s.seed;
+  info += "｜" + (s.length || "?") + " 帧";
+  if (st === "running") info += "｜" + (s.stage || "") + " " + Math.round(s.elapsed || 0) + "s";
+  else if (st === "done" || st === "failed") info += "｜" + Math.round(s.elapsed || 0) + "s";
+  setText(r.info, info);
+  setText(r.err, s.error ? String(s.error).slice(0, 120) : "");
+
+  const tails = s.tail_urls || [];
+  const sig = tails.join(",") + "|" + (s.output_url || "");
+  if (sig !== sh.tsig) {                     // 尾帧/mp4 变了才重建缩略图条
+    sh.tsig = sig;
+    r.thumbs.textContent = "";
+    tails.forEach((u, i) => {
+      const im = document.createElement("img");
+      im.src = u; im.className = "tailthumb";
+      im.title = "尾帧 tail" + i + (i === 0 ? "（最后一帧）" : "");
+      r.thumbs.appendChild(im);
+    });
+    if (s.output_url) {
+      const a = document.createElement("a");
+      a.href = s.output_url; a.target = "_blank"; a.textContent = "查看镜头 mp4";
+      r.thumbs.appendChild(a);
+    }
+  }
+}
+
+function renderDirector(snap) {
+  const j = pickDirectorJob(snap.jobs);
+  if (!j) {                                  // 列表里没有序列（未提交 / 被清空）→ 镜头卡片回到待命
+    dirJobId = null;
+    setText($("dirStatus"), "尚未提交序列");
+    dirShots.forEach(sh => updateShotProgress(sh, null));
+    return;
+  }
+  if (dirJobId && j.id !== dirJobId) dirJobId = null;   // 已滚出列表 → 回到最新一条
+  setText($("dirStatus"), "序列 " + j.id + "｜" + (STATUS_TXT[j.status] || j.status) + "｜" +
+    (j.status === "queued" ? "等待中" : j.stage) + "｜" + Math.round(j.elapsed) + "s");
+  const S = j.shots || [];
+  dirShots.forEach((sh, i) => updateShotProgress(sh, S[i]));
 }
 
 /* ---------- 轮询：数据每 2 秒拉一次，但渲染全程增量 ---------- */
@@ -518,6 +948,7 @@ async function poll() {
     renderStatus(st);
     renderRunning(jobs.jobs);
     renderQueue(jobs);
+    renderDirector(jobs);
     renderGallery(jobs);
   } catch (e) {
     setChip($("chipReady"), "服务失联", "bad");
@@ -528,6 +959,11 @@ async function poll() {
     }
   }
 }
+
+/* 导演台：先摆好 2 个镜头（镜 1 自带图 + 镜 2 引用上段），再让 /api/defaults 覆盖默认值 */
+addShot({ length: LEN_MIN });
+addShot({ length: LEN_MIN });
+refreshModeNote();
 
 loadDefaults();
 poll();

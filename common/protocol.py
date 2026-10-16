@@ -218,6 +218,17 @@ def _fill_sampling_params(payload, out):
     if out["width"] % 32 or out["height"] % 32:
         return "width / height 必须是 32 的倍数"
 
+    # 可选：把该镜头结尾 N 帧存成 PNG（<id>.tail0.png = 最后一帧），供「后续镜头
+    # 参考旧有镜头」的帧级接力；导演台序列任务内部会用到。
+    v = payload.get("dump_tail_frames", 0)
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return "dump_tail_frames 必须是整数"
+    if not (0 <= v <= 9):
+        return "dump_tail_frames 超出范围 [0, 9]"
+    out["dump_tail_frames"] = v
+
     out["sigmas"] = payload.get("sigmas")  # 可选，逗号分隔，覆盖 scheduler/steps
     if out["sigmas"] is not None:
         if not isinstance(out["sigmas"], str):
@@ -333,3 +344,141 @@ def validate_cond_job(payload: dict, cond_base_dir=None):
     if err:
         return None, err
     return {"params": out, "cond": cond}, None
+
+
+# ---------------------------------------------------------------- 导演台（镜头序列）
+
+# 一条序列最多几个镜头（防手滑提交超长序列占满 GPU）
+DIRECTOR_MAX_SHOTS = 24
+
+
+def validate_director(payload: dict):
+    """校验 POST /api/director（镜头序列；后续镜头可参考上一镜头的尾帧）。
+
+    返回 ({"global": {...}, "shots": [...]}, None) 或 (None, 错误信息)。
+    每个镜头里 length / seed / ref_prev_frames 都在这一步解析成具体值，
+    执行侧（dit_svc/director.py）不再猜默认值。
+
+    硬约束：每个镜头最终必须能拿到 ≥1 张参考图 —— 首镜头必须自带图；
+    后续镜头「自带图 ≥1」或「ref_prev=true」二选一。
+    """
+    if not isinstance(payload, dict):
+        return None, "请求体必须是 JSON 对象"
+
+    g = payload.get("global") or {}
+    if not isinstance(g, dict):
+        return None, "global 必须是 JSON 对象"
+
+    shots_in = payload.get("shots")
+    if not isinstance(shots_in, list) or not shots_in:
+        return None, "shots 至少要有 1 个镜头"
+    if len(shots_in) > DIRECTOR_MAX_SHOTS:
+        return None, "镜头数上限 %d（当前 %d）" % (DIRECTOR_MAX_SHOTS, len(shots_in))
+
+    mode = g.get("mode", DEFAULTS["mode"])
+    if mode not in ("ref2va", "fl2va"):
+        return None, "mode 只能是 ref2va 或 fl2va"
+
+    # 公共参数借用单任务校验拿取值范围，再摘掉单镜头专属字段
+    probe = dict(g)
+    probe["prompt"] = "probe"
+    probe["image_b64s"] = ["AA=="]
+    gp, err = validate_job(probe)
+    if err:
+        return None, "global 参数有误：%s" % err
+    for k in ("prompt", "image_b64s", "image_b64", "image_name", "dump_tail_frames"):
+        gp.pop(k, None)
+
+    v = g.get("ref_prev_frames", 1)
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return None, "ref_prev_frames 必须是整数"
+    if not (0 <= v <= 9):
+        return None, "ref_prev_frames 超出范围 [0, 9]"
+    gp["ref_prev_frames"] = v
+
+    ok, err = _bool_param(g, "concat", True)
+    if err:
+        return None, err
+    gp["concat"] = ok
+
+    on_error = g.get("on_error", "stop")
+    if on_error not in ("stop", "continue"):
+        return None, "on_error 只能是 stop 或 continue"
+    gp["on_error"] = on_error
+
+    gseed = gp.get("seed")
+
+    shots = []
+    for i, s in enumerate(shots_in):
+        if not isinstance(s, dict):
+            return None, "镜头 %d 必须是 JSON 对象" % (i + 1)
+        prompt = s.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return None, "镜头 %d：prompt 不能为空" % (i + 1)
+
+        b64s = s.get("image_b64s")
+        if b64s is None:
+            b64s = []
+        if not isinstance(b64s, list) or not all(isinstance(x, str) and x for x in b64s):
+            return None, "镜头 %d：image_b64s 必须是 base64 字符串列表" % (i + 1)
+        if len(b64s) > 9:
+            return None, "镜头 %d：自带参考图最多 9 张" % (i + 1)
+
+        try:
+            length = int(s.get("length", DEFAULTS["length"]))
+        except (TypeError, ValueError):
+            return None, "镜头 %d：length 必须是整数" % (i + 1)
+        if not (16 <= length <= 400):
+            return None, "镜头 %d：length 超出范围 [16, 400]" % (i + 1)
+
+        ref_prev, err = _bool_param(s, "ref_prev", i > 0)
+        if err:
+            return None, "镜头 %d：%s" % (i + 1, err)
+        if i == 0:
+            ref_prev = False          # 首镜头没有上段可引用
+
+        rpf = s.get("ref_prev_frames")
+        rpf = v if rpf is None else rpf
+        try:
+            rpf = int(rpf)
+        except (TypeError, ValueError):
+            return None, "镜头 %d：ref_prev_frames 必须是整数" % (i + 1)
+        if not (0 <= rpf <= 9):
+            return None, "镜头 %d：ref_prev_frames 超出范围 [0, 9]" % (i + 1)
+
+        seed = s.get("seed")
+        if seed is None:
+            if gseed is None:
+                seed = DEFAULTS["seed"]
+            elif gseed < 0:
+                seed = -1             # 每镜头各自随机
+            else:
+                seed = gseed + i
+        else:
+            try:
+                seed = int(seed)
+            except (TypeError, ValueError):
+                return None, "镜头 %d：seed 必须是整数" % (i + 1)
+            if not (-1 <= seed <= 2 ** 63 - 1):
+                return None, "镜头 %d：seed 超出范围" % (i + 1)
+
+        names = s.get("image_names") or []
+        if not isinstance(names, list):
+            names = []
+        names = [str(n)[:200] for n in names]
+
+        if not b64s and not (i > 0 and ref_prev):
+            return None, ("镜头 %d：必须自带参考图（第 2 个镜头起也可以改为开启"
+                          "「引用上段」）" % (i + 1))
+        if mode == "fl2va" and len(b64s) > 1:
+            return None, "镜头 %d：fl2va 每镜头最多 1 张自带参考图" % (i + 1)
+
+        shots.append({
+            "index": i, "prompt": prompt.strip(), "length": length, "seed": seed,
+            "ref_prev": ref_prev, "ref_prev_frames": rpf,
+            "image_b64s": b64s, "image_names": names,
+        })
+
+    return {"global": gp, "shots": shots}, None
