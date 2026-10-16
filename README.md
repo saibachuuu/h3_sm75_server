@@ -25,7 +25,7 @@ Start-Process C:\Users\88888888\comfyui\.venv\Scripts\python.exe `
 
 **② 远程 dit server**（模型加载约 210 秒）
 ```powershell
-ssh -p <port> sheepserver@<host> "C:\Users\sheepserver\Desktop\ComfyUI_windows_portable\python_embeded\python.exe -X utf-8 C:\Users\sheepserver\Desktop\h3_sm75_server\h3_dit_server.py 2>&1 | Tee-Object -FilePath C:\Users\sheepserver\Desktop\_dit_server.log"
+ssh -p <port> sheepserver@<host> "C:\Users\sheepserver\Desktop\ComfyUI_windows_portable\python_embeded\python.exe -X utf-8 C:\Users\sheepserver\Desktop\h3_sm75_server_git\h3_dit_server.py 2>&1 | Tee-Object -FilePath C:\Users\sheepserver\Desktop\_dit_server.log"
 ```
 
 **③ 双向隧道**（保持开着；**必须显式 127.0.0.1，不能写 localhost**——
