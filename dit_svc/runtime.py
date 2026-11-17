@@ -177,6 +177,23 @@ class Runtime:
         del sd
         gc.collect()
         torch.cuda.empty_cache()
+        # 带 quant_config 的模型恒走 manual-cast：set_inference_dtype 一旦拿到非 None 的
+        # manual_cast_dtype，就把模型 dtype 钉成 fp32，于是 model_options["dtype"] 对常驻
+        # 精度无效（实测传 bf16 后 15.82GB 纹丝不动）。改为加载后就地降级——checkpoint 里
+        # 这些张量本来就是 bf16，334 个张量因此从 3.38GB 回到 1.69GB。量化层是
+        # QuantizedTensor 包装类（dtype 也报 fp32），必须跳过：认它的 _qdata 属性，
+        # 别依赖 comfy_kitchen 顶层导出（那里没有 QuantizedTensor，会 AttributeError）。
+        _squeezed = 0
+        for _mod in unet.model.diffusion_model.modules():
+            for _name, _p in list(_mod.named_parameters(recurse=False)):
+                if _p.dtype != torch.float32 or hasattr(_p, "_qdata"):
+                    continue
+                _mod._parameters[_name] = torch.nn.Parameter(
+                    _p.data.to(torch.bfloat16), requires_grad=False)
+                _squeezed += 1
+        gc.collect()
+        torch.cuda.empty_cache()
+        print("[load] non-quant params -> bf16: %d tensors" % _squeezed, flush=True)
         print("[load] DiT loaded in %.1fs, vram: %.2f GB"
               % (time.perf_counter() - t0, torch.cuda.memory_allocated() / 1e9), flush=True)
         self._vram_ledger("DiT权重", torch)
