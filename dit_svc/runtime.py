@@ -51,6 +51,10 @@ class Runtime:
         self.veda_patch = None      # --attn veda 时：star7 VedaPatch（运行期统计）
         self.ffmpeg = None
         self.attn = args.attn
+        # 分块卸载 / 文本编码器常驻（--offload-dit-blocks / --te-gguf）
+        self.offloaded_blocks = []
+        self.text_encoder = None
+        self.te_load_s = 0.0
 
     # ---------- 阶段上报 ----------
     def set_stage(self, name):
@@ -308,6 +312,15 @@ class Runtime:
         self.avae = avae
         self.diff_model = unet.model.diffusion_model
 
+        # ---- 6. 可选：DiT 分块卸载到 RAM，给文本编码器腾地方 ----
+        n_off = int(getattr(args, "offload_dit_blocks", 0) or 0)
+        if n_off > 0:
+            self._offload_dit_blocks(n_off, torch)
+
+        # ---- 7. 可选：文本编码器整份常驻 RAM（cpu），不占显卡 ----
+        if getattr(args, "te_gguf", None):
+            self._load_text_encoder_ram(torch)
+
         gc.collect()
         torch.cuda.empty_cache()
         rt.log_memory("Runtime ready")
@@ -316,6 +329,136 @@ class Runtime:
         self.stage = "就绪"
         print("[runtime] READY — free VRAM %.2f GB"
               % (torch.cuda.mem_get_info()[0] / 1e9), flush=True)
+
+
+    # ---------- 可选：DiT 分块卸载 / 文本编码器常驻 RAM ----------
+    def _offload_dit_blocks(self, n, torch):
+        """把 blocks.0..n-1 整块搬到 CPU（RAM），腾出同等显存。
+
+        实测结论：QuantizedTensor.to("cpu") 保留 _qdata 的 int8 存储，字节不变
+        （不会解包成 bf16）；显存 1:1 换成主机内存。中间块约 0.2GB，首两块约 0.4GB。
+        注意 ComfyUI 自带的 ModelPatcher.partially_unload 在"刚加载、无 patched
+        weights"的状态下是空转（实测 freed=0），所以这里直接搬模块。
+        """
+        import gc
+        blocks = self.diff_model.blocks
+        n = min(n, len(blocks))
+        self.set_stage("卸载 DiT blocks 到 RAM (%d)" % n)
+        t0 = time.perf_counter()
+        before = torch.cuda.memory_allocated()
+        for i in range(n):
+            blocks[i].to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+        freed = (before - torch.cuda.memory_allocated()) / 1e9
+        self.offloaded_blocks = list(range(n))
+        print("[offload] %d blocks -> cpu in %.1fs, freed %.2f GB (%.2f GiB)"
+              % (n, time.perf_counter() - t0, freed, freed / 1.073741824), flush=True)
+        self._vram_ledger("DiT卸载%d块" % n, torch)
+
+    def _load_text_encoder_ram(self, torch):
+        """文本编码器（Qwen3-VL + mmproj）整份加载到 CPU 常驻，不占显卡。
+
+        走 ComfyUI-GGUF：GGMLOps 把 GGUF 反量化成 torch 张量，结构由
+        comfy/text_encoders/minimax.py（CLIPType.MINIMAX）定义。
+        本进程强制 gpu_only=True，text_encoder_offload_device() 会返回 cuda，
+        所以必须显式 initial_device=cpu，否则就上卡了。
+
+        失败不阻塞服务：记录原因，self.text_encoder 保持 None，DiT 照常待命。
+        """
+        import gc
+        import importlib
+        import types
+        args = self.args
+        path = args.te_gguf
+        self.set_stage("文本编码器加载到 RAM")
+        t0 = time.perf_counter()
+        try:
+            if not os.path.isfile(path):
+                raise FileNotFoundError(path)
+            import comfy
+            import comfy.sd
+            # 注意：本 checkout 的 comfy 是 namespace package，__file__ 为 None，
+            # 只有 __path__ 有效（[<ComfyUI>/comfy]）。依次尝试两条来源 + sys.path 兜底。
+            cands = []
+            cpath = getattr(comfy, "__path__", None)
+            if cpath:
+                cands.append(os.path.dirname(os.path.abspath(list(cpath)[0])))
+            cfile = getattr(comfy, "__file__", None)
+            if cfile:
+                cands.append(os.path.dirname(os.path.dirname(os.path.abspath(cfile))))
+            cands.extend(os.path.abspath(p) for p in sys.path if p)
+            pkg_dir = None
+            for c in cands:
+                probe = os.path.join(c, "custom_nodes", "ComfyUI-GGUF")
+                if os.path.isdir(probe):
+                    pkg_dir = probe
+                    print("[te] ComfyUI 根目录: %s" % c, flush=True)
+                    break
+            if pkg_dir is None:
+                raise FileNotFoundError("找不到 ComfyUI-GGUF（试过 %d 个候选根）" % len(cands))
+            if "comfyui_gguf" not in sys.modules:
+                pkg = types.ModuleType("comfyui_gguf")
+                pkg.__path__ = [pkg_dir]
+                sys.modules["comfyui_gguf"] = pkg
+            gguf_loader = importlib.import_module("comfyui_gguf.loader")
+            gguf_ops = importlib.import_module("comfyui_gguf.ops")
+
+            print("[te] 读 GGUF: %s" % os.path.basename(path), flush=True)
+            sd = gguf_loader.gguf_clip_loader(path)
+            has_vis = any(k.startswith("model.visual.") for k in sd)
+            if not has_vis:
+                mm = getattr(args, "te_mmproj", None)
+                if mm and os.path.isfile(mm):
+                    print("[te] 主权重未带视觉塔，单独加载 mmproj: %s"
+                          % os.path.basename(mm), flush=True)
+                    sd.update(gguf_loader.gguf_qwen3vl_mmproj_loader(mm))
+                    has_vis = any(k.startswith("model.visual.") for k in sd)
+            print("[te] GGUF 张量 %d 个，视觉塔=%s" % (len(sd), has_vis), flush=True)
+
+            # detect_te_model 先看 "model.visual.deepstack_merger_list..." —— 命中就判 4B/8B；
+            # 要判成 QWEN3VL_32B（H3 视频版 cond，hidden 5120 / 50 层）必须同时满足
+            #   "visual.deepstack_merger_list.0.norm.weight"（无 model. 前缀）
+            #   "model.layers.49.self_attn.q_proj.weight"
+            # 而 GGUF 插件给视觉塔统一加了 model. 前缀，于是误落 8B 分支（按 4096 建模型，
+            # 与 checkpoint 的 5120 尺寸不符）。这里只剥视觉键的前缀，tokenizer/层键不动。
+            n_ren = 0
+            for k in [k for k in list(sd.keys()) if k.startswith("model.visual.")]:
+                sd[k[len("model."):]] = sd.pop(k)
+                n_ren += 1
+            if n_ren:
+                print("[te] 视觉键 model.visual.* -> visual.*: %d 个" % n_ren, flush=True)
+            try:
+                print("[te] detect_te_model -> %s" % comfy.sd.detect_te_model(sd), flush=True)
+            except Exception as _e:
+                print("[te] detect 失败: %s" % _e, flush=True)
+
+            clip = comfy.sd.load_text_encoder_state_dicts(
+                clip_type=comfy.sd.CLIPType.MINIMAX,
+                state_dicts=[sd],
+                model_options={
+                    "custom_operations": gguf_ops.GGMLOps,
+                    "initial_device": torch.device("cpu"),   # ← 常驻内存，不上卡
+                },
+                embedding_directory=[],
+            )
+            del sd
+            gc.collect()
+            self.text_encoder = clip
+            self.te_load_s = time.perf_counter() - t0
+            devs = {}
+            try:
+                for p in clip.patcher.model.parameters():
+                    d = str(p.device)
+                    devs[d] = devs.get(d, 0) + 1
+            except Exception:
+                pass
+            print("[te] 文本编码器就绪 %.1fs | 参数分布 %s" % (self.te_load_s, devs), flush=True)
+        except Exception as e:
+            import traceback
+            self.te_load_s = time.perf_counter() - t0
+            print("[te] 加载失败（DiT 照常待命）: %s: %s" % (type(e).__name__, e), flush=True)
+            traceback.print_exc()
 
 
 def _build_video_vae(comfy, vsd, vmd, device, torch):

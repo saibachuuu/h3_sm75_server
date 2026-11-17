@@ -55,6 +55,13 @@ def main():
     ap.add_argument("--audio_vae", default=DEFAULT_AUDIO_VAE)
     ap.add_argument("--light-vae", action="store_true",
                     help="视频 VAE 用 LynnReal Light 版（decoder 26 层，省 ~0.7GB 权重）")
+    ap.add_argument("--offload-dit-blocks", type=int, default=0, metavar="N",
+                    help="加载完毕后把这 N 个 DiT blocks（自 blocks.0 起）搬到 RAM，腾出显存；"
+                         "0=不卸。实测中间块约 0.2GB、首两块约 0.4GB，10 块约还 2.3GB")
+    ap.add_argument("--te-gguf", default=None,
+                    help="文本编码器主权重 GGUF；加载后整份常驻 RAM（cpu），不占显卡")
+    ap.add_argument("--te-mmproj", default=None,
+                    help="文本编码器视觉塔 mmproj GGUF（与 --te-gguf 配套）")
     ap.add_argument("--attn", choices=["int8", "sage", "w8a8", "sdpa", "veda"], default="int8",
                     help="服务级 attention 后端（int8=已验证默认；sage/w8a8=调试档；veda=dev 实验）")
     ap.add_argument("--veda-bundle", default=DEFAULT_VEDA_BUNDLE,
