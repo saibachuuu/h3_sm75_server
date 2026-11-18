@@ -406,14 +406,16 @@ class Runtime:
 
             print("[te] 读 GGUF: %s" % os.path.basename(path), flush=True)
             sd = gguf_loader.gguf_clip_loader(path)
-            has_vis = any(k.startswith("model.visual.") for k in sd)
+            # 视觉塔可能以 visual.*（realrebelai 的 Q2_K 导出）或 model.visual.*
+            # （本插件的 mmproj 分离加载）两种前缀出现，两种都算。
+            has_vis = any(k.startswith(("visual.", "model.visual.")) for k in sd)
             if not has_vis:
                 mm = getattr(args, "te_mmproj", None)
                 if mm and os.path.isfile(mm):
                     print("[te] 主权重未带视觉塔，单独加载 mmproj: %s"
                           % os.path.basename(mm), flush=True)
                     sd.update(gguf_loader.gguf_qwen3vl_mmproj_loader(mm))
-                    has_vis = any(k.startswith("model.visual.") for k in sd)
+                    has_vis = any(k.startswith(("visual.", "model.visual.")) for k in sd)
             print("[te] GGUF 张量 %d 个，视觉塔=%s" % (len(sd), has_vis), flush=True)
 
             # detect_te_model 先看 "model.visual.deepstack_merger_list..." —— 命中就判 4B/8B；
@@ -438,7 +440,15 @@ class Runtime:
                 state_dicts=[sd],
                 model_options={
                     "custom_operations": gguf_ops.GGMLOps,
-                    "initial_device": torch.device("cpu"),   # ← 常驻内存，不上卡
+                    # 待命在内存、要算上显卡：
+                    #   initial_device —— 构造时权重落在 cpu（不占显存）
+                    #   load_device    —— encode 时 CLIP.load_model() 把它搬到这里；
+                    #                     显式给 cuda 才会上卡算。但要留神：load_models_gpu
+                    #                     会为腾地方卸掉其它模型（DiT），实测时确认它动了什么
+                    #   offload_device —— 用完退回 cpu
+                    "initial_device": torch.device("cpu"),
+                    "load_device": torch.device("cuda:0"),
+                    "offload_device": torch.device("cpu"),
                 },
                 embedding_directory=[],
             )
