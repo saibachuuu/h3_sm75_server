@@ -236,6 +236,56 @@ print("-- list --")
 check("list 按时间倒序且有上限", lambda: len(store2.list(limit=1)) == 1)
 
 print()
+print("== 时间轴（stdlib，不 import torch）==")
+from dit_svc.artifacts import (  # noqa: E402
+    align_frame_count, decode_trim, plan_temporal, video_latent_t,
+)
+
+check("align 5 -> 5", lambda: align_frame_count(5) == 5)
+check("align 124 -> 124", lambda: align_frame_count(124) == 124)
+check("align 100 -> 107", lambda: align_frame_count(100) == 107)
+check("align 1 -> 5（下限）", lambda: align_frame_count(1) == 5)
+check("align 结果都满足 17k+5",
+      lambda: all(align_frame_count(n) % 17 == 5
+                  for n in range(1, 400)))
+check("latent_t(124) = 37",
+      lambda: plan_temporal(124)["latent_t"] == video_latent_t(124) == 37)
+check("plan_temporal 124 音频 207",
+      lambda: plan_temporal(124)["audio_t"] == 207)
+check("plan_temporal 保留 requested_length",
+      lambda: plan_temporal(100)["requested_length"] == 100
+      and plan_temporal(100)["frame_count"] == 107)
+
+
+def _expect_artifact(name, fn, code=None, contains=None):
+    def run():
+        try:
+            fn()
+        except ArtifactError as e:
+            if code and e.code != code:
+                raise AssertionError("code=%s" % e.code)
+            if contains and contains not in str(e):
+                raise AssertionError(str(e))
+            return "%s: %s" % (e.code, str(e)[:40])
+        raise AssertionError("没抛 ArtifactError")
+    check(name, run)
+
+
+_expect_artifact("decode_trim 帧数不足报错",
+                 lambda: decode_trim(100, {"requested_length": 124}),
+                 code="EXECUTION_FAILED")
+_expect_artifact("decode_trim 缺 requested_length 报错",
+                 lambda: decode_trim(127, {}), code="INVALID_ARTIFACT")
+
+
+def _trim_ok():
+    r = decode_trim(127, {"requested_length": 124})
+    assert r["keep"] == 124 and r["trim_tail"] == 3 and r["frame_count"] == 124, r
+    return "ok"
+
+
+check("decode_trim 127 -> keep 124", _trim_ok)
+
 shutil.rmtree(TMP, ignore_errors=True)
 if fails:
     print("FAILED %d: %s" % (len(fails), ", ".join(fails)))

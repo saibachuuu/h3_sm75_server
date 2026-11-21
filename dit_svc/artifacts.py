@@ -510,3 +510,583 @@ class ArtifactStore(object):
         }
         self._write_manifest(manifest)
         return self.public(artifact_id)
+
+
+# ================================================================== 序列化层（P3）
+#
+# torch / safetensors 全部 lazy import：本文件在无 GPU、无 torch 的解释器里也能
+# 导入并跑路径层单测。
+#
+# 真实 ComfyUI 容器（remote comfy/nested_tensor.py）：
+#     class NestedTensor:
+#         def __init__(self, tensors): self.tensors = list(tensors); self.is_nested = True
+#         def unbind(self): return self.tensors
+# 且 comfy_extras/nodes_minimax_h3.py 里 `_av_latent` 固定是
+#     NestedTensor((video[B,24,T,H//16,W//16], audio[B,32,2,T40]))
+# 所以这里按 `.tensors` 列表 + shape 判别来处理，不使用 torch.nested。
+
+FORMAT_COND = "h3.cond.v1"
+FORMAT_AVLATENT = "h3.avlatent.v1"
+
+COND_REQUIRED_KEYS = ("cond", "minimax_token_tags")
+COND_OPTIONAL_KEYS = ("attention_mask", "pooled_output")
+AVLATENT_CORE_KEYS = ("video", "audio")
+AVLATENT_OPTIONAL_KEYS = ("noise_mask", "noise_mask_video", "noise_mask_audio")
+AVLATENT_REQUIRED_META = ("format", "requested_length", "native_fps")
+NATIVE_FPS = 24
+
+# video: [B,24,T,H,W] ；audio: [B,32,2,T]
+VIDEO_CHANNELS = 24
+AUDIO_CHANNELS = 32
+AUDIO_STREAMS = 2
+
+_PROBE_CHUNK_ELEMS = 1 << 22
+
+
+def _torch():
+    import torch
+    return torch
+
+
+def _safetensors_mod():
+    try:
+        import safetensors                            # noqa: F401
+    except ImportError as e:                          # pragma: no cover
+        raise ArtifactError("safetensors 未安装：%s" % e,
+                            code="ENV_NOT_READY", http_status=503)
+    return safetensors
+
+
+def _to_cpu_contiguous(tensor, *, label):
+    """原 dtype 的 CPU contiguous 副本；不做 dtype 统一。"""
+    if tensor is None:
+        raise ArtifactError("%s 是 None" % label, code="INVALID_ARTIFACT",
+                            http_status=422)
+    if not hasattr(tensor, "detach"):
+        raise ArtifactError("%s 不是 Tensor: %r" % (label, type(tensor)),
+                            code="INVALID_ARTIFACT", http_status=422)
+    out = tensor.detach().to(device="cpu", copy=True).contiguous()
+    if out.layout != _torch().strided:
+        raise ArtifactError("%s 不是 strided tensor（layout=%s）"
+                            % (label, out.layout),
+                            code="INVALID_ARTIFACT", http_status=422)
+    return out
+
+
+# ------------------------------------------------------------- 容器适配
+
+def _classify_mask(tensor):
+    """noise_mask 的 video/audio 块：只按维度区分（5D=video，4D=audio）。"""
+    shape = getattr(tensor, "shape", None)
+    if shape is None or len(shape) not in (4, 5):
+        raise ArtifactError("noise_mask tensor 维度不支持: %r"
+                            % (tuple(shape) if shape is not None else tensor,),
+                            code="INVALID_ARTIFACT", http_status=422)
+    return "video" if len(shape) == 5 else "audio"
+
+
+def split_noise_mask(noise_mask, *, split_container=None):
+    """把 noise_mask 容器拆成 ``(video, audio)``；不套用 latent 通道判别。"""
+    split = split_container or default_split_container
+    video, audio, order = _split_pair(noise_mask, split, _classify_mask,
+                                      label="noise_mask")
+    return video, audio, order
+
+
+def _split_pair(container, split, classify, *, label):
+    """通用：从容器取出两个 tensor 并按 ``classify`` 定位 video/audio。"""
+    if hasattr(container, "tensors") and isinstance(
+            getattr(container, "tensors"), (list, tuple)):
+        items = list(container.tensors)
+        order_hint = None
+    elif isinstance(container, dict):
+        if set(container) != {"video", "audio"}:
+            raise ArtifactError(
+                "%s 映射必须且只能包含 video/audio，实际: %s"
+                % (label, ", ".join(sorted(container))),
+                code="INVALID_ARTIFACT", http_status=422)
+        return container["video"], container["audio"], "video,audio"
+    elif isinstance(container, (list, tuple)):
+        items = list(container)
+        order_hint = None
+    else:
+        raise ArtifactError("%s 未知容器类型: %s（需要 .tensors / "
+                            "{video,audio} / 二元序列）" % (label, type(container)),
+                            code="INVALID_ARTIFACT", http_status=422)
+    if len(items) != 2:
+        raise ArtifactError("%s 容器必须恰好 2 个 tensor，实际 %d 个"
+                            % (label, len(items)),
+                            code="INVALID_ARTIFACT", http_status=422)
+    kinds = [classify(t) for t in items]
+    if sorted(kinds) != ["audio", "video"]:
+        raise ArtifactError("%s 两个 tensor 无法区分为 video/audio：%s"
+                            % (label, kinds), code="INVALID_ARTIFACT",
+                            http_status=422)
+    video = items[kinds.index("video")]
+    audio = items[kinds.index("audio")]
+    return video, audio, ",".join(kinds)
+
+
+def default_split_container(container):
+    """把 latent 容器拆成 ``(video, audio, trailer)``。
+
+    支持三种真实可能形状，且都只按“结构”识别，不猜：
+    1. Comfy NestedTensor：``.tensors`` 为长度 2 的 list；
+    2. 映射：``{"video": T, "audio": T}``；
+    3. 二元 tuple / list。
+
+    返回 ``(video, audio, order)``，order 记录容器内原始顺序（"video,audio" /
+    "audio,video"），重建时按原序放回，避免隐式交换。
+    """
+    items = None
+    if hasattr(container, "tensors") and isinstance(
+            getattr(container, "tensors"), (list, tuple)):
+        items = list(container.tensors)
+    elif isinstance(container, dict):
+        if set(container) == {"video", "audio"}:
+            return container["video"], container["audio"], "video,audio"
+        raise ArtifactError(
+            "latent 映射必须且只能包含 video/audio，实际: %s"
+            % ", ".join(sorted(container)),
+            code="INVALID_ARTIFACT", http_status=422)
+    elif isinstance(container, (list, tuple)):
+        items = list(container)
+
+    if items is None:
+        raise ArtifactError("未知 latent 容器类型: %s（需要 .tensors / "
+                            "{video,audio} / 二元序列）" % type(container),
+                            code="INVALID_ARTIFACT", http_status=422)
+    if len(items) != 2:
+        raise ArtifactError("latent 容器必须恰好 2 个 tensor，实际 %d 个"
+                            % len(items),
+                            code="INVALID_ARTIFACT", http_status=422)
+
+    kinds = [_classify_av(t) for t in items]
+    if sorted(kinds) != ["audio", "video"]:
+        raise ArtifactError("latent 两个 tensor 无法按 shape 区分为 video/audio：%s"
+                            % (kinds,), code="INVALID_ARTIFACT",
+                            http_status=422)
+    video = items[kinds.index("video")]
+    audio = items[kinds.index("audio")]
+    return video, audio, ",".join(kinds)
+
+
+def _classify_av(tensor):
+    shape = getattr(tensor, "shape", None)
+    if shape is None or len(shape) not in (4, 5):
+        raise ArtifactError("latent tensor 维度不支持: %r"
+                            % (tuple(shape) if shape is not None else tensor,),
+                            code="INVALID_ARTIFACT", http_status=422)
+    dims = [int(d) for d in shape]
+    if len(dims) == 5 and dims[1] == VIDEO_CHANNELS:
+        return "video"
+    if len(dims) == 4 and dims[1] == AUDIO_CHANNELS and dims[2] == AUDIO_STREAMS:
+        return "audio"
+    raise ArtifactError(
+        "latent tensor shape %s 既不是 video[B,24,T,H,W] 也不是 audio[B,32,2,T]"
+        % (tuple(dims),), code="INVALID_ARTIFACT", http_status=422)
+
+
+def default_build_container(video, audio, order="video,audio"):
+    """按记录的容器顺序重建（与原容器同类则可直接复用其类）。"""
+    pair = {"video": video, "audio": audio}
+    tensors = [pair[name] for name in order.split(",")]
+    for cls in _container_classes():
+        try:
+            obj = cls(tuple(tensors))
+            if list(getattr(obj, "tensors", [])) == tensors:
+                return obj
+        except Exception:            # noqa: BLE001 — 只是候选
+            continue
+    return tuple(tensors)
+
+
+def _container_classes():
+    """优先用真实 Comfy NestedTensor，其次尝试 comfy.nested_tensor。"""
+    found = []
+    import sys
+    mod = sys.modules.get("comfy_extras.nested_tensor")
+    if mod is not None and hasattr(mod, "NestedTensor"):
+        found.append(mod.NestedTensor)
+    mod = sys.modules.get("comfy.nested_tensor")
+    if mod is not None and hasattr(mod, "NestedTensor"):
+        found.append(mod.NestedTensor)
+    return found
+
+
+# ------------------------------------------------------------- latent 拆装
+
+def split_av_latent(latent, *, split_container=None):
+    """把采样器输出的 latent 拆成 ``({tensor keys}, order, extra_meta)``。
+
+    ``latent`` 是 Comfy latent 字典（含 ``samples``，可能有 ``noise_mask``）。
+    未知键直接报错，不静默丢弃。
+    """
+    if not isinstance(latent, dict):
+        raise ArtifactError("latent 必须是 dict（含 samples）",
+                            code="INVALID_ARTIFACT", http_status=422)
+    if "samples" not in latent:
+        raise ArtifactError("latent 缺少 samples 键",
+                            code="INVALID_ARTIFACT", http_status=422)
+    unsupported = sorted(k for k in latent
+                         if k != "samples" and k not in ("noise_mask", "batch_index"))
+    if unsupported:
+        raise ArtifactError(
+            "latent 含未支持的字段，拒绝保存（避免静默丢数据）: %s"
+            % ", ".join(unsupported),
+            code="INVALID_ARTIFACT", http_status=422,
+            details={"unsupported_fields": unsupported})
+
+    split = split_container or default_split_container
+    video, audio, order = split(latent["samples"])
+    out = {
+        "video": _to_cpu_contiguous(video, label="video"),
+        "audio": _to_cpu_contiguous(audio, label="audio"),
+    }
+
+    noise_mask = latent.get("noise_mask")
+    if noise_mask is not None:
+        if hasattr(noise_mask, "tensors") or isinstance(noise_mask, (list, tuple)):
+            vmask, amask, _ = split_noise_mask(noise_mask, split_container=split_container)
+            out["noise_mask_video"] = _to_cpu_contiguous(vmask, label="noise_mask_video")
+            out["noise_mask_audio"] = _to_cpu_contiguous(amask, label="noise_mask_audio")
+        else:
+            out["noise_mask"] = _to_cpu_contiguous(noise_mask, label="noise_mask")
+
+    extra = {"container_order": order,
+             "container_type": type(latent["samples"]).__name__}
+    if latent.get("batch_index") is not None:
+        extra["batch_index"] = str(latent["batch_index"])[:200]
+    return out, extra
+
+
+def _metadata_strings(meta):
+    out = {}
+    for key, value in (meta or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, str):
+            out[str(key)] = value
+        elif isinstance(value, bool):
+            out[str(key)] = "true" if value else "false"
+        elif isinstance(value, (int, float)):
+            out[str(key)] = str(value)
+        else:
+            out[str(key)] = json.dumps(value, ensure_ascii=False)
+    return out
+
+
+def save_av_latent(store, samples, metadata, *, filename=None,
+                   split_container=None):
+    """把 latent 存成 ``h3.avlatent.v1`` safetensors 并登记 artifact。
+
+    ``metadata`` 必须包含 format=FORMAT_AVLATENT、requested_length、native_fps。
+    """
+    if not isinstance(metadata, dict):
+        raise ArtifactError("metadata 必须是 dict", code="INVALID_REQUEST",
+                            http_status=400)
+    missing = [k for k in AVLATENT_REQUIRED_META if k not in metadata]
+    if missing:
+        raise ArtifactError("latent metadata 缺少必需字段: %s" % ", ".join(missing),
+                            code="INVALID_REQUEST", http_status=400)
+    if metadata["format"] != FORMAT_AVLATENT:
+        raise ArtifactError("latent metadata.format 必须是 %s" % FORMAT_AVLATENT,
+                            code="INVALID_REQUEST", http_status=400)
+    try:
+        fps = float(metadata["native_fps"])
+        req_len = int(metadata["requested_length"])
+    except (TypeError, ValueError):
+        raise ArtifactError("native_fps / requested_length 必须是数字",
+                            code="INVALID_REQUEST", http_status=400)
+    if fps != NATIVE_FPS:
+        raise ArtifactError("首版 latent 只支持 native_fps=24，收到 %s" % fps,
+                            code="INVALID_REQUEST", http_status=400)
+    if req_len < 1:
+        raise ArtifactError("requested_length 必须 ≥1", code="INVALID_REQUEST",
+                            http_status=400)
+
+    tensors, extra = split_av_latent(samples, split_container=split_container)
+    meta = dict(metadata)
+    meta.update(extra)
+    meta["video_shape"] = json.dumps([int(d) for d in tensors["video"].shape])
+    meta["audio_shape"] = json.dumps([int(d) for d in tensors["audio"].shape])
+    meta["dtypes"] = json.dumps({k: str(v.dtype) for k, v in tensors.items()})
+    meta.setdefault("native_fps", NATIVE_FPS)
+
+    expected = sum(t.numel() * t.element_size() for t in tensors.values())
+    name = filename or "%s.safetensors" % uuid.uuid4().hex
+
+    def _writer(tmp):
+        from safetensors.torch import save_file
+        save_file(tensors, tmp, metadata=_metadata_strings(meta))
+
+    return store.commit_stream(
+        "latent", name, _writer, metadata=_metadata_strings(meta),
+        fmt=FORMAT_AVLATENT, expected_bytes=expected)
+
+
+def load_av_latent(store, name, *, build_container=None):
+    """读回 ``h3.avlatent.v1``：返回 ``(latent_dict, metadata)``。
+
+    重建容器时按保存的 ``container_order`` 放回原序；不自动补未知字段。
+    """
+    path = store.resolve(name)
+    from safetensors import safe_open
+    tensors = {}
+    md = {}
+    with safe_open(path, framework="pt", device="cpu") as f:
+        md = dict(f.metadata() or {})
+        for key in f.keys():
+            tensors[key] = f.get_tensor(key)
+    if md.get("format") != FORMAT_AVLATENT:
+        raise ArtifactError("不是 %s 文件（format=%r）"
+                            % (FORMAT_AVLATENT, md.get("format")),
+                            code="INVALID_ARTIFACT", http_status=422)
+    missing = [k for k in AVLATENT_CORE_KEYS if k not in tensors]
+    if missing:
+        raise ArtifactError("latent 文件缺少 tensor: %s" % ", ".join(missing),
+                            code="INVALID_ARTIFACT", http_status=422)
+    unknown = sorted(k for k in tensors
+                     if k not in AVLATENT_CORE_KEYS + AVLATENT_OPTIONAL_KEYS)
+    if unknown:
+        raise ArtifactError("latent 文件含未支持 tensor 字段: %s"
+                            % ", ".join(unknown), code="INVALID_ARTIFACT",
+                            http_status=422)
+    order = md.get("container_order") or "video,audio"
+    if order not in ("video,audio", "audio,video"):
+        raise ArtifactError("container_order 非法: %r" % order,
+                            code="INVALID_ARTIFACT", http_status=422)
+    build = build_container or default_build_container
+    latent = {"samples": build(tensors["video"], tensors["audio"], order)}
+    if "noise_mask_video" in tensors:
+        latent["noise_mask"] = build(tensors["noise_mask_video"],
+                                     tensors["noise_mask_audio"], order)
+    elif "noise_mask" in tensors:
+        latent["noise_mask"] = tensors["noise_mask"]
+    md["requested_length"] = int(md.get("requested_length") or 0)
+    md["native_fps"] = float(md.get("native_fps") or NATIVE_FPS)
+    return latent, md
+
+
+# ------------------------------------------------------------- cond 拆装
+
+def split_cond(cond_data, *, extensions=()):
+    """整理 cond 负载；``minimax_token_tags=None`` 必须显式决策，不静默丢弃。"""
+    if not isinstance(cond_data, dict):
+        raise ArtifactError("cond 数据必须是 dict", code="INVALID_ARTIFACT",
+                            http_status=422)
+    allowed = set(COND_REQUIRED_KEYS) | set(COND_OPTIONAL_KEYS) | set(extensions)
+    unknown = sorted(k for k in cond_data if k not in allowed)
+    if unknown:
+        raise ArtifactError("cond 含未支持字段，拒绝保存: %s" % ", ".join(unknown),
+                            code="INVALID_ARTIFACT", http_status=422,
+                            details={"unsupported_fields": unknown})
+    out = {}
+    for key in COND_REQUIRED_KEYS:
+        if key not in cond_data:
+            raise ArtifactError("cond 缺少必需字段: %s" % key,
+                                code="INVALID_ARTIFACT", http_status=422)
+    out["cond"] = _to_cpu_contiguous(cond_data["cond"], label="cond")
+    tags = cond_data["minimax_token_tags"]
+    if tags is None:
+        raise ArtifactError(
+            "minimax_token_tags 为 None：不能写出缺少必需 key 的“成功”cond 文件",
+            code="INVALID_ARTIFACT", http_status=422,
+            details={"field": "minimax_token_tags", "reason": "none"})
+    out["minimax_token_tags"] = _to_cpu_contiguous(tags, label="minimax_token_tags")
+    # cond 通常是 [B, T, C]，tags 是 [B, T]；按 tags 的维度比较前缀
+    tag_shape = tuple(out["minimax_token_tags"].shape)
+    cond_shape = tuple(out["cond"].shape)
+    if cond_shape[:len(tag_shape)] != tag_shape:
+        raise ArtifactError(
+            "minimax_token_tags shape %s 与 cond shape %s 的 token 维度不一致"
+            % (tag_shape, cond_shape),
+            code="INVALID_ARTIFACT", http_status=422)
+    for key in COND_OPTIONAL_KEYS:
+        if cond_data.get(key) is not None:
+            out[key] = _to_cpu_contiguous(cond_data[key], label=key)
+    return out
+
+
+def save_cond(store, cond_data, metadata, *, filename=None, extensions=(),
+              synthesize_tags=None):
+    """保存 ``h3.cond.v1``。
+
+    ``synthesize_tags``：只有已被验证的适配器才能提供的等价 tags 生成器；给了
+    才允许把 tags=None 转成等价量，并在 metadata 里标明来源。默认拒绝。
+    """
+    if not isinstance(metadata, dict):
+        raise ArtifactError("metadata 必须是 dict", code="INVALID_REQUEST",
+                            http_status=400)
+    md = dict(metadata)
+    md["format"] = md.get("format") or FORMAT_COND
+    if md["format"] != FORMAT_COND:
+        raise ArtifactError("cond metadata.format 必须是 %s" % FORMAT_COND,
+                            code="INVALID_REQUEST", http_status=400)
+
+    data = dict(cond_data or {})
+    if data.get("minimax_token_tags", "missing") is None and synthesize_tags is not None:
+        tags = synthesize_tags(data.get("cond"))
+        data["minimax_token_tags"] = tags
+        md["token_tags_source"] = "synthesized"
+
+    tensors = split_cond(data, extensions=extensions)
+    if "token_tags_source" not in md:
+        md["token_tags_source"] = "encoder"
+
+    expected = sum(t.numel() * t.element_size() for t in tensors.values())
+    name = filename or "%s.safetensors" % uuid.uuid4().hex
+
+    def _writer(tmp):
+        from safetensors.torch import save_file
+        save_file(tensors, tmp, metadata=_metadata_strings(md))
+
+    return store.commit_stream(
+        "cond", name, _writer, metadata=_metadata_strings(md),
+        fmt=FORMAT_COND, expected_bytes=expected)
+
+
+def load_cond(store, name, *, extensions=()):
+    """读回 cond safetensors：返回 ``(tensors dict, metadata)``。
+
+    两个必需 key 缺失即报错；legacy 文件（无 h3.cond.v1 metadata）仍然接受，
+    只是 ``metadata["format"]`` 为 None。
+    """
+    path = store.resolve(name)
+    from safetensors import safe_open
+    tensors = {}
+    with safe_open(path, framework="pt", device="cpu") as f:
+        md = dict(f.metadata() or {})
+        for key in f.keys():
+            tensors[key] = f.get_tensor(key)
+    allowed = set(COND_REQUIRED_KEYS) | set(COND_OPTIONAL_KEYS) | set(extensions)
+    unknown = sorted(k for k in tensors if k not in allowed)
+    if unknown:
+        raise ArtifactError("cond 文件含未支持 tensor: %s" % ", ".join(unknown),
+                            code="INVALID_ARTIFACT", http_status=422)
+    missing = [k for k in COND_REQUIRED_KEYS if k not in tensors]
+    if missing:
+        raise ArtifactError("cond 文件缺少必需 tensor: %s" % ", ".join(missing),
+                            code="INVALID_ARTIFACT", http_status=422)
+    return tensors, md
+
+
+# ------------------------------------------------------------- 数值探针
+
+def probe_tensor_chunked(tensor, *, chunk_elems=_PROBE_CHUNK_ELEMS):
+    """有界分块的 NaN/Inf/min/max 探针，不新增整块 fp32 副本。"""
+    torch = _torch()
+    t = tensor.detach()
+    numel = int(t.numel())
+    if numel == 0:
+        return {"min": None, "max": None, "nan": 0, "inf": 0, "elements": 0}
+    if t.is_complex():
+        t = t.real
+    elif not t.is_floating_point():
+        t = t.float()
+    flat = t.reshape(-1)
+    nan = 0
+    inf = 0
+    vmin = None
+    vmax = None
+    for start in range(0, numel, max(1, int(chunk_elems))):
+        block = flat[start:start + chunk_elems]
+        nan += int(torch.isnan(block).sum())
+        inf += int(torch.isinf(block).sum())
+        finite = block[torch.isfinite(block)]
+        if finite.numel():
+            bmin = float(finite.min())
+            bmax = float(finite.max())
+            vmin = bmin if vmin is None else min(vmin, bmin)
+            vmax = bmax if vmax is None else max(vmax, bmax)
+    return {"min": vmin, "max": vmax, "nan": nan, "inf": inf,
+            "elements": numel}
+
+
+def probe_av_latent(tensors):
+    """对每个 tensor 分块探针；任一 NaN/Inf 整体标记 ok=False。"""
+    out = {}
+    total_nan = 0
+    total_inf = 0
+    for key in sorted(tensors):
+        info = probe_tensor_chunked(tensors[key])
+        out[key] = info
+        total_nan += info["nan"]
+        total_inf += info["inf"]
+    out["ok"] = not (total_nan or total_inf)
+    return out
+
+
+# ------------------------------------------------------------- 时间轴（04 §6）
+
+# 与 comfy_extras/nodes_minimax_h3.py 的常量一致（纯数值，不 import 该模块）
+H3_FPS = 24
+AUDIO_LATENT_FPS = 40
+FRAME_GRID = 17
+FRAME_GRID_OFFSET = 5
+
+
+def align_frame_count(length):
+    """把请求帧数 snap 到 17k+5 网格（与 H3 节点的 align_frame_count 一致）。"""
+    n = max(5, int(length))
+    while n % FRAME_GRID != FRAME_GRID_OFFSET:
+        n += 1
+    return n
+
+
+def video_latent_t(frame_count):
+    return 2 if frame_count <= 5 else ((frame_count - 5) // FRAME_GRID) * 5 + 2
+
+
+def plan_temporal(length):
+    """返回 ``{requested_length, frame_count, latent_t, audio_t, seconds}``。
+
+    ``requested_length`` 是用户要的帧数；``frame_count`` 是网格对齐后的真实
+    解码帧数；``latent_t`` 只是 latent 的时间维，**不能**用来自行推断片长。
+    """
+    requested = int(length)
+    if requested < 1:
+        raise ArtifactError("requested_length 必须 ≥1", code="INVALID_REQUEST",
+                            http_status=400)
+    frame_count = align_frame_count(requested)
+    return {
+        "requested_length": requested,
+        "frame_count": frame_count,
+        "latent_t": video_latent_t(frame_count),
+        "audio_t": int(round((frame_count / float(H3_FPS)) * AUDIO_LATENT_FPS)),
+        "seconds": frame_count / float(H3_FPS),
+    }
+
+
+def decode_trim(decoded_frames, metadata):
+    """按 artifact metadata 计算视频裁帧长度。
+
+    ``decoded_frames`` 是 VAE 解码后的实际帧数（int 或带 shape[0] 的张量）。
+    规则：以 metadata.requested_length 为准；解码结果不足即报错（不静默变短），
+    多于 requested_length 时裁掉尾部 padding。绝不从 latent_t 猜片长。
+    """
+    if not isinstance(metadata, dict):
+        raise ArtifactError("metadata 必须是 dict", code="INVALID_ARTIFACT",
+                            http_status=422)
+    if "requested_length" not in metadata:
+        raise ArtifactError("latent metadata 缺少 requested_length，无法确定片长",
+                            code="INVALID_ARTIFACT", http_status=422)
+    try:
+        requested = int(metadata["requested_length"])
+    except (TypeError, ValueError):
+        raise ArtifactError("metadata.requested_length 非法",
+                            code="INVALID_ARTIFACT", http_status=422)
+    if requested < 1:
+        raise ArtifactError("metadata.requested_length 必须 ≥1",
+                            code="INVALID_ARTIFACT", http_status=422)
+    total = int(decoded_frames.shape[0]) if hasattr(decoded_frames, "shape") \
+        else int(decoded_frames)
+    frame_count = align_frame_count(requested)
+    if total < requested:
+        raise ArtifactError(
+            "解码输出只有 %d 帧，少于 requested_length=%d（不做静默截断）"
+            % (total, requested), code="EXECUTION_FAILED", http_status=500)
+    return {"requested_length": requested, "frame_count": frame_count,
+            "decoded_frames": total, "keep": requested,
+            "trim_tail": total - requested}
+
