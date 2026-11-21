@@ -386,12 +386,16 @@ class H3ComfyAdapter(ModelAdapter):
                 details={"unit": unit_id, "unconsumed": uncovered})
         for holder_path, kind in holders:
             holder = self._resolve(model, holder_path)
-            # holder 消费的 keys：holder_path 点转 checkpoint 前缀
-            prefix = holder_path.replace(".", ".") + "."
-            # 顶层模块名与 checkpoint 顶层名一致（blocks.N / token_refiner /
-            # condition_proj / video_patch_proj / ...），rope 除外：
-            sub = {k: v for k, v in key_tensors.items() if k == holder_path
-                   or k.startswith(prefix)}
+            if kind.startswith("buffer:"):
+                name = kind.split(":", 1)[1]
+                sub = {k: v for k, v in key_tensors.items() if k == name}
+            else:
+                # holder 消费的 keys：holder_path 点转 checkpoint 前缀
+                prefix = holder_path.replace(".", ".") + "."
+                # 顶层模块名与 checkpoint 顶层名一致（blocks.N / token_refiner /
+                # condition_proj / video_patch_proj / ...），rope 除外：
+                sub = {k: v for k, v in key_tensors.items() if k == holder_path
+                       or k.startswith(prefix)}
             if kind == "module" and holder_path in ("token_refiner",):
                 # token_refiner holder 消费 token_refiner.* 全体（refiner unit 含
                 # condition_proj 时由另一 holder 条目处理，此处只取本前缀）
@@ -412,9 +416,13 @@ class H3ComfyAdapter(ModelAdapter):
                 for holder_path, kind in stale:
                     holder = self._resolve(model, holder_path)
                     n = self._sync_factory_kwargs(holder, device)
-                    prefix = holder_path + "."
-                    sub = {k: v for k, v in key_tensors.items()
-                           if k == holder_path or k.startswith(prefix)}
+                    if kind.startswith("buffer:"):
+                        name = kind.split(":", 1)[1]
+                        sub = {k: v for k, v in key_tensors.items() if k == name}
+                    else:
+                        prefix = holder_path + "."
+                        sub = {k: v for k, v in key_tensors.items()
+                               if k == holder_path or k.startswith(prefix)}
                     if kind == "module" and holder_path in ("token_refiner",):
                         sub = {k: v for k, v in key_tensors.items()
                                if k.startswith("token_refiner.")}
