@@ -87,7 +87,7 @@ def main():
                 assert units["dit.blocks.0"]["state"] == "ram", units["dit.blocks.0"]
                 assert model["counts"]["ram"] == 1, model["counts"]
                 assert model["state"] == "partial", model
-                assert model["bytes"]["resident_cpu"] >= 380 * 1024 ** 2, \
+                assert model["bytes"]["resident_cpu"] >= 380 * 1000 ** 2, \
                     model["bytes"]
                 action(client, "dit", "ram2vram",
                        {"mode": "units", "units": ["dit.blocks.0"]}, 240,
