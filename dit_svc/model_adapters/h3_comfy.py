@@ -231,7 +231,7 @@ class H3ComfyAdapter(ModelAdapter):
 
         真实 MixedPrecision Linear 构造期 device 固定为 meta（骨架阶段），
         而 _load_quantized_module 按此重建权重；to_empty 不碰该元数据，
-        不显式同步则量化权重回绑到 meta（远端 probe 20 实测 4 个 meta）。
+        陈旧值有错设备重建风险，同步为 hygiene（远端 20 诊断已证绑定本身落 cpu，此处只防漂移，不做归因）。
         只动 holder 子树，不碰未选 unit。返回同步个数（审计用）。
         """
         n = 0

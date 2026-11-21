@@ -634,22 +634,100 @@ def _torch() -> Any:
     return torch
 
 
-def _storage_id_of(t: Any) -> Optional[Tuple[str, int, int]]:
-    """(device_type, data_ptr, storage_nbytes)。meta 张量返回 None。"""
+def _device_of(t: Any) -> str:
     try:
-        dev = str(t.device)
+        return str(t.device)
     except Exception:
-        return None
-    if dev == "meta":
+        return "unknown"
+
+
+def _storage_id_of(t: Any) -> Optional[Tuple[str, int, int]]:
+    """(device_type, data_ptr, storage_nbytes)。meta/不可查张量返回 None。"""
+    if _device_of(t) == "meta":
         return None
     try:
         st = t.untyped_storage()
     except Exception:
         return None
     try:
-        return (dev.split(":")[0], int(st.data_ptr()), int(st.nbytes()))
+        return (_device_of(t).split(":")[0], int(st.data_ptr()),
+                int(st.nbytes()))
     except Exception:
         return None
+
+
+#: walk 哨兵：非 meta 但自身 storage 取不到、内部也无可用 storage 的张量。
+#: inventory 记入 uninspectable（绝不谎报 meta），audit fail-closed。
+_UNINSPECTABLE: Any = object()
+
+
+def _inner_tensor_names(t: Any) -> List[str]:
+    """tensor-subclass 内部张量名：优先 __tensor_flatten__ 协议。"""
+    flat = getattr(t, "__tensor_flatten__", None)
+    if callable(flat):
+        try:
+            inner, _meta = flat()
+            names = [n for n in inner if isinstance(n, str)]
+            if names:
+                return names
+        except Exception:
+            pass
+    return []
+
+
+def _is_walkable_value(v: Any) -> bool:
+    """subclass 内部属性扫描白名单：只进可能是张量容器的值。"""
+    if v is None or isinstance(v, (bool, int, float, str, bytes)):
+        return False
+    if isinstance(v, type) or callable(v):
+        return False
+    if type(v).__module__ == "torch" and type(v).__name__ in (
+            "dtype", "device", "layout", "memory_format"):
+        return False
+    if isinstance(v, type(__import__("sys"))):
+        return False
+    return True
+
+
+def _yield_has_storage(item: Any) -> bool:
+    """walk 产出物是否有物理 storage 或为真 meta（透明 wrapper 判定用）。
+
+    嵌套 _UNINSPECTABLE 不算有（fail-closed 向上传）。
+    """
+    if item is _UNINSPECTABLE:
+        return False
+    if _storage_id_of(item) is not None:
+        return True
+    return _device_of(item) == "meta"
+
+
+def _walk_subclass_inners(root: Any, path: str, seen: set,
+                           depth: int):
+    """展开 Tensor subclass 内部张量（__tensor_flatten__ 优先，属性扫描兜底）。
+
+    只 walk 可能是张量容器的值（_is_walkable_value），layout/dtype 等跳过。
+    """
+    names = _inner_tensor_names(root)
+    if names:
+        for n in names:
+            try:
+                v = getattr(root, n, None)
+            except Exception:
+                continue
+            if v is None or id(v) in seen:
+                continue
+            yield from _walk_tensors(v, seen, depth + 1,
+                                     "%s.%s" % (path, n))
+        return
+    d = getattr(root, "__dict__", None)
+    if not isinstance(d, dict):
+        return
+    for k, v in d.items():
+        if k.startswith("__") or not _is_walkable_value(v):
+            continue
+        if id(v) in seen:
+            continue
+        yield from _walk_tensors(v, seen, depth + 1, "%s.%s" % (path, k))
 
 
 def _walk_tensors(root: Any, _seen: Optional[set] = None,
@@ -679,6 +757,23 @@ def _walk_tensors(root: Any, _seen: Optional[set] = None,
         except Exception:
             is_tensor = False
     if is_tensor:
+        tensor_cls = getattr(torch_mod, "Tensor", None) if torch_mod else None
+        if (tensor_cls is not None and type(root) is not tensor_cls
+                and _storage_id_of(root) is None
+                and _device_of(root) != "meta"):
+            # Tensor subclass 且自身 storage 取不到（真实 QuantizedTensor
+            # wrapper：untyped_storage 直接抛）：先展开内部，外层 wrapper
+            # 自身无 storage，不得计 meta；内部无可用 storage 才报
+            # uninspectable（fail-closed）。
+            inners: List[Tuple[str, Any]] = []
+            for _ip, _it in _walk_subclass_inners(root, _path, _seen,
+                                                  _depth):
+                inners.append((_ip, _it))
+                yield (_ip, _it)
+            if any(_yield_has_storage(_it) for _ip, _it in inners):
+                return  # 透明 wrapper：内部 storage 已入账
+            yield (_path, _UNINSPECTABLE)
+            return
         yield (_path, root)
         # 视图链：base tensor 可能挂在 _base_attr 上？标准 Tensor 不需要；
         # 仍尝试展开 _base 以防封装类型。
@@ -728,6 +823,9 @@ class StorageInventory:
     total_cuda: int = 0
     meta_tensors: int = 0
     num_tensors_seen: int = 0
+    # 非 meta 但自身 storage 取不到、内部也无可用 storage 的张量路径。
+    # 绝不计入 meta；audit 见此必须 fail-closed。
+    uninspectable: List[str] = field(default_factory=list)
 
     @property
     def num_storages(self) -> int:
@@ -743,6 +841,7 @@ class StorageInventory:
             "shared": sum(1 for e in self.entries if len(e["owners"]) > 1),
             "storages": [e["storage_id"] for e in self.entries],
             "entries": self.entries,
+            "uninspectable": list(self.uninspectable),
         }
 
 
@@ -757,6 +856,10 @@ def storage_inventory(root: Any, owner: str = "") -> StorageInventory:
     seen_storage: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for path, t in _walk_tensors(root):
         inv.num_tensors_seen += 1
+        label = "%s/%s" % (owner or "root", path)
+        if t is _UNINSPECTABLE:
+            inv.uninspectable.append(label)
+            continue
         sid = _storage_id_of(t)
         if sid is None:
             inv.meta_tensors += 1
@@ -764,7 +867,6 @@ def storage_inventory(root: Any, owner: str = "") -> StorageInventory:
         dev, ptr, nbytes = sid
         key = (dev, ptr)
         # 所有者路径：owner + 张量在对象图中的属性路径。
-        label = "%s/%s" % (owner or "root", path)
         entry = seen_storage.get(key)
         if entry is None:
             entry = {"storage_id": "%s:%d:%d" % (dev, ptr, nbytes),
@@ -1209,8 +1311,12 @@ def audit_unit(catalog: UnitCatalog, unit_id: str,
     """
     if unit_id in catalog.noncompute_keys:
         resident = inventory.total_cpu + inventory.total_cuda
-        verdict = "ok" if (not expect_loaded and resident == 0
-                           and not bound_keys) else "NONCOMPUTE_LOADED"
+        uninspect_nc = list(inventory.uninspectable)
+        if uninspect_nc:
+            verdict = "UNINSPECTABLE"
+        else:
+            verdict = "ok" if (not expect_loaded and resident == 0
+                               and not bound_keys) else "NONCOMPUTE_LOADED"
         report = {
             "unit": unit_id,
             "noncompute": True,
@@ -1226,6 +1332,7 @@ def audit_unit(catalog: UnitCatalog, unit_id: str,
             "resident_bytes_cuda": inventory.total_cuda,
             "num_storages": inventory.num_storages,
             "meta_tensors": inventory.meta_tensors,
+            "uninspectable": uninspect_nc,
             "verdict": verdict,
         }
         json.dumps(report)
@@ -1239,7 +1346,10 @@ def audit_unit(catalog: UnitCatalog, unit_id: str,
     unexpected = sorted(got - want - set(waived))
     expected_bytes = catalog.units[unit_id].expected_bytes
     resident = inventory.total_cpu + inventory.total_cuda
-    if expect_loaded:
+    uninspect = list(inventory.uninspectable)
+    if uninspect:
+        verdict = "UNINSPECTABLE"
+    elif expect_loaded:
         if missing or unexpected:
             verdict = "MISSING_OR_UNEXPECTED"
         elif expected_bytes > 0 and resident == 0:
@@ -1263,6 +1373,7 @@ def audit_unit(catalog: UnitCatalog, unit_id: str,
         "resident_bytes_cuda": inventory.total_cuda,
         "num_storages": inventory.num_storages,
         "meta_tensors": inventory.meta_tensors,
+        "uninspectable": uninspect,
         "verdict": verdict,
     }
     json.dumps(report)

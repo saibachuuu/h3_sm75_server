@@ -371,6 +371,21 @@ def t_signature_covers_shape_dtype():
     return "signature pins dtype+shape"
 
 
+def t_audit_uninspectable_fail_closed():
+    h = fake_header()
+    reg = reg_with({k: v for k, v in h.items() if k != "__weird_tmp"})
+    uid = [u for u in reg.catalogs["dit"].unit_ids()
+           if u.startswith("dit.blocks")][0]
+    bound = list(reg.catalogs["dit"].units[uid].checkpoint_keys)
+    inv = W.StorageInventory()
+    inv.uninspectable.append("u/root.param.x")
+    for want_loaded in (True, False):
+        audit = W.audit_unit(reg.catalogs["dit"], uid, bound if want_loaded
+                             else [], inv, expect_loaded=want_loaded)
+        assert audit["verdict"] == "UNINSPECTABLE", audit
+    return "uninspectable fails closed both ways"
+
+
 def t_audit_rejects_meta_missing():
     h = fake_header()
     reg = reg_with({k: v for k, v in h.items() if k != "__weird_tmp"})
@@ -417,6 +432,7 @@ check("snapshot revision/counts/bytes", t_snapshot_revision_counts_bytes)
 check("header rejects bad inputs", t_header_rejects_bad_inputs)
 check("signature pins dtype+shape", t_signature_covers_shape_dtype)
 check("audit refuses meta-missing", t_audit_rejects_meta_missing)
+check("audit uninspectable fail-closed", t_audit_uninspectable_fail_closed)
 check("noncompute catalog", t_noncompute_catalog)
 
 print()

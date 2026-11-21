@@ -84,7 +84,104 @@ def t_meta_has_no_storage():
     inv = W.storage_inventory({"m": t}, owner="u")
     s = inv.to_summary()
     assert s["total_cpu"] == 0 and s["meta_tensors"] == 1, s
+    assert s["uninspectable"] == [], s
     return "meta counted, no bytes"
+
+
+class _RealQuantWrapper(torch.Tensor):
+    """真实 Tensor-subclass 量化 fixture（对标 comfy-kitchen QuantizedTensor）。
+
+    wrapper 自身无 storage（untyped_storage 直接抛）；
+    物理账只能从内部 _qdata（I8）+ _scale（F32 per-row）来。
+    逻辑 dtype/shape（F32/[N]）不得用于字节账。
+    """
+
+    @staticmethod
+    def __new__(cls, qdata, scale):
+        return torch.Tensor._make_wrapper_subclass(
+            cls, qdata.shape, dtype=torch.float32, requires_grad=False)
+
+    def __init__(self, qdata, scale):
+        self._qdata = qdata
+        self._scale = scale
+
+    def __tensor_flatten__(self):
+        return (["_qdata", "_scale"], None)
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        raise NotImplementedError("fixture dispatch: %s" % func)
+
+    def __repr__(self):
+        return "_RealQuantWrapper()"
+
+
+def t_real_subclass_wrapper_not_meta():
+    # 远端 probe 20 真实形态：wrapper device cpu、非 meta，但自身无 storage。
+    # 旧 walk 误计 meta_tensors=1 且漏内部 385MB 量级账；新 walk 必须展开。
+    qdata = torch.randint(0, 100, (32,), dtype=torch.int8)  # 32 B
+    scale = torch.ones(4, dtype=torch.float32)             # 16 B
+    w = _RealQuantWrapper(qdata, scale)
+    assert w.device.type == "cpu" and not w.is_meta
+    assert w.dtype == torch.float32  # 逻辑 dtype：8*4=32B，不得用于账
+    inv = W.storage_inventory({"w": w}, owner="u")
+    s = inv.to_summary()
+    assert s["meta_tensors"] == 0, s  # wrapper 自身绝不计 meta
+    assert s["uninspectable"] == [], s
+    assert s["total_cpu"] == 32 + 16, s  # 物理账，非逻辑 32B
+    assert s["num_storages"] == 2, s
+    kinds = sorted(o for e in s["entries"] for o in e["owners"])
+    assert any("_qdata" in k for k in kinds), kinds
+    assert any("_scale" in k for k in kinds), kinds
+    return "wrapper transparent: %d B, meta=0" % s["total_cpu"]
+
+
+def t_wrapper_view_dedup_and_mixed():
+    qdata = torch.randint(0, 100, (32,), dtype=torch.int8)
+    scale = torch.ones(4, dtype=torch.float32)
+    w = _RealQuantWrapper(qdata, scale)
+    v = qdata.view(4, 8)  # 同 storage 视图
+    inv = W.storage_inventory({"w": w, "v": v}, owner="u")
+    s = inv.to_summary()
+    assert s["total_cpu"] == 32 + 16, s  # qdata 只计一次
+    assert s["num_storages"] == 2, s
+    # mixed：meta qdata + CPU scale -> scale 实账 + meta 计 1，wrapper 仍透明
+    mq = torch.empty(32, dtype=torch.int8, device="meta")
+    w2 = _RealQuantWrapper(mq, torch.ones(4))
+    inv2 = W.storage_inventory({"w": w2}, owner="u")
+    s2 = inv2.to_summary()
+    assert s2["total_cpu"] == 16, s2
+    assert s2["meta_tensors"] == 1, s2  # 真 meta 的底层 qdata
+    assert s2["uninspectable"] == [], s2
+    # purge  analog：全 meta 内部 -> 零账
+    w3 = _RealQuantWrapper(torch.empty(32, dtype=torch.int8, device="meta"),
+                           torch.empty(4, device="meta"))
+    s3 = W.storage_inventory({"w": w3}, owner="u").to_summary()
+    assert s3["total_cpu"] == 0 and s3["meta_tensors"] == 2, s3
+    assert s3["uninspectable"] == [], s3
+    return "dedup+mixed+purge ok"
+
+
+def t_uninspectable_fail_closed():
+    class Opaque(torch.Tensor):
+        @staticmethod
+        def __new__(cls):
+            return torch.Tensor._make_wrapper_subclass(
+                cls, (4,), dtype=torch.float32, requires_grad=False)
+
+        def __init__(self):
+            pass  # 无内部张量、无 storage
+
+        @classmethod
+        def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+            raise NotImplementedError("opaque")
+
+    o = Opaque()
+    inv = W.storage_inventory({"o": o}, owner="u")
+    s = inv.to_summary()
+    assert s["meta_tensors"] == 0, s  # 非 meta 不得谎报 meta
+    assert len(s["uninspectable"]) == 1, s
+    return "opaque -> uninspectable, meta=0"
 
 
 print("== _selftest_storage_inventory ==")
@@ -93,6 +190,9 @@ check("module params+buffers walked", t_module_buffers_and_params)
 check("quant internals expanded", t_quant_internals_expanded)
 check("dict projection alias dedup", t_dict_projection_and_alias_shared_group)
 check("meta tensor has no storage", t_meta_has_no_storage)
+check("real subclass wrapper transparent", t_real_subclass_wrapper_not_meta)
+check("wrapper dedup + mixed + purge", t_wrapper_view_dedup_and_mixed)
+check("uninspectable fail-closed", t_uninspectable_fail_closed)
 
 print()
 if fails:

@@ -166,15 +166,17 @@ C:\Users\88888888\AppData\Local\Temp\opencode\explicit_api_env_20261121\Scripts\
   静态核实：快照内无顶层 torch.cuda 调用、无 sage/flash 引用、
   xformers 仅 import 时加载（不执行 attention：无 forward、无 sampler）。
 - 远端实测回填（主代理亲跑）：00 版本全对；10 真实通过——56 compute units
-  + 2 noncompute、268 meta tensors、CPU/CUDA storage 均 0；20 block0 真实
-  失败 audit META_REMAINS（bound 18/18 但 CPU 仅 1763840B + meta 4，
-  应 ~387MB）：根因为 MixedPrecision Linear 构造期 factory_kwargs device
-  固定 meta，to_empty 不碰它，_load_quantized_module 按其重建致 4 量化权重
-  回落 meta。已修：materialize 递归同步 holder 子树 fk 到目标设备并计数
-  上报，绑定后扫 meta 残留→重同步+定向重绑→仍残留则硬失败（META_REMAINS
-  审计保留不放行）；purge 把 fk 置回 meta（与空壳一致），move 同步 fk；
-  stub 增 StubQuantLinear（hook 按 fk 重建）+ fixture 测同步数/purge 后
-  fk/meta/reload 回 cpu。等主代理重跑 20。
+  + 2 noncompute、268 meta tensors、CPU/CUDA storage 均 0；20 block0 初判 META_REMAINS 被远端诊断纠正：4 个真实 QuantizedTensor 全部 weight.device=cpu、
+  is_meta=false、_qdata.device=cpu（绑定本身正确，fk 同步仅为 hygiene 保留）。
+  真正根因是 weights._walk_tensors：Qt 继承 torch.Tensor，旧 walk 在 is_tensor 分支 yield wrapper 就 return，永不展开 _qdata，wrapper 又不能直接
+  untyped_storage——误计 meta_tensors=4 并漏 385MB 账（FakeQuantTensor 非 Tensor 子类，掩盖了此 bug）。已修：Tensor subclass 先展开内部（__tensor_flatten__
+  优先 + 属性扫描兜底），外层 wrapper 自身无 storage 不计 meta；真 meta 底层
+  才计 meta；非 meta 但取不到 storage 且内部无可用 storage 记独立 uninspectable
+  （绝不谎报 meta），audit 双向 fail-closed（UNINSPECTABLE）。fixture 用真实
+  __torch_dispatch__ subclass（_make_wrapper_subclass+_qdata+scale）测 qdata/aux
+  全入账、逻辑 dtype 字节不计、视图去重、meta qdata+CPU scale 混合账、purge 零账。
+  诊断源码在远端 approvedTemp/explicit_diag_quant.py（结果 dict 已明列 CPU）。
+  新的 CPU21 搬运未测——先修 Inventory 才能准确判断失败与泄漏，等主代理重跑。
 - `_selftest_real_header_catalog`：按远端 header 报告复刻的布局保真合成头
   （双量化伴生键/adaln/rope/refiner/patch/final），catalog 全覆盖、
   单位划分、字节账、选择器、waived 精确忽略。ALL OK。
