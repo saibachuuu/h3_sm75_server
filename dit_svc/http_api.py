@@ -240,6 +240,29 @@ def make_handler(runtime, queue, ctx):
                 self._json({"ok": False, "error": error.to_dict()},
                            error.http_status)
 
+        def _post_legacy_te(self, path):
+            """Preserve synchronous legacy response, but execute on the single worker."""
+            payload = self._read_json_body()
+            if not isinstance(payload, dict):
+                self._error(OperationError("INVALID_REQUEST", "请求体必须是 JSON 对象",
+                                           400, False))
+                return
+            callback = (runtime.run_te_legacy if path.endswith("/step")
+                        else runtime.run_te_probe)
+            try:
+                operation = queue.submit_operation(
+                    "legacy.te.%s" % path.rsplit("/", 1)[-1], payload,
+                    lambda op: callback(payload, op))
+                finished = self._wait_operation(operation, 1800.0)
+                if finished is None:
+                    self._json(operation.receipt(), 202)
+                elif finished.status == "done":
+                    self._json(finished.result, 200)
+                else:
+                    self._error(finished.error)
+            except Exception as exc:
+                self._error(exc)
+
         def _post_encode(self):
             """POST /api/infer/encode → 202；显式要求 te 已在显存。"""
             payload = self._read_json_body()
@@ -481,106 +504,8 @@ def make_handler(runtime, queue, ctx):
                 # 返回 TE 原子化状态机快照（TE 所在 device / VRAM / 当前步骤）
                 self._json({"ok": True, "te_state": runtime.te_state()})
 
-            elif path == "/api/te/step":
-                # 原子化 TE 步骤：
-                # {action: "vae_swap_out"|"te_load_vram"|"te_offload_ram"|
-                #           "preprocess"|"te_encode"|"vae_swap_back"|"reset",
-                #  prompt?, image_b64s?, mode?, width?, height?, ref_image_size?,
-                #  save_cond?: bool}
-                payload = self._read_json_body()
-                if payload is None:
-                    self._json({"ok": False, "error": "请求体不是合法 JSON 或过大"}, 400)
-                    return
-                try:
-                    import base64 as _b64
-                    snap = queue.snapshot(limit=1)
-                    counts = snap.get("counts") or {}
-                    if counts.get("running") or counts.get("queued"):
-                        self._json({"ok": False,
-                                    "error": "队列非空（生成任务在跑或在排队）。TE 交换要独占显存，等它结束再试。"},
-                                   409)
-                        return
-
-                    action = payload.get("action")
-                    if not isinstance(action, str):
-                        self._json({"ok": False, "error": "action 须为字符串"}, 400)
-                        return
-
-                    step_payload = {}
-                    if action in ("preprocess", "te_encode"):
-                        raw = payload.get("image_b64s") or []
-                        imgs = []
-                        for s in raw:
-                            if not isinstance(s, str):
-                                continue
-                            if s.startswith("data:"):
-                                s = s.split(",", 1)[1]
-                            imgs.append(_b64.b64decode(s))
-                        step_payload["image_bytes_list"] = imgs
-                        step_payload["mode"] = payload.get("mode", "ref2va")
-                        step_payload["width"] = int(payload.get("width", 640))
-                        step_payload["height"] = int(payload.get("height", 960))
-                        step_payload["ref_image_size"] = payload.get("ref_image_size", "match")
-                    if action == "te_encode":
-                        step_payload["prompt"] = payload.get("prompt", "")
-
-                    result = runtime.te_step(action, step_payload)
-
-                    # te_encode + save_cond 时把 cond 落盘
-                    if action == "te_encode" and payload.get("save_cond"):
-                        import os as _os
-                        from safetensors.torch import save_file
-                        cond_data = result.get("cond")
-                        if cond_data is None:
-                            self._json({"ok": False, "error": "encode 未产生 cond"}, 500)
-                            return
-                        name = "cond_step_%d.safetensors" % int(time.time())
-                        out_dir = getattr(runtime.args, "out_dir", "outputs")
-                        _os.makedirs(out_dir, exist_ok=True)
-                        fp = _os.path.join(out_dir, name)
-                        tosave = {"cond": cond_data["cond"]}
-                        if cond_data.get("minimax_token_tags") is not None:
-                            tosave["minimax_token_tags"] = cond_data["minimax_token_tags"]
-                        save_file(tosave, fp)
-                        result["cond_file"] = name
-                        result["cond_bytes"] = _os.path.getsize(fp)
-
-                    self._json(result, 200)
-                except ValueError as e:
-                    self._json({"ok": False, "error": str(e)}, 400)
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
-
-            elif path == "/api/te/probe":
-                # 只把 TE 权重 RAM->VRAM 再退回，不 encode，专门测试远程 GPU 承受力。
-                # {cycles?: 1-10}
-                payload = self._read_json_body() or {}
-                try:
-                    snap = queue.snapshot(limit=1)
-                    counts = snap.get("counts") or {}
-                    if counts.get("running") or counts.get("queued"):
-                        self._json({"ok": False,
-                                    "error": "队列非空（生成任务在跑或在排队）。TE 交换要独占显存，等它结束再试。"},
-                                   409)
-                        return
-                    cycles = int(payload.get("cycles", 1))
-                    if not (1 <= cycles <= 10):
-                        raise ValueError("cycles 须在 1–10 之间")
-                    results = []
-                    for _ in range(cycles):
-                        r1 = runtime.te_load_to_vram()
-                        r2 = runtime.te_offload_to_ram()
-                        results.append({"load": r1, "offload": r2})
-                    self._json({"ok": True, "cycles": cycles, "results": results,
-                                "te_state": runtime.te_state()}, 200)
-                except ValueError as e:
-                    self._json({"ok": False, "error": str(e)}, 400)
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
+            elif path in ("/api/te/step", "/api/te/probe"):
+                self._post_legacy_te(path)
 
             elif path == "/api/encode":
                 # 兼容旧同步语义：同一个 worker 执行，有界等待；超时返回已有 202 回执。

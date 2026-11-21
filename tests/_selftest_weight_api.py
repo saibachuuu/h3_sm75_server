@@ -136,6 +136,31 @@ def main():
 
             status, body = request("POST", "/api/infer/encode", {"prompt": "a cat"})
             assert status == 400, (status, body)
+
+            # Legacy TE operations may not race the worker through HTTP threads.
+            entered, release = threading.Event(), threading.Event()
+            legacy_reply = []
+            def legacy_probe(payload, operation):
+                assert threading.current_thread().name == "h3-worker"
+                entered.set()
+                assert release.wait(5)
+                return {"ok": True, "cycles": payload["cycles"]}
+            runtime.run_te_probe = legacy_probe
+            caller = threading.Thread(target=lambda: legacy_reply.append(request(
+                "POST", "/api/te/probe", {"cycles": 1})))
+            caller.start()
+            try:
+                assert entered.wait(5)
+                status, body = request("POST", "/api/weights/te/disk2ram",
+                                       {"dry_run": True})
+                assert status == 409, (status, body)
+            finally:
+                release.set()
+                caller.join(5)
+            assert legacy_reply == [(200, {"ok": True, "cycles": 1})], legacy_reply
+            runtime.run_te_legacy = lambda payload, op: {"ok": True, "action": "reset"}
+            status, body = request("POST", "/api/te/step", {"action": "reset"})
+            assert status == 200 and body["action"] == "reset", (status, body)
         finally:
             queue.stop(5)
             server.shutdown()

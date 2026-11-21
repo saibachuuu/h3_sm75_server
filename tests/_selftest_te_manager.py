@@ -7,6 +7,7 @@
 * encode 的 resident 前置条件与 artifact 落盘；
 * 真实 torch 模型的 storage 账（物理字节非 numel 估算）。
 """
+import contextlib
 import json
 import os
 import sys
@@ -41,12 +42,22 @@ class FakeStore:
                 "metadata": metadata}
 
 
+class FakeResidence:
+    @contextlib.contextmanager
+    def inference(self, backend, operation=None):
+        yield {"unchanged": True}
+
+    def unregister(self):
+        pass
+
+
 class FakeRuntime:
     def __init__(self, recipes=None):
         self.args = FakeArgs(recipes)
         self.stage = None
         self.artifacts = FakeStore()
         self.device_healthy = True
+        self.te_residence = FakeResidence()
 
     def set_stage(self, name):
         self.stage = name

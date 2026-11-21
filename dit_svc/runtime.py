@@ -18,6 +18,8 @@ import traceback
 
 from dit_svc import veda_attn_star7  # noqa: F401  veda NVML/warmup 工具
 from dit_svc.weight_service import WeightService
+from dit_svc.te_residency import TeResidency
+from dit_svc.operations import OperationError
 
 
 def _all_request():
@@ -79,6 +81,7 @@ class Runtime:
         # 显式权重服务（stdlib 导入安全，启动不读权重）
         self.weights = WeightService(self)
         self.te = self.weights.backends["te"]
+        self.te_residence = TeResidency(self)
 
     @property
     def ready(self):
@@ -831,42 +834,8 @@ class Runtime:
         return imgs, ref_items, qwen_sizes
 
     def te_encode_tokens(self, prompt, ref_items, mode="ref2va"):
-        """TE 已在 GPU 上时执行 tokenize + encode。返回 (cond_dict, stats)。"""
-        import torch
-        pc = self._te_model()
-        if pc is None:
-            raise RuntimeError("TE 未加载")
-        prompt = (prompt or "").strip()
-        if not prompt:
-            raise ValueError("prompt 不能为空")
-
-        t0 = time.perf_counter()
-        if mode == "fl2va":
-            tokens = pc.tokenize(prompt, images=[ref_items[0]["data"]])
-        else:
-            tokens = pc.tokenize(prompt, minimax_ref_items=ref_items)
-        tokenize_s = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        cond_list = pc.encode_from_tokens_scheduled(tokens)
-        encode_s = time.perf_counter() - t0
-
-        tensor, values = cond_list[0][0], cond_list[0][1]
-        tags = values.get("minimax_token_tags")
-        out = {
-            "cond": tensor.detach().float().cpu().contiguous(),
-            "minimax_token_tags": (tags.detach().cpu().contiguous() if tags is not None else None),
-        }
-        stats = {
-            "n_tokens": int(tensor.shape[1]),
-            "cond_shape": list(tensor.shape),
-            "tokenize_s": round(tokenize_s, 3),
-            "encode_s": round(encode_s, 3),
-        }
-        print("[te] encode %d tokens | mode=%s | tokenize=%.2fs encode=%.2fs" %
-              (stats["n_tokens"], mode, tokenize_s, encode_s), flush=True)
-        self._vram_ledger("TE编码后", torch)
-        return out, stats
+        """Legacy 调试入口也复用受保护的 TE 推理，不再维护第二份实现。"""
+        return self.te._encode_tokens(prompt, ref_items, mode)
 
     def te_step(self, action, payload=None):
         """原子化 TE 步骤状态机。返回 {"ok", "action", "result", "state"}。
@@ -984,10 +953,48 @@ class Runtime:
 
         raise ValueError("未知 action: %s" % action)
 
+    def run_te_legacy(self, payload, operation=None):
+        """Legacy TE 调试也在唯一 worker 中运行；回执不包含 Tensor。"""
+        import base64
+        action = payload.get("action")
+        if not isinstance(action, str):
+            raise OperationError("INVALID_REQUEST", "action 须为字符串", 400, False)
+        spec = dict(payload)
+        spec["image_bytes_list"] = [base64.b64decode(value.split(",", 1)[-1])
+                                    for value in payload.get("image_b64s", [])]
+        result = self.te_step(action, spec)
+        cond = result.pop("cond", None)
+        result["state"] = self._te_public_state()
+        if cond is not None and payload.get("save_cond"):
+            request = {"mode": result["result"]["mode"],
+                       "width": int(payload.get("width", 640)),
+                       "height": int(payload.get("height", 960)),
+                       "ref_image_size": payload.get("ref_image_size", "match"),
+                       "image_b64s": payload.get("image_b64s", [])}
+            artifact = self.te._save_cond(cond, request, result["result"])
+            result["cond_file"] = artifact["filename"]
+            result["cond_bytes"] = artifact["bytes"]
+        return result
+
+    def run_te_probe(self, payload, operation=None):
+        cycles = payload.get("cycles", 1)
+        if type(cycles) is not int or not 1 <= cycles <= 10:
+            raise OperationError("INVALID_REQUEST", "cycles 须在 1–10 之间", 400, False)
+        results = []
+        for _ in range(cycles):
+            results.append({"load": self.te_load_to_vram(),
+                            "offload": self.te_offload_to_ram()})
+        return {"ok": True, "cycles": cycles, "results": results,
+                "te_state": self.te_state()}
+
+    def _te_public_state(self):
+        return {key: value for key, value in self._te_step_state.items()
+                if key not in ("preprocessed", "last_cond")}
+
     def te_state(self):
         """返回当前 TE 状态机快照（含 TE 模型当前 device、VRAM）。"""
         import torch
-        state = dict(self._te_step_state)
+        state = self._te_public_state()
         state["weights"] = self.te.state()
         pc = self._te_model()
         if pc is not None:

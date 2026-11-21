@@ -130,7 +130,7 @@ class TeBackend(GroupBackend):
     def move_to(self, device):
         if self.obj is None:
             raise RuntimeError("TE 未加载")
-        self._clip_model().to(device)
+        self.runtime.te_residence.move(self, device)
 
     def drop_caches(self):
         if self._projected and self.obj is not None:
@@ -139,6 +139,7 @@ class TeBackend(GroupBackend):
                 cache.clear()
 
     def release(self):
+        self.runtime.te_residence.unregister()
         refs = []
         model = self._clip_model()
         if model is not None:
@@ -185,7 +186,7 @@ class TeBackend(GroupBackend):
         print("[te] load_clip: %s" % os.path.basename(path), flush=True)
         return comfy.sd.load_clip(
             ckpt_paths=[path], embedding_directory=[],
-            clip_type=comfy.sd.CLIPType.MINIMAX,
+            clip_type=comfy.sd.CLIPType.MINIMAX, disable_dynamic=True,
             model_options={
                 "initial_device": torch.device("cpu"),
                 "load_device": torch.device("cuda:0"),
@@ -231,7 +232,7 @@ class TeBackend(GroupBackend):
                 "initial_device": torch.device("cpu"),
                 "load_device": torch.device("cuda:0"),
                 "offload_device": torch.device("cpu"),
-            }, embedding_directory=[])
+            }, embedding_directory=[], disable_dynamic=True)
         state.clear()
         return clip
 
@@ -307,7 +308,9 @@ class TeBackend(GroupBackend):
             before = self._cuda_bytes(torch)
             try:
                 out, stats = self._encode_tokens(
-                    request["prompt"], ref_items, request["mode"])
+                    request["prompt"], ref_items, request["mode"], operation)
+            except OperationError:
+                raise
             except Exception as exc:
                 self._mark_error()
                 raise OperationError(
@@ -370,7 +373,24 @@ class TeBackend(GroupBackend):
             ref_items.append({"type": "image", "data": rz})
         return imgs, ref_items, qwen_sizes
 
-    def _encode_tokens(self, prompt, ref_items, mode):
+    def _encode_tokens(self, prompt, ref_items, mode, operation=None):
+        """All encode callers share the resident guard, including legacy endpoints."""
+        import torch
+        with self._lock:
+            self.preflight_encode()
+            try:
+                with self.runtime.te_residence.inference(self, operation) as proof:
+                    with torch.no_grad():
+                        out, stats = self._encode_tokens_impl(prompt, ref_items, mode)
+                stats["residence"] = proof
+                return out, stats
+            except torch.OutOfMemoryError as exc:
+                audit = self._refresh()
+                # No weights moved: insufficient workspace does not corrupt TE.
+                raise OperationError("CUDA_OOM", "TE 推理工作区不足，未自动卸载其它模型",
+                                     409, True, {"actual": audit}) from exc
+
+    def _encode_tokens_impl(self, prompt, ref_items, mode):
         pc = self.obj
         if pc is None:
             raise RuntimeError("TE 未加载")
