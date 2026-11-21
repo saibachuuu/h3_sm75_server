@@ -8,7 +8,8 @@ tokenizer/视觉塔），``te.proj`` 是 ClipProj 投影。Comfy 的 ``load_clip
 * 物理账走 ``weights.storage_inventory``：量化包装展开、按 storage 去重；
 * ClipProj 的 GPU 缓存（``_proj`` 的 ``_gpu`` 副本）计入 te.proj 的 CUDA
   驻留，purge 前必须先 vram2ram 清掉；
-* encode 是 resident 推理：要求 te.model 已在 vram，绝不自动上卡；编码后
+* encode 是 resident 推理：TE 及其独立投影计算副本必须已在 vram，
+  GPU 投影/MLP/sink 在 ram2vram 准备，推理不再创建权重副本；编码后
   重新测量设备，被内部流程改变时 fail-closed。
 
 本模块不 import torch/Comfy：只有真正执行动作时才惰性导入。
@@ -107,6 +108,19 @@ class TeBackend(GroupBackend):
                 "te.proj 不能脱离 te.model 单独装载", 409, False,
                 {"missing": [UNIT_MODEL]})
 
+    def run_action(self, action, request, operation=None):
+        if action == "vram2ram":
+            with self._lock:
+                units = self.unit_ids(request)
+                self._require_group(units)
+                if any(self.registry.unit_record(MODEL_ID, uid)["state"]
+                       in ("mixed", "error") for uid in units):
+                    # Explicit whole-TE recovery only; never repair during inference.
+                    if request.get("dry_run"):
+                        return self._dry_run(action, units)
+                    return self._vram2ram(units, operation)
+        return super().run_action(action, request, operation)
+
     # ---------------------------------------------------------- 构造/搬运
     def construct_cpu(self, operation=None):
         import torch
@@ -134,9 +148,21 @@ class TeBackend(GroupBackend):
 
     def drop_caches(self):
         if self._projected and self.obj is not None:
-            cache = self.obj.__dict__.get("_gpu")
-            if cache:
-                cache.clear()
+            self.obj.clear_projection()
+
+    def _ram2vram(self, units, operation=None):
+        try:
+            return super()._ram2vram(units, operation)
+        except OperationError as exc:
+            # An atomic projection-cache failure can leave a valid GPU TE + CPU
+            # projection. Report that partial state and allow explicit retry/offload.
+            try:
+                self._refresh()
+                exc.details = dict(exc.details or {})
+                exc.details["actual"] = self._safe_state()
+            except Exception:
+                pass  # mixed/uninspectable weights remain error, not ghost resident
+            raise
 
     def release(self):
         self.runtime.te_residence.unregister()
@@ -146,7 +172,12 @@ class TeBackend(GroupBackend):
             refs.append(self._release_ref(model))
         if self.obj is not None:
             refs.append(self._release_ref(self.obj))
+            if self._projected:
+                refs.extend(self._release_ref(tensor) for _, tensor in
+                            W._walk_tensors(self.obj.projection_cpu))
         self.drop_caches()
+        if self._projected and self.obj is not None:
+            self.obj.__dict__.update(_proj_cpu={}, _proj={})
         self.obj = None
         self._clip = None
         self._projected = False
@@ -164,10 +195,12 @@ class TeBackend(GroupBackend):
         out["uninspectable"] += list(inv.uninspectable)
         digest = [entry["storage_id"] for entry in inv.entries]
         if self._projected:
-            proj = self.obj.__dict__.get("_proj") or {}
+            proj = self.obj.projection_cpu
             gpu = self.obj.__dict__.get("_gpu") or {}
             inv_proj = W.storage_inventory(proj, owner=UNIT_PROJ)
-            inv_gpu = W.storage_inventory(gpu, owner=UNIT_PROJ + ".gpu")
+            inv_gpu = W.storage_inventory(
+                {"cache": gpu, "sink_out": self.obj.__dict__["_proj"].get("sink_out")},
+                owner=UNIT_PROJ + ".gpu")
             out["units"][UNIT_PROJ] = {
                 "device": "cuda:0" if inv_gpu.total_cuda > 0 else "cpu",
                 "cpu": inv_proj.total_cpu, "cuda": inv_gpu.total_cuda}
@@ -245,12 +278,12 @@ class TeBackend(GroupBackend):
             raise FileNotFoundError("custom_nodes/clipproj 缺失（ClipProj 未安装）")
         from clipproj.clipproj_projection import register_folder
         import folder_paths
-        from clipproj.clipproj_nodes import ProjectedCLIP
+        from dit_svc.clipproj_resident import wrap_resident_projected
 
         register_folder()
         name = self._projection_name(folder_paths)
         print("[te] ClipProj 投影: %s" % name, flush=True)
-        return ProjectedCLIP(clip, name)
+        return wrap_resident_projected(clip, name)
 
     def _projection_name(self, folder_paths):
         value = self.config["proj"]
@@ -283,14 +316,15 @@ class TeBackend(GroupBackend):
 
     # ---------------------------------------------------------- encode
     def preflight_encode(self, request=None):
-        """要求 te.model 已在 vram；缺资源给有序建议，绝不自动搬。"""
+        """要求 TE 及其已配置投影都在 vram；缺资源给有序建议，绝不自动搬。"""
         self._require_configured()
         record = self.registry.unit_record(MODEL_ID, UNIT_MODEL)
-        if record["state"] != "vram":
+        missing = [name for name in self.catalog.unit_ids()
+                   if self.registry.unit_record(MODEL_ID, name)["state"] != "vram"]
+        if missing:
             raise OperationError(
-                "MISSING_UNITS", "encode 需要 te 已在显存（当前 %s）"
-                % record["state"], 409, False,
-                {"missing": [MODEL_ID], "state": record["state"],
+                "MISSING_UNITS", "encode 所需 TE/投影层未全部上卡", 409, False,
+                {"missing": missing, "state": record["state"],
                  "suggested": suggestions(MODEL_ID, record["state"])})
         if not self.runtime.device_healthy:
             raise OperationError("DEVICE_UNHEALTHY", "CUDA 设备不可用", 503, False)
@@ -403,8 +437,13 @@ class TeBackend(GroupBackend):
         else:
             tokens = pc.tokenize(prompt, minimax_ref_items=ref_items)
         tokenize_s = time.perf_counter() - t0
+        import torch
+        if torch.cuda.is_initialized():
+            torch.cuda.synchronize(self.obj.patcher.load_device)
         t0 = time.perf_counter()
         cond_list = pc.encode_from_tokens_scheduled(tokens)
+        if torch.cuda.is_initialized():
+            torch.cuda.synchronize(self.obj.patcher.load_device)
         encode_s = time.perf_counter() - t0
         tensor, values = cond_list[0][0], cond_list[0][1]
         tags = values.get("minimax_token_tags")

@@ -18,8 +18,27 @@
   响应；超时返回 operation receipt。移除 HTTP 线程中的重复执行与落盘代码。
   `Runtime.te_encode_tokens` 也复用同一 TE 推理实现。
 
-本阶段仍保留 ClipProj 原来的首次 encode GPU 副本创建；完整投影驻留保护在
-阶段 2 接入。不要把此阶段独立当作最终规模探针实现。
+本阶段独立提交时仍保留 ClipProj 原来的首次 encode GPU 副本创建；下面的
+阶段 2 已将它移入显式上卡动作。
 
-测试：原有 15 组自测 + bindings 25 个契约场景 + TE residency 8 个 CPU 场景。
+## 阶段 2：投影显式上卡
+
+- `clipproj_resident.py` 只包装已核对的插件 `_encode`，不复制 encoder 或 MLP
+  数学实现。规范化 encoder 源码 SHA256 为
+  `f1da7ee8cee419a69e174c062be6f083388ade5612e1b6c1cfb3d013ca15beea`；
+  其它版本拒绝，不静默使用兼容性猜测或备用模型。
+- `te ram2vram` 一并准备投影系数、原插件 residual MLP 和 float32 sink。
+  完整临时缓存验证成功后才发布；重复上卡不重新分配已有投影缓存。
+- GPU 投影缓存与内部系数字典只读，推理不能走惰性权重创建路径；保留原
+  dtype，CPU 主副本和 CUDA 计算副本分开记账（包括 sink）。
+- `encode` 要求 TE 和已配置投影都为 vram。没有独立 ClipProj 的模型只按自身
+  unit 检查，不虚构 te.proj。
+- `vram2ram` 释放计算副本；`purgefromram` 检查投影 Tensor 的 weakref。
+  从插件采用的 CPU 缓存只移除对应条目，避免全局缓存偷偷保留服务权重。
+- 原子投影分配失败时报告实际 partial 状态，允许用户显式重试或下卡；
+  TE error/mixed 可以通过整组 vram2ram 尝试恢复，不在推理时修复。
+- CUDA 编码计时在计算前后同步，避免仅测量异步提交时间。
+
+本地原生 ComfyUI（CPU）`tests/probes/te_native_bookkeeping.py` 已验证真实
+LoadedModel/ModelPatcher 加载、登记、resident 检查、卸载与弱引用释放。
 CPU/fake 测试不能证明真实 RTX 2080 Ti 上的驻留、数值或性能；远端尚未验证。

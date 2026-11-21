@@ -73,6 +73,7 @@ PHASES = {"p0": P0_SPECS, "p1": P1_SPECS,
           "p2": (
               TestSpec("comfy_bindings", "_selftest_comfy_bindings.py"),
               TestSpec("te_residency", "_selftest_te_residency.py"),
+              TestSpec("clipproj_resident", "_selftest_clipproj_resident.py"),
               TestSpec("te_manager", "_selftest_te_manager.py"),
               TestSpec("weight_api", "_selftest_weight_api.py"),
               TestSpec("h3_patcher", "_selftest_h3_patcher.py"),

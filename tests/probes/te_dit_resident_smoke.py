@@ -100,7 +100,7 @@ def main():
             report["te_before"] = {"state": te_before["state"],
                                    "counts": te_before["counts"],
                                    "bytes": te_before["bytes"]}
-            assert te_before["state"] in ("vram", "partial"), te_before["state"]
+            assert te_before["state"] == "vram", te_before["state"]
 
             # 3) TE encode（参考图 + 真实 prompt）
             payload = {
@@ -145,7 +145,7 @@ def main():
             assert dit_after["counts"]["vram"] == 56, dit_after["counts"]
             assert dit_after["bytes"]["resident_cuda"] == \
                 dit_before["bytes"]["resident_cuda"]
-            assert te_after["state"] in ("vram", "partial"), te_after["state"]
+            assert te_after["state"] == "vram", te_after["state"]
             status, body = client.request("GET", "/api/status")
             report["vram"] = body.get("vram")
             report["verdict"] = "ok"

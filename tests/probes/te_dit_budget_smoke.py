@@ -104,6 +104,7 @@ def main():
             action(client, "te", "disk2ram", {"mode": "all"}, 900, report)
             action(client, "te", "ram2vram", {"mode": "all"}, 300, report)
             te_before = weights_of(client, "te")
+            assert te_before["state"] == "vram", te_before
             report["te_before"] = {"state": te_before["state"],
                                    "cuda_bytes": te_before["bytes"]["resident_cuda"]}
             report["vram_after_te"] = vram_of(client)

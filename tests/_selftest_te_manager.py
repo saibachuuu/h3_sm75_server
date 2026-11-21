@@ -287,16 +287,75 @@ class TeManagerTests(unittest.TestCase):
         manager.run_action("disk2ram", {"mode": "all", "units": []})
         manager.move_to = lambda device: None
         manager.inventory = lambda: dict(inventory(cpu=0, cuda=4096,
-                                                    device="cuda:0"))
+                                                    device="cuda:0", proj_cuda=256))
         manager.run_action("ram2vram", {"mode": "all", "units": []})
         manager._preprocess = lambda *args: ([], [{"type": "image",
                                                    "data": None}], [[32, 32]])
-        manager.inventory = lambda: dict(inventory(cpu=4096, device="cpu"))
+        manager.inventory = lambda: dict(inventory(cpu=4096, device="cpu", proj_cuda=256))
         with self.assertRaises(OperationError) as ctx:
             manager.run_encode(self._encode_request())
         self.assertEqual(ctx.exception.code, "WEIGHT_MUTATED")
         self.assertEqual(ctx.exception.details["units"][UNIT_MODEL]["device"],
                          "cpu")
+
+    def test_encode_requires_projection_in_vram_too(self):
+        manager, _, registry = self._manager()
+        manager.prepare()
+        registry.set_unit_loaded(MODEL_ID, UNIT_MODEL, "cuda:0",
+                                 resident_bytes_cpu=0, resident_bytes_cuda=4096)
+        registry.set_unit_loaded(MODEL_ID, UNIT_PROJ, "cpu",
+                                 resident_bytes_cpu=512, resident_bytes_cuda=0)
+        with self.assertRaises(OperationError) as ctx:
+            manager.preflight_encode()
+        self.assertEqual(ctx.exception.code, "MISSING_UNITS")
+        self.assertEqual(ctx.exception.details["missing"], [UNIT_PROJ])
+
+    def test_projection_oom_preserves_real_partial_state_for_explicit_offload(self):
+        import torch
+        manager, _, registry = self._manager()
+        manager.prepare()
+        manager.construct_cpu = lambda operation=None: self._attach(manager)
+        manager.inventory = lambda: dict(inventory(cpu=4096, proj_cpu=512))
+        manager.run_action("disk2ram", {"mode": "all"})
+        def fail_projection(device):
+            manager.inventory = lambda: dict(inventory(cuda=4096, device="cuda:0", proj_cpu=512))
+            raise torch.OutOfMemoryError("projection allocation failed")
+        manager.move_to = fail_projection
+        with self.assertRaises(OperationError):
+            manager.run_action("ram2vram", {"mode": "all"})
+        self.assertEqual(registry.model_state(MODEL_ID)["state"], "partial")
+        manager.move_to = lambda device: None
+        manager.inventory = lambda: dict(inventory(cpu=4096, proj_cpu=512))
+        manager.run_action("vram2ram", {"mode": "all"})
+        self.assertEqual(registry.model_state(MODEL_ID)["state"], "ram")
+
+    def test_explicit_offload_can_recover_error_state_but_encode_cannot(self):
+        manager, _, registry = self._manager()
+        manager.prepare()
+        self._attach(manager)
+        manager.inventory = lambda: dict(inventory(cpu=4096, proj_cpu=512))
+        manager._refresh()
+        manager._mark_error()
+        with self.assertRaises(OperationError):
+            manager.preflight_encode()
+        manager.move_to = lambda device: None
+        manager.run_action("vram2ram", {"mode": "all"})
+        self.assertEqual(registry.model_state(MODEL_ID)["state"], "ram")
+
+    def test_workspace_oom_does_not_mark_resident_weights_corrupt(self):
+        import torch
+        manager, _, registry = self._manager()
+        manager.prepare()
+        self._attach(manager)
+        manager.inventory = lambda: dict(inventory(cuda=4096, device="cuda:0", proj_cuda=256))
+        manager._refresh()
+        def oom(*args):
+            raise torch.OutOfMemoryError("workspace")
+        manager._encode_tokens_impl = oom
+        with self.assertRaises(OperationError) as ctx:
+            manager._encode_tokens("a cat", [], "ref2va")
+        self.assertEqual(ctx.exception.code, "CUDA_OOM")
+        self.assertEqual(registry.model_state(MODEL_ID)["state"], "vram")
 
     @staticmethod
     def _encode_request():

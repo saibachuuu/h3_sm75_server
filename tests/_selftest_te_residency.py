@@ -22,6 +22,9 @@ class Patcher:
         self.parent = None
         self.gpu = False
 
+    def detach(self):
+        self.gpu = False
+
     def is_dynamic(self):
         return False
 
@@ -32,6 +35,9 @@ class Patcher:
 class Backend:
     def __init__(self, patcher):
         self.obj = types.SimpleNamespace(patcher=patcher)
+
+    def drop_caches(self):
+        pass
 
     def _clip_model(self):
         return self.obj.patcher.model
@@ -116,6 +122,13 @@ class ResidenceTests(unittest.TestCase):
         self.assertEqual(len(mm.current_loaded_models), 1)
         residence.unregister()
         self.assertIsNone(residence.bindings.registry.get("te"))
+
+    def test_offload_without_booking_cleans_partial_native_state(self):
+        residence, runtime, backend, other, mm, calls = setup()
+        backend.obj.patcher.gpu = True
+        residence.move(backend, "cpu")
+        self.assertFalse(backend.obj.patcher.gpu)
+        self.assertEqual(mm.current_loaded_models, [])
 
     def test_inference_only_checks_existing_booking(self):
         residence, runtime, backend, other, mm, calls = setup()

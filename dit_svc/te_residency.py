@@ -38,10 +38,11 @@ class TeResidency:
     def _register(self, backend):
         patcher = backend.obj.patcher
         registry = self.bindings.registry
+        def devices():
+            units = backend.inventory()["units"]
+            return {name: item["device"] for name, item in units.items()}
         if registry.get("te") is None:
-            registry.register(patcher, "te", {"te.model": "cpu"},
-                              probe=lambda: {"te.model": backend.inventory()[
-                                  "units"]["te.model"]["device"]})
+            registry.register(patcher, "te", devices(), probe=devices)
         elif registry.resolve(patcher) is not registry.get("te"):
             raise OperationError("BOOKKEEPING_CONFLICT", "TE 对象与登记不符", 503, False)
 
@@ -62,7 +63,7 @@ class TeResidency:
         before = self.snapshot(exclude_te=True)
         with self.bindings.execution(PHASE_EXPLICIT_MOVE, "te.%s" % device,
                                      allowed_models=("te",),
-                                     declared_units=("te.model",)):
+                                     declared_units=backend.inventory()["units"]):
             try:
                 bookings = self._bookings(mm, patcher)
                 if len(bookings) > 1:
@@ -79,11 +80,19 @@ class TeResidency:
                     item = inv["units"]["te.model"]
                     if inv["uninspectable"] or item["device"] != device or item["cpu"]:
                         raise OperationError("MOVE_FAILED", "TE 未完整上卡", 500, False, inv)
+                    if getattr(backend, "_projected", False):
+                        if backend.obj.is_prepared:
+                            backend.obj.require_projection(device)
+                        else:
+                            backend.obj.prepare_projection(device)
                 else:
                     for entry in bookings:
                         entry.model_unload()
                         mm.current_loaded_models.remove(entry)
+                    if not bookings:
+                        patcher.detach()  # clean partial native-load bookkeeping too
                     patcher.model.to(device)
+                    backend.drop_caches()
                 self.assert_unchanged(before, self.snapshot(exclude_te=True))
             except BaseException:
                 self.assert_unchanged(before, self.snapshot(exclude_te=True))
@@ -102,16 +111,25 @@ class TeResidency:
         if len(bookings) != 1 or str(bookings[0].device) != "cuda:0":
             raise OperationError("MISSING_RESIDENCE", "TE 没有有效 CUDA 登记",
                                  409, False)
+        if getattr(backend, "_projected", False):
+            backend.obj.require_projection("cuda:0")
+            gpu = {"cache": backend.obj.__dict__["_gpu"],
+                   "sink": backend.obj.__dict__["_proj"].get("sink_out")}
+            inv = W.storage_inventory(gpu, owner="te.proj.gpu")
+            if inv.uninspectable or inv.meta_tensors or inv.total_cpu or not inv.total_cuda:
+                raise OperationError("MISSING_UNITS", "投影计算副本未完整驻留 CUDA",
+                                     409, False, {"missing": ["te.proj"]})
 
     @contextlib.contextmanager
     def inference(self, backend, operation=None):
         self.require(backend)
         before = self.snapshot()
         proof = {}
+        required = tuple(backend.inventory()["units"])
         with self.bindings.execution(PHASE_RESIDENT_INFER,
                                      getattr(operation, "id", None) or "te.encode",
-                                     declared_units=("te.model",),
-                                     expected_devices={"te.model": "cuda:0"}):
+                                     declared_units=required,
+                                     expected_devices={name: "cuda:0" for name in required}):
             try:
                 yield proof
             finally:
@@ -128,9 +146,12 @@ class TeResidency:
             if name == "te":
                 if exclude_te:
                     continue
-                # Projection residency is checked by the explicit projection adapter.
-                inv = W.storage_inventory(backend._clip_model(), owner="te.model")
-                result[name] = self._storage(inv)
+                tensors = {"model": backend._clip_model()}
+                if getattr(backend, "_projected", False):
+                    tensors["projection_cpu"] = backend.obj.projection_cpu
+                    tensors["projection_gpu"] = backend.obj.__dict__["_gpu"]
+                    tensors["projection_runtime"] = backend.obj.__dict__["_proj"]
+                result[name] = self._storage(W.storage_inventory(tensors, owner="te"))
             else:
                 inv = backend.inventory()
                 if inv.get("uninspectable"):

@@ -36,7 +36,8 @@
 ```
 
 state 是聚合值：含 mixed/error 即 `error`；部分缺失为 `partial`；全部 CPU 为
-`ram`；全部 GPU 为 `vram`。bytes 是**真实 storage**（量化展开、按 storage 去重），
+`ram`；全部 GPU 计算副本就绪为 `vram`。TE 投影可保留 CPU 主副本，CUDA 计算
+副本完整就绪后 te.proj 仍为 vram；两端字节分别报告。bytes 是**真实 storage**（量化展开、按 storage 去重），
 不是 `numel * element_size`。
 
 ## 2. 四动作
@@ -75,6 +76,15 @@ dry_run / generation / model_state`，成功动作另带 `audit` 或 `proof`。
 | ram2vram | ram → vram | 已 vram | absent；mixed/error |
 | vram2ram | vram → ram | 已 ram/absent | mixed/error |
 | purgefromram | ram → absent | 已 absent | 任何 CUDA 驻留（先 vram2ram） |
+
+### TE 投影与登记
+
+`te ram2vram` 同时完成 TE 原生 Comfy 登记，以及投影系数、residual MLP 和
+sink 的 GPU 准备，不推理。编码要求全部已配置的 TE unit 为 vram；推理不会
+补登记、补建投影、为自己卸载其它模型。投影 CPU 主副本保留供下次上卡。
+原子投影准备失败可以留下真实 partial 状态，显式重试或 vram2ram；整组 TE
+的 vram2ram 也可尝试恢复 error/mixed，完成后必须重新通过物理审计。
+ClipProj encoder 仅支持已核对的源码版本，不匹配返回 `UNSUPPORTED_CLIPPROJ`。
 
 ### 关键错误
 
@@ -117,8 +127,9 @@ POST /api/weights/te/purgefromram {"mode": "all"} # 释放并证明零存储
 
 旧 `POST /api/encode` 保留同步形态：仍由同一个 worker 执行，有界等待（1800s），
 超时返回已有的 202 回执，**不再自动 VAE 让位/TE 上卡**；TE 未上卡时 409。
-旧 `POST /api/te/step`、`/api/te/probe` 保留为 legacy 调试路径（内部走同一
-backend，但尚未迁移成 operation，不能当作最终契约）。
+旧 `POST /api/te/step`、`/api/te/probe` 保留为 legacy 调试路径，也由同一
+worker 执行；有界等待 1800s，超时返回 operation 回执，不再在 HTTP 线程里
+并发搬模型或编码。
 
 ## 4. 启动与配置
 
@@ -157,8 +168,9 @@ python h3_dit_server.py --host 127.0.0.1 --port 8190 `
 * sample 只要求 `dit` 在显存；`vae.video` / `vae.audio` 允许停在 RAM。decode
   阶段由 pipeline 调 `WeightService.prepare_vae()` 显式上卡（量化 VAE 走重建）。
   同时驻留 14GB DiT + 2.7GB VAE 会在 2080Ti 22GB 上 OOM。
-* attention 绑定与 VEDA 严格 resident（C 分支）未合并；`/api/status` 的
-  `attn` 仍为 none。
+* C 分支的 ComfyBindings 已单独接入 TE；attention 与 VEDA 严格 resident
+  尚未合并，`/api/status` 的 `attn` 仍为 none。不能把 TE 的验证当作全程序
+  所有推理路径的驻留验证。
 * `purgefromram` 的跨 unit 事务不承诺全回滚：报告 completed/failed/not_attempted
   和实际 snapshot。
-* 旧的 `/api/te/*` 与 `/api/jobs*` 尚未全部迁移到 operation。
+* `/api/te/step`、`/api/te/probe` 已迁入 operation；旧 `/api/jobs*` 仍保留 Job 外形。
