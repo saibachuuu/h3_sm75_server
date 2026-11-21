@@ -7,6 +7,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from common.protocol import DEFAULTS, DIRECTOR_MAX_SHOTS, SAMPLERS, SCHEDULERS, dumps
+from dit_svc import api_validation
 from dit_svc.operations import OperationError
 from dit_svc.artifacts import ArtifactStore, safe_join
 
@@ -160,6 +161,110 @@ def make_handler(runtime, queue, ctx):
             except Exception:
                 return None
 
+        def _wait_operation(self, operation, timeout):
+            """Wait for a terminal state without holding any worker/lease lock.
+
+            Returns the operation, or None on timeout (the caller then reports the
+            existing 202 receipt; the operation is not resubmitted).
+            """
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if operation.terminal:
+                    return operation
+                time.sleep(0.05)
+            return None
+
+        def _operation_error_response(self, operation):
+            error = operation.error
+            if isinstance(error, OperationError):
+                payload = error.to_dict()
+                status = error.http_status
+            else:
+                payload = {"code": "EXECUTION_FAILED", "message": str(error),
+                           "http_status": 500, "retryable": False,
+                           "details": None}
+                status = 500
+            return payload, status
+
+        def _post_weights(self, path):
+            """POST /api/weights/<model>/<action> → 202 operation receipt."""
+            rest = path[len("/api/weights/"):]
+            parts = rest.split("/")
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                self._json({"ok": False, "error": {
+                    "code": "MODEL_NOT_FOUND", "message": "路径应为 /api/weights/<model>/<action>",
+                    "http_status": 404, "retryable": False, "details": None}}, 404)
+                return
+            model_id, action = parts
+            payload = self._read_json_body()
+            if payload is None:
+                self._json({"ok": False, "error": {
+                    "code": "INVALID_REQUEST", "message": "请求体必须是 JSON 对象",
+                    "http_status": 400, "retryable": False, "details": None}}, 400)
+                return
+            try:
+                if not isinstance(payload, dict):
+                    raise OperationError("INVALID_REQUEST", "请求体必须是 JSON 对象",
+                                         400, False)
+                payload = dict(payload)
+                declared = payload.get("model")
+                if declared is None:
+                    payload["model"] = model_id
+                elif declared != model_id:
+                    raise OperationError(
+                        "INVALID_REQUEST",
+                        "URL model 与 body.model 不一致", 400, False,
+                        {"url_model": model_id, "body_model": declared})
+                request = api_validation.validate_weights_request(payload, action)
+                if request["models"] != [model_id]:
+                    raise OperationError("INVALID_REQUEST", "model 列表不匹配",
+                                         400, False)
+                # 提交阶段完成 catalog 建立 + selector 展开（纯 CPU/header，
+                # 不构造模型、不搬设备）；未知 unit 直接 4xx。
+                runtime.weights.ensure_catalog(model_id)
+                if request["mode"] != "all":
+                    request["units"] = runtime.weights.unit_ids(model_id, request)
+                operation = queue.submit_operation(
+                    "weights.%s" % action, request,
+                    lambda op: runtime.run_weights_action(
+                        model_id, action, request, op),
+                    request_id=request["request_id"])
+                receipt = operation.receipt()
+                receipt["model"] = model_id
+                receipt["action"] = action
+                self._json(receipt, 202)
+            except OperationError as exc:
+                self._json({"ok": False, "error": exc.to_dict()}, exc.http_status)
+            except Exception as exc:
+                error = OperationError.from_exception(exc)
+                self._json({"ok": False, "error": error.to_dict()},
+                           error.http_status)
+
+        def _post_encode(self):
+            """POST /api/infer/encode → 202；显式要求 te 已在显存。"""
+            payload = self._read_json_body()
+            if payload is None:
+                self._json({"ok": False, "error": {
+                    "code": "INVALID_REQUEST", "message": "请求体必须是 JSON 对象",
+                    "http_status": 400, "retryable": False, "details": None}}, 400)
+                return
+            try:
+                request = api_validation.validate_encode_request(payload)
+                runtime.te.preflight_encode(request)
+                operation = queue.submit_operation(
+                    "infer.encode", request,
+                    lambda op: runtime.run_infer_encode(request, op),
+                    request_id=request["request_id"])
+                receipt = operation.receipt()
+                receipt["capability"] = "encode"
+                self._json(receipt, 202)
+            except OperationError as exc:
+                self._json({"ok": False, "error": exc.to_dict()}, exc.http_status)
+            except Exception as exc:
+                error = OperationError.from_exception(exc)
+                self._json({"ok": False, "error": error.to_dict()},
+                           error.http_status)
+
         def _status(self):
             from dit_svc import cond_client
             torch = getattr(runtime, "torch", None)
@@ -284,6 +389,12 @@ def make_handler(runtime, queue, ctx):
         # ---------------- POST ----------------
         def do_POST(self):
             path = urllib.parse.urlparse(self.path).path
+            if path.startswith("/api/weights/"):
+                self._post_weights(path)
+                return
+            if path == "/api/infer/encode":
+                self._post_encode()
+                return
             if path.startswith("/api/operations/") and path.endswith("/cancel"):
                 operation_id = path[len("/api/operations/"):-len("/cancel")]
                 try:
@@ -472,60 +583,52 @@ def make_handler(runtime, queue, ctx):
                     self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
 
             elif path == "/api/encode":
-                # 探针：只算 condition，不进 DiT（完整封装）。
-                # 流程：VAE 让位 -> TE 上卡 -> encode -> TE 退回 RAM -> VAE 归位。
-                # {prompt, image_b64s? 1–9, mode?, width?, height?, ref_image_size?,
-                #  save_cond?: bool}
+                # 兼容旧同步语义：同一个 worker 执行，有界等待；超时返回已有 202 回执。
+                # 不再自动 VAE 让位/TE 上卡：必须先用 POST /api/weights/te/*。
                 payload = self._read_json_body()
                 if payload is None:
                     self._json({"ok": False, "error": "请求体不是合法 JSON 或过大"}, 400)
                     return
-                snap = queue.snapshot(limit=1)
-                counts = snap.get("counts") or {}
-                if counts.get("running") or counts.get("queued"):
-                    self._json({"ok": False,
-                                "error": "队列非空（生成任务在跑或在排队）。TE 交换要独占显存，等它结束再试。"},
-                               409)
+                if not isinstance(payload, dict):
+                    self._json({"ok": False, "error": "请求体必须是 JSON 对象"}, 400)
                     return
+                # save_cond 在旧语义里控制落盘；新 operation 总是提交 artifact。
+                payload = {k: v for k, v in payload.items() if k != "save_cond"}
                 try:
-                    import base64 as _b64
-                    import os as _os
-                    prompt = payload.get("prompt", "")
-                    raw = payload.get("image_b64s") or []
-                    imgs = []
-                    for s in raw:
-                        if not isinstance(s, str):
-                            continue
-                        if s.startswith("data:"):
-                            s = s.split(",", 1)[1]
-                        imgs.append(_b64.b64decode(s))
-                    mode = payload.get("mode", "ref2va")
-                    width = int(payload.get("width", 640))
-                    height = int(payload.get("height", 960))
-                    ref_size = payload.get("ref_image_size", "match")
-                    out, stats = runtime.encode_condition(
-                        prompt, imgs, mode=mode, width=width, height=height,
-                        ref_image_size=ref_size)
-                    resp = {"ok": True, "stats": stats}
-                    if payload.get("save_cond"):
-                        from safetensors.torch import save_file
-                        name = "cond_probe_%d.safetensors" % int(time.time())
-                        out_dir = getattr(runtime.args, "out_dir", "outputs")
-                        _os.makedirs(out_dir, exist_ok=True)
-                        fp = _os.path.join(out_dir, name)
-                        tosave = {"cond": out["cond"]}
-                        if out["minimax_token_tags"] is not None:
-                            tosave["minimax_token_tags"] = out["minimax_token_tags"]
-                        save_file(tosave, fp)
-                        resp["cond_file"] = name
-                        resp["cond_bytes"] = _os.path.getsize(fp)
-                    self._json(resp, 200)
-                except ValueError as e:
-                    self._json({"ok": False, "error": str(e)}, 400)
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
+                    request = api_validation.validate_encode_request(payload)
+                    runtime.te.preflight_encode(request)
+                    operation = queue.submit_operation(
+                        "infer.encode", request,
+                        lambda op: runtime.run_infer_encode(request, op),
+                        request_id=request["request_id"])
+                    finished = self._wait_operation(operation, 1800.0)
+                    if finished is None:
+                        self._json(operation.receipt(), 202)
+                        return
+                    if finished.status == "done":
+                        result = finished.result or {}
+                        artifact = result.get("artifact") or {}
+                        filename = artifact.get("filename")
+                        self._json({
+                            "ok": True,
+                            "stats": result.get("stats"),
+                            "artifact": artifact,
+                            "cond_file": filename,
+                            "cond_bytes": artifact.get("bytes"),
+                            "cond_url": ("/outputs/stage/%s" % filename
+                                         if filename else None),
+                            "operation_id": finished.id,
+                        }, 200)
+                    else:
+                        error, status = self._operation_error_response(finished)
+                        self._json({"ok": False, "error": error,
+                                    "operation_id": finished.id}, status)
+                except OperationError as exc:
+                    self._json({"ok": False, "error": exc.to_dict()}, exc.http_status)
+                except Exception as exc:
+                    error = OperationError.from_exception(exc)
+                    self._json({"ok": False, "error": error.to_dict()},
+                               error.http_status)
             elif path == "/api/jobs/drop":
                 payload = self._read_json_body() or {}
                 job_id = payload.get("id")

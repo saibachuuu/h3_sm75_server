@@ -1,0 +1,157 @@
+# 显式权重 API（统一四动作）
+
+更新时间：2026-11-21。目标：**所有模型权重只能通过 API 管理**，无参数启动是纯空壳；
+推理与权重操作共用同一个单 worker 执行器。
+
+## 1. 模型与粒度
+
+| model id | backend | 首版粒度 | unit |
+|---|---|---|---|
+| `dit` | `DitBackend`（A 的 `H3ComfyAdapter`） | block 级部分物化 | `dit.blocks.N`、`dit.refiner`、`dit.modules.*`、`dit.root` |
+| `vae.video` | `VaeBackend`（Comfy VAE） | 整组 | `vae.video.model` |
+| `vae.audio` | `VaeBackend`（Comfy VAE） | 整组 | `vae.audio.model` |
+| `te` | `TeBackend`（Comfy CLIP + ClipProj） | `te.model` + `te.proj`（同进同出） | 见左 |
+| `veda.bundle` | `VedaBackend`（`veda.bundle_compat`） | 整组 | `veda.bundle.model` |
+
+`GET /api/weights` 与 `GET /api/weights/<model>` 返回同一份 registry 摘要：
+
+```json
+{
+  "ok": true,
+  "revision": 3,
+  "models": {
+    "te": {
+      "model_id": "te", "state": "partial|absent|ram|vram|error",
+      "generation": 2, "catalog_ready": true, "addressable": true,
+      "recipe": {"kind": "4b", "path": "...", "fingerprint": {...}},
+      "counts": {"absent": 0, "ram": 1, "vram": 1, "mixed": 0, "error": 0},
+      "bytes": {"resident_cpu": 5123456789, "resident_cuda": 5123456789,
+                "expected": 5150000000},
+      "units": [{"id": "te.model", "state": "vram", "device": "cuda:0",
+                 "resident_bytes_cpu": 0, "resident_bytes_cuda": 5150000000,
+                 "expected_bytes": 4858559240, "last_error": null}, ...]
+    }
+  }
+}
+```
+
+state 是聚合值：含 mixed/error 即 `error`；部分缺失为 `partial`；全部 CPU 为
+`ram`；全部 GPU 为 `vram`。bytes 是**真实 storage**（量化展开、按 storage 去重），
+不是 `numel * element_size`。
+
+## 2. 四动作
+
+```text
+POST /api/weights/<model>/<action>
+action ∈ disk2ram | ram2vram | vram2ram | purgefromram
+```
+
+统一请求体：
+
+```json
+{"mode": "all"}                        // 或 {"mode": "units", "units": ["dit.blocks.12"]}
+{"model": "te"}                        // 可省；省则用 URL 里的 model；不一致 400
+{"dry_run": true}                      // 只读 header/catalog + 资源摘要，不构造/不搬
+{"request_id": "client-abc"}           // 可选：同 payload 幂等返回同一个 operation
+{"recipe": {"path": "...", "kind": "4b", "proj": "...", "mmproj": "..."}}
+                                       // 仅 disk2ram；不传则用 defaults-file
+```
+
+返回 **202**：
+
+```json
+{"ok": true, "operation_id": "op_...", "status": "queued",
+ "operation_url": "/api/operations/op_...", "model": "te", "action": "disk2ram"}
+```
+
+`GET /api/operations/<id>` 轮询；`result` 里有 `completed / failed / not_attempted /
+dry_run / generation / model_state`，成功动作另带 `audit` 或 `proof`。
+
+### 状态迁移
+
+| 动作 | 合法 → | no-op | 拒绝 |
+|---|---|---|---|
+| disk2ram | absent → ram | 已 ram/vram | mixed/error；recipe 变更 |
+| ram2vram | ram → vram | 已 vram | absent；mixed/error |
+| vram2ram | vram → ram | 已 ram/absent | mixed/error |
+| purgefromram | ram → absent | 已 absent | 任何 CUDA 驻留（先 vram2ram） |
+
+### 关键错误
+
+| code | HTTP | 场景 |
+|---|---|---|
+| `MODEL_NOT_FOUND` | 404 | 未知 model |
+| `<MODEL>_NOT_CONFIGURED` | 409 | defaults-file 没有该模型 |
+| `SHARED_UNIT_REQUIRED` | 409 | TE 只选 `te.model` 或 `te.proj` |
+| `MISSING_UNITS` | 409 | 上卡/编码所需 unit 不在目标状态，带 `suggested` |
+| `INVALID_SELECTOR` | 400 | 未知 unit / 区间越界（不 clamp） |
+| `TRANSITION_CONFLICT` | 409 | mixed/error 未恢复就继续 |
+| `CUDA_RESIDENT` | 409 | purge 时仍有 CUDA 存储 |
+| `PURGE_INCOMPLETE` | 500 | weakref 还活着，拒绝谎报 absent |
+| `UNINSPECTABLE_WEIGHTS` | 500 | 量化包装无法审计，fail-closed |
+| `WEIGHT_MUTATED` | 500 | 推理期间权重设备被内部流程改变 |
+
+## 3. 显式 TE 条件编码
+
+```text
+POST /api/weights/te/disk2ram   {"mode": "all"}   # 4.85GB 读盘，构造在 CPU
+POST /api/weights/te/ram2vram   {"mode": "all"}   # 权重上卡（不推理）
+POST /api/infer/encode          {"prompt": "...", "image_b64s": ["..."],
+                                 "mode": "ref2va", "width": 640, "height": 960}
+GET  /api/operations/<id>                          # 轮询到 done
+POST /api/weights/te/vram2ram   {"mode": "all"}   # 下卡（清 ClipProj GPU 缓存）
+POST /api/weights/te/purgefromram {"mode": "all"} # 释放并证明零存储
+```
+
+`/api/infer/encode` 固定 202；`result.artifact` 是 `cond_<hex>` artifact：
+
+```json
+{"artifact": {"id": "cond_...", "filename": "cond_te_....safetensors",
+              "bytes": 4100000, "sha256": "..."},
+ "stats": {"n_tokens": 1234, "cond_shape": [1, 1234, 5120],
+           "tokenize_s": 0.1, "encode_s": 4.2, "mode": "ref2va"},
+ "audit": {...}}
+```
+
+下载：`GET /outputs/stage/<filename>`（支持单段 Range）。
+
+旧 `POST /api/encode` 保留同步形态：仍由同一个 worker 执行，有界等待（1800s），
+超时返回已有的 202 回执，**不再自动 VAE 让位/TE 上卡**；TE 未上卡时 409。
+旧 `POST /api/te/step`、`/api/te/probe` 保留为 legacy 调试路径（内部走同一
+backend，但尚未迁移成 operation，不能当作最终契约）。
+
+## 4. 启动与配置
+
+```powershell
+python h3_dit_server.py --host 127.0.0.1 --port 8190 `
+  --runner-dir C:\Users\sheepserver\Desktop `
+  --defaults-file C:\Users\sheepserver\Desktop\h3_explicit_defaults.json
+```
+
+`defaults.json` 只描述配方，不触发加载：
+
+```json
+{"models": {
+  "te":  {"path": "C:\\Users\\sheepserver\\qwen3vl_4b_int8_convrot.safetensors",
+          "kind": "4b",
+          "proj": "mmh3-4b-ClipProj-celeb-mlp.safetensors"},
+  "dit": {"path": "C:\\Users\\sheepserver\\10Eros_Max_h3_TURBO-hybrid_beta5_w4a8_14gb_optimized.safetensors"},
+  "vae.video": {"path": "D:\\minimax_h3_video_vae_int8_convrot.safetensors"},
+  "vae.audio": {"path": "D:\\minimax_h3_audio_vae_fp32.safetensors"},
+  "veda.bundle": {"path": "D:\\minimax_h3_r2va_veda_preview_fp8.safetensors"}
+}}
+```
+
+`te.kind` 可省略：有 `proj` → `4b`；`.gguf` → `gguf`；否则 `checkpoint`。
+`te.proj` 可以是 `models/clip_projections` 下的文件名，也可以是绝对路径。
+
+## 5. 已知边界
+
+* DiT 只接权重存储（meta 骨架 + 选定 unit 物化 + 搬运/purge）；ModelPatcher /
+  sampling 包装（B 的 `h3_patcher`）尚未接进生产加载，推理仍走旧 job 路径。
+* VAE / VEDA 首版是整组 unit，尚未按 encoder/decoder/层拆分。
+* attention 绑定与 VEDA 严格 resident（C 分支）未合并；`/api/status` 的
+  `attn` 仍为 none。
+* `purgefromram` 的跨 unit 事务不承诺全回滚：报告 completed/failed/not_attempted
+  和实际 snapshot。
+* 旧的 `/api/te/*` 与 `/api/jobs*` 尚未全部迁移到 operation。

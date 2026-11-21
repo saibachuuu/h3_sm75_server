@@ -69,8 +69,13 @@ P1_SPECS = (
     TestSpec("check_call_sites", "_check_call_sites.py"),
 )
 
-PHASES = {"p0": P0_SPECS, "p1": P1_SPECS}
-PHASE_ORDER = ("p0", "p1")
+PHASES = {"p0": P0_SPECS, "p1": P1_SPECS,
+          "p2": (
+              TestSpec("te_manager", "_selftest_te_manager.py"),
+              TestSpec("weight_api", "_selftest_weight_api.py"),
+              TestSpec("h3_patcher", "_selftest_h3_patcher.py"),
+          )}
+PHASE_ORDER = ("p0", "p1", "p2")
 STATUS_ORDER = ("passed", "failed", "timeout", "error", "not-covered")
 
 
@@ -306,7 +311,7 @@ def main(argv=None):
             pass
     parser = argparse.ArgumentParser(
         description="串行运行现有 selftest（纯 stdlib，不 SSH/pip/联网）")
-    parser.add_argument("--phase", choices=("p0", "p1", "all"), default="all",
+    parser.add_argument("--phase", choices=PHASE_ORDER + ("all",), default="all",
                         help="p0=权重/环境，p1=启动/HTTP/executor/边界")
     parser.add_argument("--python", default=sys.executable,
                         help="运行测试脚本的解释器（默认当前解释器）")

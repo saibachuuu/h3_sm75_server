@@ -22,12 +22,51 @@ Implementation authorized on 2026-11-21. The user allows the listed agents, dedi
 - Local isolated test interpreter: `C:\Users\88888888\AppData\Local\Temp\opencode\explicit_api_env_20261121\Scripts\python.exe`, inherits CPU torch, safetensors `0.8.0` installed only in that environment.
 - `python tests/_selftest_environment_probe.py`: 3 tests passed. Probe reads a bounded safetensors header and never imports torch or constructs a model.
 
+### Real CPU/meta feasibility probes (primary execution)
+
+- Primary reviewed and locally reran A's `f4e758e` seven suites; passed. Ran
+  its immutable probe bundle in a unique remote temporary directory, not the
+  server checkout: `C:\Users\sheepserver\AppData\Local\Temp\explicit_api_probe_f4e758e_20261121_1650`.
+- Probe 00 passed: all three package versions and nine source hashes match.
+- Probe 10 initially failed because Comfy imports initialized CUDA despite CPU
+  CLI flags. On Windows PowerShell an empty environment value removes the
+  variable; `CUDA_VISIBLE_DEVICES=-1` correctly isolated the CPU-only process.
+  With that isolation, the real H3 class built successfully: 50 blocks, 2 refiner
+  blocks, 56 compute units, 2 explicitly noncompute keys, 268 meta tensors and
+  zero CPU/CUDA resident storage. The successful full JSON is copied locally
+  to `explicit_api_sources_20261121\probe_10_cpu_isolated.json` under approved temp.
+- Probe 20 read only `dit.blocks.0` on CPU, then correctly failed `META_REMAINS`:
+  all 18 keys bound, but only 1,763,840 CPU bytes and 4 meta tensors remained.
+  Initial suspicion was the mixed-precision construction-device cache. A direct
+  physical-leaf diagnostic disproved that explanation: all four QuantizedTensor
+  parameters and their `_qdata` are non-meta CPU tensors, and factory devices
+  are CPU. Their `_qdata` byte counts are 115,605,504 / 38,535,168 / 154,140,672 /
+  77,070,336. The actual issue is `_walk_tensors`: the real quant wrapper inherits
+  `torch.Tensor`, so its early tensor-return skips `_qdata` and typed parameters;
+  the outer wrapper's unavailable storage is wrongly classified as meta. The
+  earlier non-Tensor fake did not expose this. Corrective work and an actual
+  Tensor-subclass regression were returned to session A. No GPU weight move is
+  accepted until physical accounting and CPU selective purge/reload pass.
+- No installed third-party source or existing server worktree was modified.
+
+### Real empty-boot HTTP gate
+
+- A reviewed `85f6de5` archive was extracted to a separate remote temporary
+  directory. The bounded `tests/probes/empty_boot.py` started a new loopback
+  server on an ephemeral port and stopped only the PID it created.
+- Passed: `api_version=2`, `env_ready=true`, `ready=false`,
+  `compute_ready=false`, `attn=none`, idle executor and all five model records
+  absent with no catalogs or units. The status reported zero allocated and
+  reserved PyTorch VRAM; no model/attention/load API actions were requested.
+- Full report and log are retained locally in approved temp under
+  `explicit_api_sources_20261121\empty_boot_report.json` / `.log`.
+
 ## Phase ledger
 
 | Phase | Status | Evidence / pending gate |
 |---|---|---|
 | P0 feasibility/version baseline | In progress | Selective materialization, resident Comfy bookkeeping, VEDA lifecycle, actual dependency signatures |
-| P1 empty shell/executor | Local foundation integrated | Process-only CLI, no startup loader, environment/compute split, one worker, operation HTTP views; real empty boot pending |
+| P1 empty shell/executor | Empty-boot gate passed | Process-only CLI, environment/compute split, one worker, operation HTTP views; real remote empty HTTP startup verified |
 | P2 partial weight lifecycle | Not integrated | Real selective read/materialize/purge/reload, quant storage, error recovery |
 | P3 resident inference/artifacts | Artifact component locally integrated | CPU safetensors roundtrip and safe downloads; resident inference and real GPU invariants pending |
 | P4 attention/VEDA | Not integrated | Correct rollback/clear and no implicit predictor copies |

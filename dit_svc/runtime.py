@@ -17,6 +17,14 @@ import time
 import traceback
 
 from dit_svc import veda_attn_star7  # noqa: F401  veda NVML/warmup 工具
+from dit_svc.weight_service import WeightService
+
+
+def _all_request():
+    """Legacy te_* 端点复用的全量请求；语义与 POST /api/weights/te/all 一致。"""
+    return {"action": "all", "models": ["te"], "mode": "all",
+            "units": [], "dry_run": False, "request_id": None,
+            "recipe": None, "recipes": None, "options": None}
 
 
 def find_ffmpeg():
@@ -68,7 +76,9 @@ class Runtime:
         self.te_load_s = 0.0
         self.te_swaps = 0           # 已发生的 VAE↔TE 交换次数
         self._te_step_state = {}    # 原子化 TE encode 状态机
-        self.weights = None
+        # 显式权重服务（stdlib 导入安全，启动不读权重）
+        self.weights = WeightService(self)
+        self.te = self.weights.backends["te"]
 
     @property
     def ready(self):
@@ -113,6 +123,12 @@ class Runtime:
                 self.error = None
                 self.env_ready = True
                 self.set_stage("环境就绪（无权重）")
+                # 只登记 recipe/catalog（stat 文件），不读权重、不构造模型
+                try:
+                    self.weights.prepare()
+                except Exception as exc:
+                    print("[weights] prepare 失败: %s: %s"
+                          % (type(exc).__name__, exc), flush=True)
             except Exception as exc:
                 self.env_ready = False
                 self.error = "%s: %s" % (type(exc).__name__, exc)
@@ -122,15 +138,9 @@ class Runtime:
 
     def weights_snapshot(self):
         """A cheap metadata snapshot; startup never opens checkpoint files."""
-        snapshot = self.weights.snapshot() if self.weights is not None else {"models": {}}
-        models = snapshot.setdefault("models", {})
-        for model_id in ("dit", "vae.video", "vae.audio", "te", "veda.bundle"):
-            models.setdefault(model_id, {
-                "model_id": model_id, "state": "absent", "generation": 0,
-                "catalog_ready": False, "units": [], "bytes_cpu": 0, "bytes_cuda": 0,
-            })
-        snapshot["ok"] = True
-        return snapshot
+        if self.weights is None:
+            return {"ok": True, "models": {}}
+        return self.weights.snapshot()
 
     def capabilities(self):
         models = self.weights_snapshot()["models"]
@@ -164,6 +174,17 @@ class Runtime:
             raise OperationError("ENV_NOT_READY", self.error or "环境尚未就绪", 503, True)
         if not self.device_healthy:
             raise OperationError("DEVICE_UNHEALTHY", "CUDA 设备不可用，需检查或重启", 503, False)
+        if kind == "infer.encode":
+            # 只查状态，不自动上卡；缺资源时给有序建议。
+            self.weights.preflight_encode(None)
+
+    def run_weights_action(self, model_id, action, request, operation=None):
+        """weights.<action> 的唯一执行入口（单 worker 调用）。"""
+        return self.weights.run_action(model_id, action, request, operation)
+
+    def run_infer_encode(self, request, operation=None):
+        """infer.encode 的唯一执行入口（单 worker 调用）。"""
+        return self.weights.encode(request, operation)
 
     def operation_synchronize(self, operation):
         if self.torch is not None and self.torch.cuda.is_initialized():
@@ -709,12 +730,8 @@ class Runtime:
     # ============================================================
 
     def _te_model(self):
-        """返回当前可用的 TE 模型对象（te_proj 优先；GGUF 路径次之）。"""
-        if self.te_proj is not None:
-            return self.te_proj
-        if self.text_encoder is not None:
-            return self.text_encoder
-        return None
+        """当前已加载的 TE 对象；由显式权重管理器持有。"""
+        return self.te.pc
 
     def te_vae_swap_out(self):
         """VAE 让位到 CPU，给 TE 腾显存。返回 {"freed_gb", "elapsed_s"}。"""
@@ -736,51 +753,27 @@ class Runtime:
         return {"elapsed_s": round(elapsed, 3)}
 
     def te_load_to_vram(self):
-        """把 TE 权重从 RAM 搬到 VRAM（不推理）。返回 {"elapsed_s", "device", "alloc_gb"}。"""
+        """显式 ram2vram：只在本服务动作授权下搬权重，不推理。"""
         import torch
-        pc = self._te_model()
-        if pc is None:
-            raise RuntimeError("TE 未加载：启动需 --te-4b/--te-proj 或 --te-gguf（且加载不能失败）")
-        self.set_stage("TE: 权重 RAM -> VRAM（不推理）")
-        t0 = time.perf_counter()
-        before = torch.cuda.memory_allocated() / 1e9
-        try:
-            pc.patcher.model.to(torch.device("cuda:0"))
-            torch.cuda.empty_cache()
-        except Exception as e:
-            print("[te] 加载到 VRAM 失败: %s: %s" % (type(e).__name__, e), flush=True)
-            raise
-        after = torch.cuda.memory_allocated() / 1e9
-        elapsed = time.perf_counter() - t0
-        print("[te] 权重 RAM -> VRAM 耗时 %.3fs | VRAM alloc %.2f -> %.2f GB" %
-              (elapsed, before, after), flush=True)
-        self._vram_ledger("TE上卡", torch)
+        if self._te_model() is None:
+            raise RuntimeError("TE 未加载：先用 POST /api/weights/te/disk2ram")
+        result = self.te.run_action("ram2vram", _all_request())
         return {
-            "elapsed_s": round(elapsed, 3),
-            "device": str(next(pc.patcher.model.parameters()).device),
-            "alloc_gb": round(after, 3),
+            "elapsed_s": result.get("elapsed_s", 0.0),
+            "device": (result.get("audit") or {}).get("model_device"),
+            "alloc_gb": round(torch.cuda.memory_allocated() / 1e9, 3),
+            "audit": result.get("audit"),
         }
 
     def te_offload_to_ram(self):
-        """把 TE 权重从 VRAM 退回 RAM。返回 {"elapsed_s", "device"}。"""
-        import torch
-        pc = self._te_model()
-        if pc is None:
+        """显式 vram2ram：搬回 CPU 并清掉 ClipProj 的 GPU 缓存副本。"""
+        if self._te_model() is None:
             raise RuntimeError("TE 未加载")
-        self.set_stage("TE: 权重 VRAM -> RAM")
-        t0 = time.perf_counter()
-        try:
-            pc.patcher.model.to(torch.device("cpu"))
-            torch.cuda.empty_cache()
-        except Exception as e:
-            print("[te] 退回 RAM 失败: %s: %s" % (type(e).__name__, e), flush=True)
-            raise
-        elapsed = time.perf_counter() - t0
-        print("[te] 权重 VRAM -> RAM 耗时 %.3fs" % elapsed, flush=True)
-        self._vram_ledger("TE退卡", torch)
+        result = self.te.run_action("vram2ram", _all_request())
         return {
-            "elapsed_s": round(elapsed, 3),
-            "device": str(next(pc.patcher.model.parameters()).device),
+            "elapsed_s": result.get("elapsed_s", 0.0),
+            "device": (result.get("audit") or {}).get("model_device"),
+            "audit": result.get("audit"),
         }
 
     def _te_preprocess_refs(self, image_bytes_list, mode, width, height, ref_image_size):
@@ -882,8 +875,7 @@ class Runtime:
             try:
                 pc = self._te_model()
                 if pc is not None:
-                    pc.patcher.model.to(torch.device("cpu"))
-                    torch.cuda.empty_cache()
+                    self.te_offload_to_ram()
             except Exception as e:
                 print("[te] reset TE 退回失败: %s" % e, flush=True)
             self._te_step_state = {}
@@ -972,6 +964,7 @@ class Runtime:
         """返回当前 TE 状态机快照（含 TE 模型当前 device、VRAM）。"""
         import torch
         state = dict(self._te_step_state)
+        state["weights"] = self.te.state()
         pc = self._te_model()
         if pc is not None:
             try:
@@ -992,34 +985,28 @@ class Runtime:
 
     def encode_condition(self, prompt, image_bytes_list=None, mode="ref2va",
                          width=640, height=960, ref_image_size="match"):
-        """VAE 让位 -> TE 上卡算 condition -> TE 退回 RAM -> VAE 归位（完整封装）。
+        """居民式条件编码：要求 TE 已在显存，绝不自动上卡/交换。
 
-        串行独占：调用方须保证没有并发的生成任务（DiT 正在跑时不要调）。
-        返回 (dict 含 cond/minimax_token_tags, stats)。
+        返回 (dict 含 cond/minimax_token_tags, stats)。调用方（pipeline/HTTP）
+        必须先通过 POST /api/weights/te/disk2ram + ram2vram 把 TE 放上卡。
         """
+        import base64 as _b64
         import torch
         t_all = time.perf_counter()
+        self.te.preflight_encode(None)
 
-        # ---- 1. VAE 让位 ----
-        res_out = self.te_vae_swap_out()
-        swap_out_s = res_out["elapsed_s"]
+        # 参考图预处理（CPU）
+        images = [_b64.b64encode(b).decode("ascii")
+                  for b in (image_bytes_list or []) if b]
+        images = [s if s.startswith("data:") else s for s in images]
+        _, ref_items, qwen_sizes = self.te._preprocess(
+            images, mode, width, height, ref_image_size)
 
-        # ---- 2. 参考图预处理（CPU） ----
-        _, ref_items, qwen_sizes = self._te_preprocess_refs(
-            image_bytes_list, mode, width, height, ref_image_size)
-
-        # ---- 3. TE 上卡（不推理，只搬权重）----
-        self.te_load_to_vram()
-
-        # ---- 4. TE 编码 ----
-        out, enc_stats = self.te_encode_tokens(prompt, ref_items, mode=mode)
-
-        # ---- 5. TE 退回 RAM ----
-        self.te_offload_to_ram()
-
-        # ---- 6. VAE 归位 ----
-        res_back = self.te_vae_swap_back()
-        swap_back_s = res_back["elapsed_s"]
+        out, enc_stats = self.te._encode_tokens(prompt, ref_items, mode=mode)
+        audit = self.te._refresh()
+        if audit["model_device"] != "cuda:0":
+            raise RuntimeError("encode 期间 TE 权重被移出显存: %s"
+                               % audit["model_device"])
 
         total_s = time.perf_counter() - t_all
         result = {
@@ -1034,15 +1021,12 @@ class Runtime:
             "qwen_hw": qwen_sizes,
             "tokenize_s": enc_stats.get("tokenize_s"),
             "encode_s": enc_stats.get("encode_s"),
-            "swap_out_s": swap_out_s,
-            "swap_back_s": swap_back_s,
             "total_s": round(total_s, 3),
-            "swaps": self.te_swaps,
+            "audit": audit,
         }
-        print("[encode] %d tokens | %d 图 | mode=%s | encode=%.2fs swap_out=%.2fs "
-              "swap_back=%.2fs total=%.2fs"
+        print("[encode] %d tokens | %d 图 | mode=%s | encode=%.2fs total=%.2fs"
               % (stats["n_tokens"], len(qwen_sizes), mode,
-                 stats["encode_s"], swap_out_s, swap_back_s, total_s), flush=True)
+                 stats["encode_s"], total_s), flush=True)
         self._vram_ledger("encode后", torch)
         return result, stats
 

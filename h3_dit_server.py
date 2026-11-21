@@ -1,4 +1,4 @@
-"""入口 B（远程）：H3 DiT 生成服务 + WebUI（连续生成，模型常驻）。
+"""入口 B（远程）：H3 DiT 空壳服务 + WebUI（权重与推理由 API 控制）。
 
 用法（远程 python_embeded）：
   python h3_dit_server.py [--port 8190] [--defaults-file paths.json] [--out-dir outputs]
@@ -69,15 +69,34 @@ def parse_args(argv=None):
             if not isinstance(config["models"], dict):
                 raise ValueError("models must be a JSON object")
             known = {"dit", "vae.video", "vae.audio", "te", "veda.bundle"}
+            allowed = {"path", "kind", "proj", "mmproj", "options"}
             for model, recipe in config["models"].items():
                 if model not in known or not isinstance(recipe, dict):
                     raise ValueError("invalid model recipe: %s" % model)
+                unknown = sorted(set(recipe) - allowed)
+                if unknown:
+                    raise ValueError("%s has unknown keys: %s"
+                                     % (model, ", ".join(unknown)))
                 for key in ("path", "mmproj"):
                     value = recipe.get(key)
                     if value is not None:
                         if not isinstance(value, str) or not value:
                             raise ValueError("%s.%s must be a nonempty path" % (model, key))
                         recipe[key] = os.path.abspath(value)
+                # TE 的 proj 可以是 models/clip_projections 下的文件名；
+                # 只有绝对路径才规范化为绝对路径。
+                proj = recipe.get("proj")
+                if proj is not None:
+                    if not isinstance(proj, str) or not proj:
+                        raise ValueError("%s.proj must be a nonempty string" % model)
+                    if os.path.isabs(proj):
+                        recipe["proj"] = os.path.abspath(proj)
+                kind = recipe.get("kind")
+                if kind is not None and (not isinstance(kind, str) or not kind):
+                    raise ValueError("%s.kind must be a nonempty string" % model)
+                options = recipe.get("options")
+                if options is not None and not isinstance(options, dict):
+                    raise ValueError("%s.options must be a JSON object" % model)
             args.model_recipes = config["models"]
         except (OSError, ValueError) as exc:
             ap.error("invalid --defaults-file: %s" % exc)
