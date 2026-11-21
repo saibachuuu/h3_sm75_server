@@ -57,6 +57,7 @@ class Runtime:
         self.te_proj = None         # ClipProj 包装后的 4B 编码器（--te-4b + --te-proj）
         self.te_load_s = 0.0
         self.te_swaps = 0           # 已发生的 VAE↔TE 交换次数
+        self._te_step_state = {}    # 原子化 TE encode 状态机
 
     # ---------- 阶段上报 ----------
     def set_stage(self, name):
@@ -585,46 +586,101 @@ class Runtime:
               flush=True)
         return freed
 
-    def encode_condition(self, prompt, image_bytes_list=None, mode="ref2va",
-                         width=640, height=960, ref_image_size="match"):
-        """VAE 让位 -> TE 上卡算 condition -> TE 退回 RAM -> VAE 归位。
+    # ============================================================
+    # 文本编码器（TE）原子化操作：VAE 让位 / TE 上卡 / TE 退回 / VAE 归位
+    # 这些操作可逐个步骤通过 HTTP API 触发，便于远程高密度 GPU 下调试。
+    # ============================================================
 
-        串行独占：调用方须保证没有并发的生成任务（DiT 正在跑时不要调）。
-        返回 (dict 含 cond/minimax_token_tags, stats)。
-        """
-        import gc
+    def _te_model(self):
+        """返回当前可用的 TE 模型对象（te_proj 优先；GGUF 路径次之）。"""
+        if self.te_proj is not None:
+            return self.te_proj
+        if self.text_encoder is not None:
+            return self.text_encoder
+        return None
+
+    def te_vae_swap_out(self):
+        """VAE 让位到 CPU，给 TE 腾显存。返回 {"freed_gb", "elapsed_s"}。"""
+        import torch
+        self.set_stage("TE: VAE 让位")
+        t0 = time.perf_counter()
+        freed = self._vae_to(torch.device("cpu"), torch, "为 TE 让位")
+        elapsed = time.perf_counter() - t0
+        return {"freed_gb": round(freed, 3), "elapsed_s": round(elapsed, 3)}
+
+    def te_vae_swap_back(self):
+        """VAE 归位到 GPU。返回 {"elapsed_s"}。"""
+        import torch
+        self.set_stage("TE: VAE 归位")
+        t0 = time.perf_counter()
+        self._vae_to(torch.device("cuda:0"), torch, "TE 用完，归位")
+        elapsed = time.perf_counter() - t0
+        self.te_swaps += 1
+        return {"elapsed_s": round(elapsed, 3)}
+
+    def te_load_to_vram(self):
+        """把 TE 权重从 RAM 搬到 VRAM（不推理）。返回 {"elapsed_s", "device", "alloc_gb"}。"""
+        import torch
+        pc = self._te_model()
+        if pc is None:
+            raise RuntimeError("TE 未加载：启动需 --te-4b/--te-proj 或 --te-gguf（且加载不能失败）")
+        self.set_stage("TE: 权重 RAM -> VRAM（不推理）")
+        t0 = time.perf_counter()
+        before = torch.cuda.memory_allocated() / 1e9
+        try:
+            pc.patcher.model.to(torch.device("cuda:0"))
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print("[te] 加载到 VRAM 失败: %s: %s" % (type(e).__name__, e), flush=True)
+            raise
+        after = torch.cuda.memory_allocated() / 1e9
+        elapsed = time.perf_counter() - t0
+        print("[te] 权重 RAM -> VRAM 耗时 %.3fs | VRAM alloc %.2f -> %.2f GB" %
+              (elapsed, before, after), flush=True)
+        self._vram_ledger("TE上卡", torch)
+        return {
+            "elapsed_s": round(elapsed, 3),
+            "device": str(next(pc.patcher.model.parameters()).device),
+            "alloc_gb": round(after, 3),
+        }
+
+    def te_offload_to_ram(self):
+        """把 TE 权重从 VRAM 退回 RAM。返回 {"elapsed_s", "device"}。"""
+        import torch
+        pc = self._te_model()
+        if pc is None:
+            raise RuntimeError("TE 未加载")
+        self.set_stage("TE: 权重 VRAM -> RAM")
+        t0 = time.perf_counter()
+        try:
+            pc.patcher.model.to(torch.device("cpu"))
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print("[te] 退回 RAM 失败: %s: %s" % (type(e).__name__, e), flush=True)
+            raise
+        elapsed = time.perf_counter() - t0
+        print("[te] 权重 VRAM -> RAM 耗时 %.3fs" % elapsed, flush=True)
+        self._vram_ledger("TE退卡", torch)
+        return {
+            "elapsed_s": round(elapsed, 3),
+            "device": str(next(pc.patcher.model.parameters()).device),
+        }
+
+    def _te_preprocess_refs(self, image_bytes_list, mode, width, height, ref_image_size):
+        """参考图预处理：bytes -> ref_items / images（CPU 张量）。"""
         import io
-
         import numpy as np
         import torch
         from PIL import Image
-
         import comfy.utils as cu
         from common.protocol import target_frame_size
 
-        pc = self.te_proj
-        if pc is None:
-            raise RuntimeError("4B 编码器未加载：启动需 --te-4b 与 --te-proj（且加载不能失败）")
-
-        prompt = (prompt or "").strip()
-        if not prompt:
-            raise ValueError("prompt 不能为空")
         imgs = [b for b in (image_bytes_list or []) if b]
         if not (1 <= len(imgs) <= 9):
             raise ValueError("参考图须为 1–9 张")
         if mode == "fl2va" and len(imgs) != 1:
             raise ValueError("fl2va 仅支持单图")
 
-        dev = torch.device("cuda:0")
-        cpu = torch.device("cpu")
-        t_all = time.perf_counter()
-
-        # ---- 1. VAE 让位 ----
-        t0 = time.perf_counter()
-        vae_freed = self._vae_to(cpu, torch, "为 TE 让位")
-        swap_out_s = time.perf_counter() - t0
-
-        # ---- 2. 参考图预处理（CPU，尺寸按 mode 策略） ----
         qwen_sizes = []
         ref_items = []
         for b in imgs:
@@ -638,36 +694,28 @@ class Runtime:
             rz = samples.movedim(1, -1)
             qwen_sizes.append([int(rz.shape[1]), int(rz.shape[2])])
             ref_items.append({"type": "image", "data": rz})
+        return imgs, ref_items, qwen_sizes
 
-        # ---- 3. TE 上卡编码（wrapper 内部会 load_models_gpu），用完必退 ----
+    def te_encode_tokens(self, prompt, ref_items, mode="ref2va"):
+        """TE 已在 GPU 上时执行 tokenize + encode。返回 (cond_dict, stats)。"""
+        import torch
+        pc = self._te_model()
+        if pc is None:
+            raise RuntimeError("TE 未加载")
+        prompt = (prompt or "").strip()
+        if not prompt:
+            raise ValueError("prompt 不能为空")
+
         t0 = time.perf_counter()
-        err = None
-        cond_list = None
-        try:
-            if mode == "fl2va":
-                tokens = pc.tokenize(prompt, images=[ref_items[0]["data"]])
-            else:
-                tokens = pc.tokenize(prompt, minimax_ref_items=ref_items)
-            cond_list = pc.encode_from_tokens_scheduled(tokens)
-        except Exception as e:
-            err = e
-            raise
-        finally:
-            # ---- 4. TE 退回 RAM（成败都退，别把卡占死） ----
-            try:
-                pc.patcher.model.to(cpu)
-                torch.cuda.empty_cache()
-            except Exception as _e:
-                print("[swap] TE 退回 RAM 失败: %s: %s" % (type(_e).__name__, _e), flush=True)
-            if err is not None:
-                print("[encode] 失败已捕获，TE 已退回", flush=True)
+        if mode == "fl2va":
+            tokens = pc.tokenize(prompt, images=[ref_items[0]["data"]])
+        else:
+            tokens = pc.tokenize(prompt, minimax_ref_items=ref_items)
+        tokenize_s = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        cond_list = pc.encode_from_tokens_scheduled(tokens)
         encode_s = time.perf_counter() - t0
-
-        # ---- 5. VAE 归位 ----
-        t0 = time.perf_counter()
-        self._vae_to(dev, torch, "TE 用完，归位")
-        swap_back_s = time.perf_counter() - t0
-        self.te_swaps += 1
 
         tensor, values = cond_list[0][0], cond_list[0][1]
         tags = values.get("minimax_token_tags")
@@ -678,22 +726,208 @@ class Runtime:
         stats = {
             "n_tokens": int(tensor.shape[1]),
             "cond_shape": list(tensor.shape),
-            "n_images": len(imgs),
+            "tokenize_s": round(tokenize_s, 3),
+            "encode_s": round(encode_s, 3),
+        }
+        print("[te] encode %d tokens | mode=%s | tokenize=%.2fs encode=%.2fs" %
+              (stats["n_tokens"], mode, tokenize_s, encode_s), flush=True)
+        self._vram_ledger("TE编码后", torch)
+        return out, stats
+
+    def te_step(self, action, payload=None):
+        """原子化 TE 步骤状态机。返回 {"ok", "action", "result", "state"}。
+
+        action 取值：
+          vae_swap_out : VAE -> CPU
+          te_load_vram : TE RAM -> VRAM（不推理）
+          te_offload_ram : TE VRAM -> RAM
+          preprocess   : 参考图预处理（CPU）
+          te_encode    : TE 推理（需先 te_load_vram + preprocess）
+          vae_swap_back: VAE -> GPU
+          reset        : 重置状态机并恢复 VAE/TE 位置
+        """
+        import torch
+        payload = payload or {}
+        state = self._te_step_state
+
+        def _set(step, **kwargs):
+            state["step"] = step
+            state["last_action"] = action
+            state["last_at"] = time.time()
+            state.update(kwargs)
+
+        # reset 总是可用
+        if action == "reset":
+            try:
+                self._vae_to(torch.device("cuda:0"), torch, "状态机 reset：VAE 归位")
+            except Exception as e:
+                print("[te] reset VAE 归位失败: %s" % e, flush=True)
+            try:
+                pc = self._te_model()
+                if pc is not None:
+                    pc.patcher.model.to(torch.device("cpu"))
+                    torch.cuda.empty_cache()
+            except Exception as e:
+                print("[te] reset TE 退回失败: %s" % e, flush=True)
+            self._te_step_state = {}
+            return {"ok": True, "action": action, "state": {}}
+
+        if action == "vae_swap_out":
+            res = self.te_vae_swap_out()
+            _set("vae_swapped_out", vae_freed_gb=res["freed_gb"], elapsed=res["elapsed_s"])
+            return {"ok": True, "action": action, "result": res, "state": state}
+
+        if action == "te_load_vram":
+            res = self.te_load_to_vram()
+            _set("te_on_vram", device=res["device"], alloc_gb=res["alloc_gb"], elapsed=res["elapsed_s"])
+            return {"ok": True, "action": action, "result": res, "state": state}
+
+        if action == "te_offload_ram":
+            res = self.te_offload_to_ram()
+            _set("te_on_ram", device=res["device"], elapsed=res["elapsed_s"])
+            return {"ok": True, "action": action, "result": res, "state": state}
+
+        if action == "preprocess":
+            mode = payload.get("mode", "ref2va")
+            width = int(payload.get("width", 640))
+            height = int(payload.get("height", 960))
+            ref_image_size = payload.get("ref_image_size", "match")
+            image_bytes = payload.get("image_bytes_list", [])
+            imgs, ref_items, qwen_sizes = self._te_preprocess_refs(
+                image_bytes, mode, width, height, ref_image_size)
+            state["preprocessed"] = {
+                "imgs": imgs,
+                "ref_items": ref_items,
+                "qwen_sizes": qwen_sizes,
+                "mode": mode,
+                "width": width,
+                "height": height,
+                "ref_image_size": ref_image_size,
+            }
+            _set("preprocessed", n_images=len(imgs), qwen_hw=qwen_sizes)
+            return {"ok": True, "action": action, "result": {
+                "n_images": len(imgs), "qwen_hw": qwen_sizes}, "state": state}
+
+        if action == "te_encode":
+            if "preprocessed" not in state:
+                # 允许在单步里传图并预处理
+                mode = payload.get("mode", "ref2va")
+                width = int(payload.get("width", 640))
+                height = int(payload.get("height", 960))
+                ref_image_size = payload.get("ref_image_size", "match")
+                image_bytes = payload.get("image_bytes_list", [])
+                imgs, ref_items, qwen_sizes = self._te_preprocess_refs(
+                    image_bytes, mode, width, height, ref_image_size)
+            else:
+                p = state["preprocessed"]
+                ref_items = p["ref_items"]
+                qwen_sizes = p["qwen_sizes"]
+                mode = p["mode"]
+
+            prompt = payload.get("prompt", "")
+            out, enc_stats = self.te_encode_tokens(prompt, ref_items, mode=mode)
+            # 兼容 te_encode_tokens 的命名
+            result = {
+                "cond_shape": enc_stats["cond_shape"],
+                "n_tokens": enc_stats["n_tokens"],
+                "n_images": len(qwen_sizes),
+                "mode": mode,
+                "qwen_hw": qwen_sizes,
+                "tokenize_s": enc_stats.get("tokenize_s"),
+                "encode_s": enc_stats.get("encode_s"),
+            }
+            _set("encoded", **result)
+            out_dict = {
+                "cond": out["cond"],
+                "minimax_token_tags": out.get("minimax_token_tags"),
+            }
+            state["last_cond"] = out_dict
+            return {"ok": True, "action": action, "result": result, "state": state, "cond": out_dict}
+
+        if action == "vae_swap_back":
+            res = self.te_vae_swap_back()
+            _set("vae_swapped_back", elapsed=res["elapsed_s"], swaps=self.te_swaps)
+            return {"ok": True, "action": action, "result": res, "state": state}
+
+        raise ValueError("未知 action: %s" % action)
+
+    def te_state(self):
+        """返回当前 TE 状态机快照（含 TE 模型当前 device、VRAM）。"""
+        import torch
+        state = dict(self._te_step_state)
+        pc = self._te_model()
+        if pc is not None:
+            try:
+                state["te_device"] = str(next(pc.patcher.model.parameters()).device)
+            except Exception:
+                state["te_device"] = None
+        else:
+            state["te_device"] = None
+        try:
+            state["vram_alloc_gb"] = round(torch.cuda.memory_allocated() / 1e9, 3)
+            state["vram_reserved_gb"] = round(torch.cuda.memory_reserved() / 1e9, 3)
+            free, total = torch.cuda.mem_get_info()
+            state["vram_free_gb"] = round(free / 1e9, 3)
+            state["vram_total_gb"] = round(total / 1e9, 3)
+        except Exception:
+            pass
+        return state
+
+    def encode_condition(self, prompt, image_bytes_list=None, mode="ref2va",
+                         width=640, height=960, ref_image_size="match"):
+        """VAE 让位 -> TE 上卡算 condition -> TE 退回 RAM -> VAE 归位（完整封装）。
+
+        串行独占：调用方须保证没有并发的生成任务（DiT 正在跑时不要调）。
+        返回 (dict 含 cond/minimax_token_tags, stats)。
+        """
+        import torch
+        t_all = time.perf_counter()
+
+        # ---- 1. VAE 让位 ----
+        res_out = self.te_vae_swap_out()
+        swap_out_s = res_out["elapsed_s"]
+
+        # ---- 2. 参考图预处理（CPU） ----
+        _, ref_items, qwen_sizes = self._te_preprocess_refs(
+            image_bytes_list, mode, width, height, ref_image_size)
+
+        # ---- 3. TE 上卡（不推理，只搬权重）----
+        self.te_load_to_vram()
+
+        # ---- 4. TE 编码 ----
+        out, enc_stats = self.te_encode_tokens(prompt, ref_items, mode=mode)
+
+        # ---- 5. TE 退回 RAM ----
+        self.te_offload_to_ram()
+
+        # ---- 6. VAE 归位 ----
+        res_back = self.te_vae_swap_back()
+        swap_back_s = res_back["elapsed_s"]
+
+        total_s = time.perf_counter() - t_all
+        result = {
+            "cond": out["cond"],
+            "minimax_token_tags": out["minimax_token_tags"],
+        }
+        stats = {
+            "n_tokens": enc_stats["n_tokens"],
+            "cond_shape": enc_stats["cond_shape"],
+            "n_images": len(qwen_sizes),
             "mode": mode,
             "qwen_hw": qwen_sizes,
-            "encode_s": round(encode_s, 3),
-            "swap_out_s": round(swap_out_s, 3),
-            "swap_back_s": round(swap_back_s, 3),
-            "total_s": round(time.perf_counter() - t_all, 3),
-            "vae_freed_gb": round(vae_freed, 3),
+            "tokenize_s": enc_stats.get("tokenize_s"),
+            "encode_s": enc_stats.get("encode_s"),
+            "swap_out_s": swap_out_s,
+            "swap_back_s": swap_back_s,
+            "total_s": round(total_s, 3),
             "swaps": self.te_swaps,
         }
         print("[encode] %d tokens | %d 图 | mode=%s | encode=%.2fs swap_out=%.2fs "
               "swap_back=%.2fs total=%.2fs"
-              % (stats["n_tokens"], len(imgs), mode, encode_s, swap_out_s, swap_back_s,
-                 stats["total_s"]), flush=True)
+              % (stats["n_tokens"], len(qwen_sizes), mode,
+                 stats["encode_s"], swap_out_s, swap_back_s, total_s), flush=True)
         self._vram_ledger("encode后", torch)
-        return out, stats
+        return result, stats
 
 
 def _build_video_vae(comfy, vsd, vmd, device, torch):
