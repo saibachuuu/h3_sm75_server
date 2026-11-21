@@ -89,11 +89,13 @@ class StubH3(nn.Module):
                                           device=device, dtype=dtype)
         self.video_patch_proj = op.Linear(8, hidden_size, bias=False,
                                           device=device, dtype=dtype)
+        # 故意不用 device：模拟真实 minimax/model.py:503/:508
+        # （torch.empty(dtype=float32) 无 device），骨架必须靠 device 上下文兜底
         self.register_buffer("adaln_t_table",
-                             torch.empty(8, time_embed_dim, device=device))
+                             torch.empty(8, time_embed_dim))
         self.rope = nn.Module()
         self.rope.register_buffer("inv_freq",
-                                  torch.empty(rope_inv_freq_len, device=device))
+                                  torch.empty(rope_inv_freq_len))
 
 
 class StubDetection:
@@ -168,6 +170,9 @@ def t_detect_and_skeleton_meta():
     inv = W.storage_inventory(model, owner="dit").to_summary()
     assert inv["total_cpu"] == 0 and inv["total_cuda"] == 0, inv
     assert inv["meta_tensors"] > 0, inv
+    # 无 device 分配必须也被兜到 meta（stub 故意复现真实 bug）
+    assert model.get_buffer("adaln_t_table").is_meta, "adaln_t_table leaked to CPU"
+    assert model.rope.get_buffer("inv_freq").is_meta, "inv_freq leaked to CPU"
     return "meta skeleton, %d meta tensors" % inv["meta_tensors"]
 
 
@@ -217,8 +222,27 @@ def t_strict_bind_and_audit():
         a.materialize_unit(model, uid, bad, device="cpu")
     except Exception as e:
         assert "strict" in str(e).lower() or "missing" in str(e).lower(), e
-        return "bind ok, strict refuses missing"
-    raise AssertionError("missing key accepted")
+    else:
+        raise AssertionError("missing key accepted")
+    # 跨 unit 多余 key 必须拒（不得静默忽略）
+    other_key = next(iter(cat.units["dit.blocks.1"].checkpoint_keys))
+    mixed = dict(sub)
+    mixed[other_key] = torch.randn(4)
+    try:
+        a.materialize_unit(model, uid, mixed, device="cpu")
+    except Exception as e:
+        assert "unconsumed" in str(e).lower(), e
+    else:
+        raise AssertionError("cross-unit extra key accepted")
+    # expected_keys 精确钉死：多/少都拒
+    try:
+        a.materialize_unit(model, uid, sub, device="cpu",
+                           expected_keys=list(sub.keys()) + ["dit.blocks.0.EXTRA"])
+    except Exception as e:
+        assert "mismatch" in str(e).lower(), e
+    else:
+        raise AssertionError("expected_keys extra accepted")
+    return "bind ok, strict refuses missing"
 
 
 def t_purge_keeps_slots():
@@ -282,6 +306,32 @@ def t_no_comfy_gives_clear_error():
     raise AssertionError("no error without comfy")
 
 
+def t_noncompute_short_circuit():
+    a = _adapter()
+    shapes = _shapes()
+    header = {k: {"dtype": "F32", "shape": list(v)} for k, v in shapes.items()}
+    header["adaln_basis"] = {"dtype": "F32", "shape": [8, 32]}
+    header["adaln_mean"] = {"dtype": "F32", "shape": [8, 32]}
+    cat = W.build_catalog_from_header("dit", header, "dit",
+                                      noncompute_exact=["adaln_basis", "adaln_mean"],
+                                      noncompute_reason="test")
+    assert "adaln_basis" not in cat.key_to_unit
+    assert cat.noncompute_keys == ("adaln_basis", "adaln_mean"), cat.noncompute_keys
+    _, _, model = _env()
+    n_params_before = sum(1 for _ in model.parameters())
+    rep = a.materialize_unit(model, "dit.modules.adaln_basis",
+                             {"adaln_basis": torch.zeros(8, 32)}, device="cpu")
+    assert rep.get("noncompute") is True, rep
+    n_params_after = sum(1 for _ in model.parameters())
+    assert n_params_before == n_params_after, "noncompute touched model"
+    audit = a.audit_after_bind(cat, model, "dit.blocks.0",
+                               {"bound_keys": [], "waived": [],
+                                "noncompute": True, "device": "cpu"},
+                               expect_loaded=False)
+    assert audit["verdict"] == "ok", audit
+    return "waived-only never materialized"
+
+
 print("== _selftest_h3_adapter ==")
 check("shape proxy mapping", t_shape_proxy)
 check("quant config version gate", t_quant_config_gate)
@@ -289,6 +339,7 @@ check("detect + meta skeleton zero storage", t_detect_and_skeleton_meta)
 check("unit holders + waived", t_holders_and_waived)
 check("strict bind + audit; missing refused", t_strict_bind_and_audit)
 check("purge keeps slots, zero storage", t_purge_keeps_slots)
+check("waived-only short-circuit", t_noncompute_short_circuit)
 check("registry lock concurrency", t_registry_lock_smoke)
 check("no-comfy clear error", t_no_comfy_gives_clear_error)
 

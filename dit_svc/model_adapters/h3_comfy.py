@@ -172,7 +172,12 @@ class H3ComfyAdapter(ModelAdapter):
             operations = ops_mod.disable_weight_init
         cfg = dict(unet_config)
         try:
-            model = model_cls(**cfg, device=device, operations=operations, dtype=dtype)
+            # 真实 MiniMaxH3Model 内部有无 device 分配（adaln_t_table /
+            # rope.inv_freq 用 torch.empty(dtype=float32)），构造参数 device
+            # 覆盖不到它们；用 torch.device 上下文兜底，保证骨架零真实 storage。
+            with torch_mod.device(device):
+                model = model_cls(**cfg, device=device, operations=operations,
+                                  dtype=dtype)
         except Exception as e:
             raise AdapterError("skeleton construct failed: %s: %s"
                                % (type(e).__name__, e),
@@ -224,19 +229,57 @@ class H3ComfyAdapter(ModelAdapter):
     # -- 选择性物化：只读所选 unit keys，未选不动 --
     def materialize_unit(self, model: Any, unit_id: str,
                          key_tensors: Mapping[str, Any],
-                         device: str = "cpu") -> Dict[str, Any]:
+                         device: str = "cpu",
+                         expected_keys: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         """把该 unit 的 checkpoint keys 精确绑定进骨架（strict=True）。
 
-        key_tensors: {checkpoint全key: tensor}，必须恰为该 unit 所需
-        （waived 除外）；多读/漏读直接拒绝。未选 unit 的模块保持 meta/None。
+        key_tensors: {checkpoint全key: tensor}。任何未被任一 holder 消费、
+        也未被显式 waive 的 key 直接拒绝（防跨 unit 多读静默忽略）。
+        expected_keys: 调用方按 catalog 传入的该 unit 全 key 集；传入时做
+        集合精确校验（多/少都拒）。未选 unit 的模块保持 meta/None。
+        waived-only 请求（全 key 被 waive、无 holder 可绑）返回 noncompute
+        报告，不触模型、不读权重体、不计驻留。
         返回绑定报告（含 waived、per-layer quant format 日志）。
         """
         torch_mod = _need("torch", self.torch)
         model_id = unit_id.split(".")[0]
+        waived_pre = sorted(k for k in key_tensors
+                            if k.split(".")[-1] in WAIVED_KEYS or k in WAIVED_KEYS)
+        if waived_pre and len(waived_pre) == len(key_tensors):
+            return {"unit": unit_id, "bound_keys": [], "waived": waived_pre,
+                    "quant_formats": {}, "device": device, "noncompute": True}
+        if expected_keys is not None:
+            exp, got = set(expected_keys), set(key_tensors.keys())
+            if exp != got:
+                raise AdapterError(
+                    "key set mismatch for %r: missing=%r extra=%r"
+                    % (unit_id, sorted(exp - got), sorted(got - exp)),
+                    details={"unit": unit_id, "missing": sorted(exp - got),
+                             "extra": sorted(got - exp)})
         bound: List[str] = []
-        waived: List[str] = []
+        waived: List[str] = list(waived_pre)
         quant_formats: Dict[str, str] = {}
-        for holder_path, kind in self.unit_holders(unit_id, model_id):
+        holders = self.unit_holders(unit_id, model_id)
+        # 预检：每个 key 必须被某 holder 消费或被显式 waive；
+        # 跨 unit 多余 key 在此拒绝，不等绑定污染模型。
+        def _covered(k: str) -> bool:
+            if k.split(".")[-1] in WAIVED_KEYS or k in WAIVED_KEYS:
+                return True
+            for hp, kind in holders:
+                if kind.startswith("buffer:"):
+                    if k == kind.split(":", 1)[1]:
+                        return True
+                elif k == hp or k.startswith(hp + "."):
+                    return True
+            return False
+        uncovered = sorted(k for k in key_tensors.keys() if not _covered(k))
+        if uncovered:
+            raise AdapterError(
+                "unconsumed keys for %r (cross-unit extra?): %r"
+                % (unit_id, uncovered),
+                recovery=["只传该 unit 的 keys；跨 unit key 必须走各自 unit 绑定"],
+                details={"unit": unit_id, "unconsumed": uncovered})
+        for holder_path, kind in holders:
             if kind.startswith("buffer:"):
                 name = kind.split(":", 1)[1]
                 full = name  # 顶层 buffer key 即名
@@ -309,6 +352,14 @@ class H3ComfyAdapter(ModelAdapter):
             for k, v in sub.items():
                 if k.endswith("comfy_quant"):
                     quant_formats[k] = self._read_quant_format(v)
+        consumed = set(bound) | set(waived)
+        unconsumed = sorted(k for k in key_tensors.keys() if k not in consumed)
+        if unconsumed:
+            raise AdapterError(
+                "unconsumed keys for %r (cross-unit extra?): %r"
+                % (unit_id, unconsumed),
+                recovery=["只传该 unit 的 keys；跨 unit key 必须走各自 unit 绑定"],
+                details={"unit": unit_id, "unconsumed": unconsumed})
         return {"unit": unit_id, "bound_keys": sorted(bound),
                 "waived": sorted(waived), "quant_formats": quant_formats,
                 "device": device}
@@ -411,6 +462,15 @@ class H3ComfyAdapter(ModelAdapter):
                          expect_loaded: bool = True) -> Dict[str, Any]:
         """绑定后交叉自证：catalog × 真实绑定记录 × 物理 inventory。"""
         from ..weights import audit_unit, storage_inventory
+        if bind_report.get("noncompute"):
+            # waived-only：无 holder、无 storage、不在 catalog units；
+            # 其“永不驻留”由 catalog 分类（noncompute_keys）+ probe 只读
+            # catalog keys 保证，此处只确认报告自洽。
+            verdict = "ok" if not expect_loaded else "NONCOMPUTE_LOADED"
+            return {"unit": unit_id, "noncompute": True,
+                    "reason": "waived-only keys; no holder, never materialized",
+                    "waived": list(bind_report.get("waived", [])),
+                    "expect_loaded": expect_loaded, "verdict": verdict}
         bound = list(bind_report.get("bound_keys", []))
         waived = list(bind_report.get("waived", []))
         inv = storage_inventory(self.resident_tensors(model, unit_id),

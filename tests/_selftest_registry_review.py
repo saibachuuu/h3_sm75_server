@@ -342,6 +342,68 @@ def t_header_rejects_bad_inputs():
     return "header validation matrix ok"
 
 
+def t_signature_covers_shape_dtype():
+    h = fake_header()
+    reg = reg_with(h)
+    reg.set_unit_loaded("dit", "dit.blocks.0", "cpu", resident_bytes_cpu=4,
+                        resident_bytes_cuda=0)
+    # 同 key 集、某 key shape 变大：签名变，驻留时换 catalog 必须拒
+    h2 = {k: dict(v) for k, v in h.items()}
+    k0 = "blocks.0.attn.qkv.weight"
+    h2[k0] = {"dtype": "F32", "shape": [512, 256]}
+    cat2 = W.build_catalog_from_header("dit", h2, "dit",
+                                       ignored_exact=["__weird_tmp"])
+    assert reg._catalog_signature(cat2) != reg._catalog_signature(
+        reg.catalogs["dit"])
+    try:
+        reg.attach_catalog(cat2)
+    except W.CatalogError:
+        pass
+    else:
+        raise AssertionError("same-keys-different-shape accepted while resident")
+    # dtype 变但字节相同（F32[4] vs I8[16]）：签名也必须变
+    h3 = {k: dict(v) for k, v in h.items()}
+    h3[k0] = {"dtype": "I8", "shape": [16]}
+    cat3 = W.build_catalog_from_header("dit", h3, "dit",
+                                       ignored_exact=["__weird_tmp"])
+    assert reg._catalog_signature(cat3) != reg._catalog_signature(
+        reg.catalogs["dit"])
+    return "signature pins dtype+shape"
+
+
+def t_audit_rejects_meta_missing():
+    h = fake_header()
+    reg = reg_with({k: v for k, v in h.items() if k != "__weird_tmp"})
+    uids = [u for u in reg.catalogs["dit"].unit_ids()
+            if u.startswith("dit.blocks")]
+    uid = uids[0]
+    inv = W.StorageInventory()
+    bound = list(reg.catalogs["dit"].units[uid].checkpoint_keys)
+    audit = W.audit_unit(reg.catalogs["dit"], uid, bound, inv, expect_loaded=True)
+    assert audit["verdict"] == "META_MISSING", audit
+    # 零 expected 的退化 unit 不误伤：expected==0 且 resident==0 应 ok
+    return "meta-missing refused: %s" % audit["verdict"]
+
+
+def t_noncompute_catalog():
+    h = dict(fake_header())
+    h["adaln_basis"] = {"dtype": "F32", "shape": [4]}
+    cat = W.build_catalog_from_header("dit", h, "dit",
+                                      ignored_exact=["__weird_tmp"],
+                                      noncompute_exact=["adaln_basis"],
+                                      noncompute_reason="reason-x")
+    cat.check_cover(list(h.keys()))
+    assert "adaln_basis" not in cat.key_to_unit
+    assert cat.noncompute_keys == ("adaln_basis",)
+    inv = W.StorageInventory()
+    audit = W.audit_unit(cat, "adaln_basis", [], inv, expect_loaded=False)
+    assert audit["verdict"] == "ok" and audit.get("noncompute") is True, audit
+    bad = W.audit_unit(cat, "adaln_basis", ["adaln_basis"], inv,
+                       expect_loaded=False)
+    assert bad["verdict"] == "NONCOMPUTE_LOADED", bad
+    return "noncompute classified with reason"
+
+
 print("== _selftest_registry_review ==")
 check("same_source gates kind/options/version", t_same_source_kind_options_version)
 check("recipe switch clears catalog, gen monotonic", t_recipe_switch_clears_catalog_monotonic)
@@ -353,6 +415,9 @@ check("recover needs measured proof", t_recover_needs_measured_proof)
 check("deepcopy isolation", t_deepcopy_isolation)
 check("snapshot revision/counts/bytes", t_snapshot_revision_counts_bytes)
 check("header rejects bad inputs", t_header_rejects_bad_inputs)
+check("signature pins dtype+shape", t_signature_covers_shape_dtype)
+check("audit refuses meta-missing", t_audit_rejects_meta_missing)
+check("noncompute catalog", t_noncompute_catalog)
 
 print()
 if fails:

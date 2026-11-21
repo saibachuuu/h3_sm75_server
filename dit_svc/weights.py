@@ -310,6 +310,8 @@ class UnitInfo:
     factory: str = "rule-generic-v0"
     capabilities: Dict[str, Any] = field(default_factory=dict)
     shared_group: Optional[str] = None  # 同 storage 所有权组（不可分拆时同名）
+    # 每 key (key, dtype, shape)：签名与审计用，防“同 key 集不同 shape”偷换
+    key_meta: Tuple[Tuple[str, str, Tuple[int, ...]], ...] = ()
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -320,6 +322,7 @@ class UnitInfo:
             "factory": self.factory,
             "capabilities": dict(self.capabilities),
             "shared_group": self.shared_group,
+            "key_meta": [[k, d, list(s)] for k, d, s in self.key_meta],
         }
 
 
@@ -327,7 +330,9 @@ class UnitCatalog:
     """完整 catalog：覆盖 header 全部带权 key（白名单忽略除外）。"""
 
     def __init__(self, model_id: str, units: Sequence[UnitInfo],
-                 ignored_keys: Sequence[str] = ()):
+                 ignored_keys: Sequence[str] = (),
+                 noncompute_keys: Sequence[str] = (),
+                 noncompute_reason: str = ""):
         self.model_id = model_id
         self.units: Dict[str, UnitInfo] = {}
         self.key_to_unit: Dict[str, str] = {}
@@ -346,6 +351,8 @@ class UnitCatalog:
             for g in u.groups:
                 self.groups.setdefault(g, []).append(u.id)
         self.ignored_keys = tuple(ignored_keys)
+        self.noncompute_keys = tuple(noncompute_keys)
+        self.noncompute_reason = noncompute_reason
 
     def unit_ids(self) -> List[str]:
         return list(self.units.keys())
@@ -365,7 +372,7 @@ class UnitCatalog:
         唯一的例外是构造时具名的 ignored_exact（精确全名、可解释），
         前缀通配不接受。
         """
-        ignored = set(self.ignored_keys)
+        ignored = set(self.ignored_keys) | set(self.noncompute_keys)
         missing = [k for k in header_keys
                    if k not in self.key_to_unit and k not in ignored]
         if missing:
@@ -380,6 +387,8 @@ class UnitCatalog:
             "units": [self.units[uid].summary() for uid in self.unit_ids()],
             "groups": {g: list(v) for g, v in self.groups.items()},
             "ignored_keys": list(self.ignored_keys),
+            "noncompute_keys": list(self.noncompute_keys),
+            "noncompute_reason": self.noncompute_reason,
         }
 
 
@@ -390,7 +399,9 @@ _LAYER_RE = re.compile(r"(?:^|[._])(?:layers?|predictor)[._-]?(\d+)(?:[._]|$)")
 def build_catalog_from_header(model_id: str,
                               header: Mapping[str, Mapping[str, Any]],
                               family: str = "dit",
-                              ignored_exact: Sequence[str] = ()) -> UnitCatalog:
+                              ignored_exact: Sequence[str] = (),
+                              noncompute_exact: Sequence[str] = (),
+                              noncompute_reason: str = "") -> UnitCatalog:
     """从 header 全量建 catalog（暂行命名规则，已按真实 H3 布局校准 key 名，
     但共享边界/VAE 独立性仍待真实张量复核）。
 
@@ -401,12 +412,20 @@ def build_catalog_from_header(model_id: str,
     独立建账，并在 docs/p0_weights.md 登记为 unknown。
     """
     ignored_set = set(ignored_exact)
+    noncompute_set = set(noncompute_exact)
+    if ignored_set & noncompute_set:
+        raise CatalogError("key in both ignored and noncompute lists",
+                           details={"overlap": sorted(ignored_set & noncompute_set)})
     buckets: Dict[str, List[str]] = {}
     unit_groups: Dict[str, Tuple[str, ...]] = {}
     ignored: List[str] = []
+    noncompute: List[str] = []
     for key in header.keys():
         if key in ignored_set:
             ignored.append(key)
+            continue
+        if key in noncompute_set:
+            noncompute.append(key)
             continue
         uid = _assign_unit(model_id, key, family)
         buckets.setdefault(uid, []).append(key)
@@ -416,14 +435,19 @@ def build_catalog_from_header(model_id: str,
     for uid in sorted(buckets.keys()):
         keys = tuple(sorted(buckets[uid]))
         total = 0
+        meta = []
         for k in keys:
             total += tensor_key_bytes(header[k]["dtype"], header[k]["shape"])
+            meta.append((k, header[k]["dtype"], tuple(header[k]["shape"])))
         groups = _groups_for(model_id, uid, family)
         units.append(UnitInfo(id=uid, checkpoint_keys=keys, expected_bytes=total,
                               groups=groups,
                               factory="rule-%s-v0-UNVERIFIED" % family,
-                              capabilities=_capabilities_for(uid, family)))
-    cat = UnitCatalog(model_id, units, ignored)
+                              capabilities=_capabilities_for(uid, family),
+                              key_meta=tuple(meta)))
+    cat = UnitCatalog(model_id, units, ignored,
+                      noncompute_keys=sorted(noncompute),
+                      noncompute_reason=noncompute_reason)
     cat.check_cover(list(header.keys()))
     return cat
 
@@ -806,9 +830,19 @@ class WeightRegistry:
         for uid in catalog.unit_ids():
             info = catalog.units[uid]
             h.update(uid.encode("utf-8"))
-            for k in info.checkpoint_keys:
+            h.update(b"\x01")
+            h.update(str(info.expected_bytes).encode("utf-8"))
+            for k, dtype, shape in info.key_meta:
                 h.update(b"\x00")
                 h.update(k.encode("utf-8"))
+                h.update(b"\x00")
+                h.update(str(dtype).encode("utf-8"))
+                h.update(b"\x00")
+                h.update(repr(tuple(shape)).encode("utf-8"))
+        h.update(b"\x02")
+        for k in catalog.noncompute_keys:
+            h.update(k.encode("utf-8"))
+            h.update(b"\x00")
         return h.hexdigest()
 
     # -- recipe / catalog --
@@ -1173,6 +1207,32 @@ def audit_unit(catalog: UnitCatalog, unit_id: str,
     expect_loaded=True 要求零缺失；=False 要求零真实 storage。
     返回可 JSON 报告；verdict != "ok" 时调用方必须 mark_error。
     """
+    if unit_id in catalog.noncompute_keys:
+        resident = inventory.total_cpu + inventory.total_cuda
+        verdict = "ok" if (not expect_loaded and resident == 0
+                           and not bound_keys) else "NONCOMPUTE_LOADED"
+        report = {
+            "unit": unit_id,
+            "noncompute": True,
+            "noncompute_reason": catalog.noncompute_reason,
+            "expect_loaded": expect_loaded,
+            "keys_expected": 0,
+            "keys_bound": len(list(bound_keys)),
+            "waived": sorted(waived),
+            "missing": [],
+            "unexpected": sorted(bound_keys),
+            "expected_bytes": 0,
+            "resident_bytes_cpu": inventory.total_cpu,
+            "resident_bytes_cuda": inventory.total_cuda,
+            "num_storages": inventory.num_storages,
+            "meta_tensors": inventory.meta_tensors,
+            "verdict": verdict,
+        }
+        json.dumps(report)
+        return report
+    if unit_id not in catalog.units:
+        raise StateError("audit unknown unit %r" % (unit_id,),
+                         details={"unit": unit_id})
     want = set(catalog.units[unit_id].checkpoint_keys) - set(waived)
     got = set(bound_keys)
     missing = sorted(want - got)
@@ -1180,7 +1240,14 @@ def audit_unit(catalog: UnitCatalog, unit_id: str,
     expected_bytes = catalog.units[unit_id].expected_bytes
     resident = inventory.total_cpu + inventory.total_cuda
     if expect_loaded:
-        verdict = "ok" if not missing and not unexpected else "MISSING_OR_UNEXPECTED"
+        if missing or unexpected:
+            verdict = "MISSING_OR_UNEXPECTED"
+        elif expected_bytes > 0 and resident == 0:
+            verdict = "META_MISSING"
+        elif expected_bytes > 0 and inventory.meta_tensors > 0:
+            verdict = "META_REMAINS"
+        else:
+            verdict = "ok"
     else:
         verdict = "ok" if resident == 0 else "STORAGE_LEAK"
     report = {

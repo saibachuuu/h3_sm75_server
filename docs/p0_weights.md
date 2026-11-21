@@ -138,15 +138,30 @@ C:\Users\88888888\AppData\Local\Temp\opencode\explicit_api_env_20261121\Scripts\
   未选无 storage、partial purge 保槽位、补回不碰兄弟 storage（data_ptr 比对）、
   CUDA 残留 purge 拒绝、全量 purge 回 absent。ALL OK。
 - 真实 header catalog 验证：§3 表格（4 checkpoint，`check_cover` 零 unmapped）。
-- `_selftest_registry_review`（主代理 m00424 审查回归）：same_source 含
-  kind/options/version、无驻留换源清旧 catalog 且 generation 单调、
-  驻留换 catalog 拒绝、未知 unit 不得当 absent 通过、四动作遇 error/mixed
-  全拒（recover 必经）、recover 必须附 adapter 实测 release_proof
-  （双零+空 digest，否则 ghost absent 拒绝）、输出深拷贝隔离、
+- `_selftest_registry_review`（主代理 m00424/m00699/m00830 审查回归）：
+  same_source 含 kind/options/version、无驻留换源清旧 catalog 且 generation
+  单调、驻留换 catalog 拒绝、未知 unit 不得当 absent 通过、四动作遇
+  error/mixed 全拒（recover 必经）、recover 必须附 adapter 实测
+  release_proof（双零+空 digest，否则 ghost absent 拒绝）、输出深拷贝隔离、
   snapshot 修订号/counts/bytes、header 检验矩阵（32MiB 界/dtype/shape/
-  offsets/EOF/重复 key）。ALL OK。
+  offsets/EOF/重复 key）、签名钉死 dtype+shape+expected（同 key 集换 shape
+  驻留拒）、audit 拒 META_MISSING/META_REMAINS、noncompute 分类。ALL OK。
+- `_selftest_probe_helpers`：parse 拒 all/空、resolve 后 unit 数+1GiB 源端
+  双预算（range 展开 50units 拒）、schema 不符 unverified+exit、staging
+  weakref 释放证明（含残留检出）、真 peak RSS、env 无 CUDA 字段。ALL OK。
 - `_selftest_h3_adapter`：stub 语义（device 透传、meta 零 storage、strict
-  关门、purge 保槽位、registry 锁并发）+ 无 Comfy 报 ComfyUnavailable。ALL OK。
+  关门、purge 保槽位、registry 锁并发）+ 无 Comfy 报 ComfyUnavailable；
+  stub 故意复现真实 bug（adaln_t_table/rope.inv_freq 无 device 分配），
+  骨架靠 `torch.device` 上下文兜底并断言两 buffer 落 meta。ALL OK。
+- probe 安全（m00830，主代理远端运行，本机只做静态+00 实测）：
+  00 仅 importlib.metadata 版本只读，零 torch.cuda.*（已本地实测）；
+  10/20 import comfy 前清 argv + 设 cpu/gpu_only，前后断言
+  `cuda.is_initialized()==False`；20/21 resolve 后双预算（≤2 units、
+  源端合计 ≤1GiB，range 展开拒）；schema 不符 verdict=unverified+exit 2；
+  20 purge 前 staging（key_tensors/sub）释放 + weakref 无残留证明；
+  报告真 CPU peak（PeakWorkingSetSize/ru_maxrss）而非 rss delta。
+  静态核实：快照内无顶层 torch.cuda 调用、无 sage/flash 引用、
+  xformers 仅 import 时加载（不执行 attention：无 forward、无 sampler）。
 - `_selftest_real_header_catalog`：按远端 header 报告复刻的布局保真合成头
   （双量化伴生键/adaln/rope/refiner/patch/final），catalog 全覆盖、
   单位划分、字节账、选择器、waived 精确忽略。ALL OK。

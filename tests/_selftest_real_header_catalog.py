@@ -16,7 +16,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
 from dit_svc import weights as W
-from dit_svc.model_adapters import WAIVED_KEYS
+from dit_svc.model_adapters import H3ComfyAdapter, WAIVED_KEYS
+
+NONCOMPUTE_REASON = (
+    "checkpoint-only keys with no forward consumer in minimax/model.py "
+    "(adaln_basis/mean); the consumed curve table is adaln_t_table. "
+    "Never materialized, never counted resident, excluded from all-load."
+)
 
 fails = []
 
@@ -71,10 +77,10 @@ def real_like_header(n_blocks=3):
 
 def t_cover_and_units():
     h = real_like_header()
-    waived = [k for k in h if k.split(".")[-1] in WAIVED_KEYS
-              or k in ("adaln_basis", "adaln_mean")]
-    assert set(waived) == {"adaln_basis", "adaln_mean"}, waived
-    cat = W.build_catalog_from_header("dit", h, "dit", ignored_exact=waived)
+    cat = W.build_catalog_from_header("dit", h, "dit",
+                                      noncompute_exact=["adaln_basis",
+                                                        "adaln_mean"],
+                                      noncompute_reason=NONCOMPUTE_REASON)
     cat.check_cover(list(h.keys()))
     ids = cat.unit_ids()
     assert "dit.refiner" in ids, ids
@@ -84,12 +90,28 @@ def t_cover_and_units():
     assert "dit.modules.rope" in ids, ids
     assert "dit.modules.final_layer" in ids, ids
     assert "dit.modules.video_patch_proj" in ids, ids
-    # waived 不得进账
-    for k in waived:
+    # noncompute：有理由、不进账、不进 unit
+    assert cat.noncompute_keys == ("adaln_basis", "adaln_mean"), cat.noncompute_keys
+    assert cat.noncompute_reason == NONCOMPUTE_REASON
+    for k in cat.noncompute_keys:
         assert k not in cat.key_to_unit, k
-    # 字节账 = 各 key 真实 dtype 字节之和
+    # 全 header key 去向唯一：unit key / noncompute / ignored
+    accounted = set(cat.key_to_unit) | set(cat.noncompute_keys) | set(cat.ignored_keys)
+    assert accounted == set(h.keys()), set(h.keys()) - accounted
+    # 每个 compute unit 都有 holder 映射（all-load 必经 materialize）
+    adapter = H3ComfyAdapter()
+    holderless = []
+    for uid in ids:
+        try:
+            holders = adapter.unit_holders(uid, "dit")
+        except Exception:
+            holderless.append(uid)
+            continue
+        assert holders, uid
+    assert not holderless, holderless
+    # 字节账 = 各 key 真实 dtype 字节之和（noncompute 不计）
     want = sum(W.tensor_key_bytes(v["dtype"], v["shape"])
-               for k, v in h.items() if k not in waived)
+               for k, v in h.items() if k not in cat.noncompute_keys)
     got = sum(cat.units[u].expected_bytes for u in ids)
     assert got == want, (got, want)
     # 选择器：整机 / 组 / 区间全可用
@@ -114,8 +136,9 @@ def t_descriptor_keys_present():
 def t_quant_companions_stay_in_block():
     h = real_like_header()
     cat = W.build_catalog_from_header("dit", h, "dit",
-                                      ignored_exact=["adaln_basis",
-                                                     "adaln_mean"])
+                                      noncompute_exact=["adaln_basis",
+                                                        "adaln_mean"],
+                                      noncompute_reason=NONCOMPUTE_REASON)
     for k in h:
         if k.startswith("blocks.1."):
             assert cat.key_to_unit[k] == "dit.blocks.1", (k, cat.key_to_unit[k])

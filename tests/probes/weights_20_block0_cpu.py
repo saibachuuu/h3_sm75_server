@@ -27,24 +27,44 @@ def main() -> int:
     t0 = C.rss_bytes()
     report: dict = {"probe": "weights_20_block0_cpu", "units": units}
 
+    # 版本 schema 门：不符不许 ok（显式 unverified + exit 2）
+    env = C.env_info(include_cuda=False)
+    try:
+        C.require_schema(env, report)
+    except SystemExit:
+        C.write_report(report, args.out, "weights_probe_20.json")
+        raise
+    report["env"] = env
+
     from dit_svc import weights as W
     from dit_svc.model_adapters import H3ComfyAdapter
 
     tensors, _ = W.read_safetensors_header(args.header)
     shapes = {k: tuple(v["shape"]) for k, v in tensors.items()}
-    cat = W.build_catalog_from_header(args.model_id, tensors, "dit")
+    cat = W.build_catalog_from_header(
+        args.model_id, tensors, "dit",
+        noncompute_exact=["adaln_basis", "adaln_mean"],
+        noncompute_reason=(
+            "checkpoint-only keys with no forward consumer in "
+            "minimax/model.py; never materialized, never counted resident."))
     cat.check_cover(list(tensors.keys()))
     resolved = W.resolve_units(cat, "units", units)
     report["resolved"] = resolved
+    # resolve 后预算（range 可能展开成全量）：unit 数 + 源端字节
+    report["budget"] = C.enforce_probe_budget(cat, resolved)
 
     from safetensors import safe_open
     with safe_open(args.header, framework="pt") as fh:
         metadata = dict(fh.metadata() or {})
 
-    sys.path.insert(0, args.comfy_root)
     import torch
+    assert torch.cuda.is_initialized() is False, "cuda already initialized"
+    report["comfy_import_guard"] = C.prepare_comfy_import(args.comfy_root,
+                                                          cpu=True)
     import comfy.model_detection as detection
     import comfy.ops as ops
+    assert torch.cuda.is_initialized() is False, "comfy import touched CUDA"
+    report["cuda_initialized_after_import"] = False
     try:
         from comfy.ldm.minimax.model import MiniMaxH3Model
     except ImportError:
@@ -73,8 +93,6 @@ def main() -> int:
     with _so(args.header, framework="pt") as fh:
         for uid in resolved:
             for k in cat.units[uid].checkpoint_keys:
-                if k in ("adaln_basis", "adaln_mean"):
-                    continue  # waived：模型不消费，不读体
                 key_tensors[k] = fh.get_tensor(k)
                 access_log.append(k)
     report["keys_read"] = len(access_log)
@@ -82,7 +100,7 @@ def main() -> int:
     # 未选大 key 零物化：access_log 必须恰为所选 keys
     want_read = set()
     for uid in resolved:
-        want_read |= set(cat.units[uid].checkpoint_keys) - {"adaln_basis", "adaln_mean"}
+        want_read |= set(cat.units[uid].checkpoint_keys)
     assert set(access_log) == want_read, "selective read violated"
 
     # 严格绑定
@@ -91,7 +109,9 @@ def main() -> int:
     for uid in resolved:
         sub = {k: v for k, v in key_tensors.items()
                if k in cat.units[uid].checkpoint_keys}
-        rep = adapter.materialize_unit(model, uid, sub, device="cpu")
+        rep = adapter.materialize_unit(
+            model, uid, sub, device="cpu",
+            expected_keys=cat.units[uid].checkpoint_keys)
         audit = adapter.audit_after_bind(cat, model, uid, rep, expect_loaded=True)
         bind_reports[uid] = {"bound": len(rep["bound_keys"]),
                              "waived": rep["waived"],
@@ -125,6 +145,14 @@ def main() -> int:
     # purge 第一个 unit（purgefromram 门卫：cpu 可 purge）
     reg.check_transition("purgefromram", args.model_id, [resolved[0]])
     adapter.purge_unit(model, resolved[0])
+    # staging 释放证明：bind 临时 dict 仍持有原权重 storage，必须先释放
+    # 并证无强引用残留，否则 purge audit 的“零残留”结论不成立
+    staged = list(key_tensors.values()) + list(sub.values())
+    del key_tensors, sub
+    proof = C.release_staging_proof(staged)
+    del staged
+    report["staging_release"] = proof
+    assert proof["alive_after_release"] == 0, proof
     audit_p = adapter.audit_after_bind(
         cat, model, resolved[0],
         {"bound_keys": [], "waived": []}, expect_loaded=False)
@@ -137,11 +165,11 @@ def main() -> int:
     with _so(args.header, framework="pt") as fh:
         sub = {}
         for k in cat.units[resolved[0]].checkpoint_keys:
-            if k in ("adaln_basis", "adaln_mean"):
-                continue
             sub[k] = fh.get_tensor(k)
     reg.check_transition("disk2ram", args.model_id, [resolved[0]])
-    rep = adapter.materialize_unit(model, resolved[0], sub, device="cpu")
+    rep = adapter.materialize_unit(
+        model, resolved[0], sub, device="cpu",
+        expected_keys=cat.units[resolved[0]].checkpoint_keys)
     audit_r = adapter.audit_after_bind(cat, model, resolved[0], rep,
                                        expect_loaded=True)
     assert audit_r["verdict"] == "ok", audit_r
@@ -158,6 +186,7 @@ def main() -> int:
 
     report["registry"] = reg.model_state(args.model_id)
     report["rss_delta_bytes"] = C.rss_bytes() - t0
+    report["cpu_peak_bytes"] = C.rss_peak_bytes()
     report["verdict"] = "ok"
     C.write_report(report, args.out, "weights_probe_20.json")
     return 0

@@ -24,6 +24,15 @@ def main() -> int:
     t0 = C.rss_bytes()
     report: dict = {"probe": "weights_10_meta_skeleton", "header": args.header}
 
+    # 版本 schema 门：不符不许 ok（显式 unverified + exit 2）
+    env = C.env_info(include_cuda=False)
+    try:
+        C.require_schema(env, report)
+    except SystemExit:
+        C.write_report(report, args.out, "weights_probe_10.json")
+        raise
+    report["env"] = env
+
     from dit_svc import weights as W
     from dit_svc.model_adapters import H3ComfyAdapter
 
@@ -40,13 +49,17 @@ def main() -> int:
         metadata = dict(fh.metadata() or {})
     report["metadata_keys"] = sorted(metadata.keys())
 
-    # 3. 注入真实 comfy 模块
+    # 3. 注入真实 comfy 模块（CPU 钳制：先清 argv 再设 cpu）
     if not args.comfy_root:
         raise SystemExit("--comfy-root required on remote")
-    sys.path.insert(0, args.comfy_root)
     import torch
+    assert torch.cuda.is_initialized() is False, "cuda already initialized"
+    report["comfy_import_guard"] = C.prepare_comfy_import(args.comfy_root,
+                                                          cpu=True)
     import comfy.model_detection as detection
     import comfy.ops as ops
+    assert torch.cuda.is_initialized() is False, "comfy import touched CUDA"
+    report["cuda_initialized_after_import"] = False
     try:
         from comfy.ldm.minimax.model import MiniMaxH3Model
     except ImportError:
@@ -61,10 +74,19 @@ def main() -> int:
     quant_config, quant_rep = adapter.quant_config_from_metadata(metadata)
     report["quant"] = quant_rep
 
-    # 4. catalog（真实 header 全覆盖）
-    cat = W.build_catalog_from_header(args.model_id, tensors, "dit")
+    # 4. catalog（真实 header 全覆盖；adaln_basis/mean 为非计算键，
+    #    minimax/model.py 无消费点，永不物化、不计驻留）
+    cat = W.build_catalog_from_header(
+        args.model_id, tensors, "dit",
+        noncompute_exact=["adaln_basis", "adaln_mean"],
+        noncompute_reason=(
+            "checkpoint-only keys with no forward consumer in "
+            "minimax/model.py (adaln_basis/mean); the consumed curve "
+            "table is adaln_t_table. Never materialized, never counted "
+            "resident, excluded from all-load."))
     cat.check_cover(list(tensors.keys()))
-    report["catalog"] = {"units": len(cat.units), "keys": len(cat.key_to_unit)}
+    report["catalog"] = {"units": len(cat.units), "keys": len(cat.key_to_unit),
+                         "noncompute": list(cat.noncompute_keys)}
 
     # 5. meta 骨架
     compute_dtype = {"bfloat16": torch.bfloat16,
@@ -86,6 +108,8 @@ def main() -> int:
                            "meta_tensors": inv["meta_tensors"],
                            "num_tensors_seen": inv["num_tensors_seen"]}
     assert inv["total_cpu"] == 0 and inv["total_cuda"] == 0, inv
+    assert model.get_buffer("adaln_t_table").is_meta, "adaln_t_table CPU leak"
+    assert model.rope.get_buffer("inv_freq").is_meta, "inv_freq CPU leak"
 
     # 7. registry 快照
     reg = W.WeightRegistry()
@@ -94,6 +118,7 @@ def main() -> int:
     reg.attach_catalog(cat)
     report["registry"] = reg.model_state(args.model_id)
     report["rss_delta_bytes"] = C.rss_bytes() - t0
+    report["cpu_peak_bytes"] = C.rss_peak_bytes()
     report["verdict"] = "ok"
     C.write_report(report, args.out, "weights_probe_10.json")
     return 0

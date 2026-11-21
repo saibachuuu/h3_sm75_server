@@ -32,8 +32,15 @@ def main() -> int:
     from dit_svc import weights as W
     tensors, _ = W.read_safetensors_header(args.header)
     shapes = {k: tuple(v["shape"]) for k, v in tensors.items()}
-    cat = W.build_catalog_from_header(args.model_id, tensors, "dit")
+    cat = W.build_catalog_from_header(
+        args.model_id, tensors, "dit",
+        noncompute_exact=["adaln_basis", "adaln_mean"],
+        noncompute_reason=(
+            "checkpoint-only keys with no forward consumer in "
+            "minimax/model.py; never materialized, never counted resident."))
     resolved = W.resolve_units(cat, "units", units)
+    # resolve 后预算（range 可能展开成全量）：unit 数 + 源端字节
+    report["budget"] = C.enforce_probe_budget(cat, resolved)
     want = cat.expected_bytes_of(resolved)
     estimate = {"expected_resident_bytes": want,
                 "expected_peak_gpu_bytes": want + (1 << 30),
@@ -46,12 +53,22 @@ def main() -> int:
     t0 = C.rss_bytes()
     report: dict = {"probe": "weights_21_block0_cuda", "units": units,
                     "estimate": estimate}
+    # 版本 schema 门：不符不许 ok（显式 unverified + exit 2）
+    env = C.env_info(include_cuda=False)
+    try:
+        C.require_schema(env, report)
+    except SystemExit:
+        C.write_report(report, args.out, "weights_probe_21.json")
+        raise
+    report["env"] = env
     from dit_svc.model_adapters import H3ComfyAdapter
     from safetensors import safe_open
     with safe_open(args.header, framework="pt") as fh:
         metadata = dict(fh.metadata() or {})
 
     sys.path.insert(0, args.comfy_root)
+    prog = sys.argv[0] if sys.argv else "probe"
+    sys.argv = [prog]  # 防 comfy.cli_args 误读 probe 参数（21 需 CUDA，不设 cpu）
     import torch
     assert torch.cuda.is_available(), "cuda not available"
     import comfy.model_detection as detection
@@ -81,14 +98,14 @@ def main() -> int:
         sub = {}
         for uid in resolved:
             for k in cat.units[uid].checkpoint_keys:
-                if k in ("adaln_basis", "adaln_mean"):
-                    continue
                 sub[k] = fh.get_tensor(k)
     reg.check_transition("disk2ram", args.model_id, resolved)
     for uid in resolved:
         one = {k: v for k, v in sub.items()
                if k in cat.units[uid].checkpoint_keys}
-        rep = adapter.materialize_unit(model, uid, one, device="cpu")
+        rep = adapter.materialize_unit(
+            model, uid, one, device="cpu",
+            expected_keys=cat.units[uid].checkpoint_keys)
         assert adapter.audit_after_bind(cat, model, uid, rep,
                                         expect_loaded=True)["verdict"] == "ok"
         inv = W.storage_inventory(adapter.resident_tensors(model, uid),
@@ -123,6 +140,14 @@ def main() -> int:
     reg.check_transition("purgefromram", args.model_id, resolved)
     for uid in resolved:
         adapter.purge_unit(model, uid)
+        staged = list(sub.values())
+        for k in list(sub.keys()):
+            if k in cat.units[uid].checkpoint_keys:
+                del sub[k]
+        proof = C.release_staging_proof(staged)
+        del staged
+        report.setdefault("staging_release", {})[uid] = proof
+        assert proof["alive_after_release"] == 0, proof
         assert adapter.audit_after_bind(
             cat, model, uid, {"bound_keys": [], "waived": []},
             expect_loaded=False)["verdict"] == "ok"
@@ -131,6 +156,7 @@ def main() -> int:
 
     report["registry"] = reg.model_state(args.model_id)
     report["rss_delta_bytes"] = C.rss_bytes() - t0
+    report["cpu_peak_bytes"] = C.rss_peak_bytes()
     report["verdict"] = "ok"
     C.write_report(report, args.out, "weights_probe_21.json")
     return 0
