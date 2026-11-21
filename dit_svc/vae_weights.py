@@ -56,7 +56,11 @@ class VaeBackend(GroupBackend):
         if loader is None:
             raise RuntimeError("runner 缺少 stream_load_safetensors_to_dict")
         self._stage("读取 %s 到 %s" % (self.MODEL_ID, device), operation)
-        state, metadata = loader(self.config["path"], device="cpu")
+        # 关键：sd 本身必须先在目标设备。Comfy 的 VAE(device=...) 只设
+        # patcher/load_device，不会把 CPU sd 搬上卡；旧 _load() 也是先用
+        # device="cuda" 读盘再构造。
+        read_device = "cuda" if getattr(device, "type", str(device)) == "cuda" else "cpu"
+        state, metadata = loader(self.config["path"], device=read_device)
         try:
             if self.video:
                 from dit_svc.runtime import _build_video_vae
