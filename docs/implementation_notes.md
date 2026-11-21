@@ -123,3 +123,47 @@ No GPU load, inference baseline, or attention kernel verification has been perfo
 - C: resident Comfy and VEDA lifecycle work continues; no result has been accepted yet.
 
 Four fixed children are recorded in `agent_work_ledger.md`; slot E remains unused because its exact model was not listed by the provider.
+
+## 2026-11-21 continuation: unified weight API + real remote verification
+
+- Integrated `agent/explicit-weights` (A) and B's `975fd64` (`h3_patcher`). C branch
+  (`agent/explicit-bindings`) remains unmerged; attention/VEDA resident bindings are
+  not part of this round.
+- New `WeightService` with five backends: `dit` (block-level via A's `H3ComfyAdapter`),
+  `vae.video` / `vae.audio` (whole-group Comfy VAE), `te` (whole-group CLIP + ClipProj),
+  `veda.bundle` (whole-group `LoadedBundle`). One HTTP contract:
+  `POST /api/weights/<model>/<action>` -> 202 operation; `dry_run` never constructs.
+- `POST /api/infer/encode` is resident-only: `te.model` must already be `vram`; the cond
+  artifact is committed to `ArtifactStore` (`h3.cond.v1`). Legacy `/api/encode` keeps a
+  bounded synchronous wait on the same worker. `/api/te/step` and `/api/te/probe` remain
+  legacy debug endpoints (not yet migrated to operations).
+- Local selftests: `--phase all` = 15/15 (p0 7, p1 5, p2 3). New coverage:
+  `_selftest_te_manager.py` (13 cases) and `_selftest_weight_api.py` (HTTP contract).
+
+### Remote deployment
+
+- Remote worktree: `C:\Users\sheepserver\Desktop\h3_sm75_server_explicit_api`,
+  branch `feat/explicit-api`; defaults file `Desktop\h3_explicit_defaults.json`
+  uses the user-profile weights (DiT w4a8, **light** video VAE, TE 4B + ClipProj)
+  and D-drive audio VAE / VEDA bundle.
+- GPU idle at start: 272 MiB / 22528 MiB used. The probes start and stop only their
+  own server PID; no user service was touched.
+
+### Real remote results (2026-11-21)
+
+| model | action | result |
+|---|---|---|
+| te | disk2ram | done 0.51s; 4,858,391,108 B CPU |
+| te | ram2vram | done 2.73s; 4,858,391,108 B CUDA; proj 304 MB stays CPU (partial, expected) |
+| te | infer.encode | done 3.02s; 24 tokens; cond `[1,24,5120]`; artifact 492,096 B, download bytes match |
+| te | vram2ram / purge | 2.02s / 0.63s; final state `absent`, 0 resident bytes |
+| dit | catalog | 56 units; `disk2ram` dry_run lists all |
+| dit | disk2ram `dit.blocks.0` | done 0.52s; 387,359,232 B (matches probe 20) |
+| dit | ram2vram / vram2ram / purge | 1.01s / 0.51s / 0.52s; `partial` -> `absent` |
+| vae.video | disk2ram (light 2.14 GB) | done 8.17s; official 2.8 GB file took 135.26s |
+| vae.audio | disk2ram (605 MB fp32) | done 18.58s |
+| veda.bundle | disk2ram | done 1.01s; 550,502,400 B bf16 resident (fp8 source 275 MB) |
+
+All four actions for all five models passed on the real GPU host. This proves the
+API/state machine and physical accounting; it does **not** prove DiT sampling or
+VAE decode results, nor attention/VEDA sparse execution (C not merged).
