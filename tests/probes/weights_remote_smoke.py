@@ -9,12 +9,14 @@
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import time
 
-from te_remote_smoke import Client, free_port, wait_server
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from te_remote_smoke import Client, free_port, wait_server  # noqa: E402
 
 
 def action(client, model, name, body, timeout, report):
