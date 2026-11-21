@@ -207,11 +207,30 @@ def _sha256_file(path, chunk=1 << 20):
 
 # ------------------------------------------------------------------ ArtifactStore
 
+_ALLOWED_MANIFEST_KEYS = frozenset(
+    ["id", "kind", "format", "filename", "bytes", "sha256", "created_at",
+     "metadata"])
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _is_reparse_or_link(path):
+    """路径自身是 symlink / junction / 其它 reparse point。"""
+    try:
+        if os.path.islink(path):
+            return True
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return bool(getattr(st, "st_file_attributes", 0)
+                & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
 class ArtifactStore(object):
     """``<out_dir>/stage`` 下的 artifact 仓库。
 
-    并发约定：所有 manifest 写入与引用计数在 ``self._lock`` 内完成；文件本体
-    用原子改名，读者要么看到旧文件要么看到完整新文件。
+    并发约定：manifest 索引、引用计数、配额预留都在 ``self._lock`` 内完成；
+    文件本体用唯一临时文件 + 原子改名，读者要么看到旧文件要么看到完整新文件。
     """
 
     def __init__(self, out_dir, *, quota_bytes=DEFAULT_STAGE_QUOTA_BYTES,
@@ -219,13 +238,36 @@ class ArtifactStore(object):
         self.out_dir = os.path.realpath(out_dir)
         self.stage_dir = os.path.join(self.out_dir, STAGE_DIRNAME)
         os.makedirs(self.stage_dir, exist_ok=True)
+        self._validate_stage_root()
         self.quota_bytes = int(quota_bytes)
         self.disk_reserve_bytes = int(disk_reserve_bytes)
         self.ttl_s = float(ttl_s)
         self._lock = threading.RLock()
         self._refs = {}          # artifact_id -> active 引用计数
         self._index = {}         # artifact_id -> manifest dict
+        self._pending = {}       # reservation token -> 预留字节
         self._load_manifests()
+
+    def _validate_stage_root(self):
+        """stage 根自身不能是 symlink/junction，且 realpath 必须留在 out_dir 内。
+
+        否则 ``realpath(stage)`` 会落到 out_dir 之外，而 ``safe_join`` 以它为新
+        根，包含关系检查反而全部“通过”。
+        """
+        if _is_reparse_or_link(self.stage_dir):
+            raise ArtifactError(
+                "stage 目录不能是符号链接/junction/reparse point: %s"
+                % self.stage_dir, code="INVALID_PATH", http_status=400)
+        real = os.path.realpath(self.stage_dir)
+        try:
+            common = os.path.commonpath([self.out_dir, real])
+        except ValueError:
+            common = None
+        if common != self.out_dir:
+            raise ArtifactError(
+                "stage 目录 realpath 逃逸出 out_dir（%s -> %s）"
+                % (self.stage_dir, real), code="INVALID_PATH", http_status=400)
+        _assert_no_reparse(real, self.out_dir)
 
     # -------------------------------------------------- 路径
 
@@ -273,6 +315,11 @@ class ArtifactStore(object):
         return os.path.join(self.stage_dir, artifact_id + MANIFEST_SUFFIX)
 
     def _load_manifests(self):
+        """只把通过 schema/文件一致性校验的 manifest 收入索引。
+
+        防任意 JSON 进入索引：校验 ID 与文件名一致、schema 白名单、文件存在且
+        不是 reparse、大小与 manifest 相符；不跟随 manifest 自身的 symlink。
+        """
         try:
             entries = os.listdir(self.stage_dir)
         except OSError:
@@ -283,14 +330,62 @@ class ArtifactStore(object):
             artifact_id = entry[:-len(MANIFEST_SUFFIX)]
             if not ARTIFACT_ID_RE.match(artifact_id):
                 continue
+            mpath = os.path.join(self.stage_dir, entry)
+            if _is_reparse_or_link(mpath) or not os.path.isfile(mpath):
+                continue
             try:
-                with open(os.path.join(self.stage_dir, entry), "r",
-                          encoding="utf-8") as f:
+                if os.path.getsize(mpath) > 1024 * 1024:
+                    continue
+                with open(mpath, "r", encoding="utf-8") as f:
                     manifest = json.load(f)
             except (OSError, ValueError):
                 continue
-            if isinstance(manifest, dict) and manifest.get("id") == artifact_id:
+            if self._manifest_is_valid(manifest, artifact_id):
                 self._index[artifact_id] = manifest
+
+    def _manifest_is_valid(self, manifest, artifact_id):
+        if not isinstance(manifest, dict):
+            return False
+        if set(manifest) - _ALLOWED_MANIFEST_KEYS:
+            return False
+        if manifest.get("id") != artifact_id:
+            return False
+        if not ARTIFACT_ID_RE.match(artifact_id):
+            return False
+        kind = manifest.get("kind")
+        if kind != artifact_id.split("_", 1)[0] or kind not in ("cond", "latent"):
+            return False
+        filename = manifest.get("filename")
+        if not isinstance(filename, str):
+            return False
+        try:
+            validate_stage_name(filename)
+        except ArtifactError:
+            return False
+        size = manifest.get("bytes")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            return False
+        sha = manifest.get("sha256")
+        if not isinstance(sha, str) or not _SHA256_RE.match(sha):
+            return False
+        created = manifest.get("created_at")
+        if isinstance(created, bool) or not isinstance(created, (int, float)):
+            return False
+        if not isinstance(manifest.get("metadata") or {}, dict):
+            return False
+        if "format" in manifest and manifest["format"] is not None \
+                and not isinstance(manifest["format"], str):
+            return False
+        # 数据文件必须存在、不是 reparse、大小与 manifest 一致
+        dpath = os.path.join(self.stage_dir, filename)
+        if _is_reparse_or_link(dpath) or not os.path.isfile(dpath):
+            return False
+        try:
+            if os.path.getsize(dpath) != size:
+                return False
+        except OSError:
+            return False
+        return True
 
     def new_id(self, kind):
         if kind not in ("cond", "latent"):
@@ -392,12 +487,58 @@ class ArtifactStore(object):
                                 details=info)
         return info
 
+    # -------------------------------------------------- 配额预留
+
+    def _pending_bytes(self):
+        return sum(self._pending.values())
+
+    def reserve(self, expected_bytes, *, token=None):
+        """在锁内预留配额，避免并发提交各自通过预检后合计超额。"""
+        expected = max(0, int(expected_bytes))
+        token = token or uuid.uuid4().hex
+        with self._lock:
+            info = self.budget(expected + self._pending_bytes())
+            if not info["fits"]:
+                raise ArtifactError("; ".join(info["reasons"]),
+                                    code="RESOURCE_EXHAUSTED", http_status=503,
+                                    details=info)
+            self._pending[token] = expected
+        return token
+
+    def release_reservation(self, token):
+        with self._lock:
+            self._pending.pop(token, None)
+
+    def _check_actual_locked(self, actual_bytes, expected):
+        """实际字节复核：临时文件已计入 usage，因此可用量要扣掉预留本身。
+
+        ``_pending`` 里包含本次预留，临时文件也已被 ``stage_usage_bytes`` 统计，
+        两者会双算；这里按实际值重新算，且把本次预留从 pending 中剔除后再算，
+        避免同一份数据被计两次。
+        """
+        actual = int(actual_bytes)
+        free = self.free_bytes()
+        usage = self.stage_usage_bytes()
+        quota_left = self.quota_bytes - usage
+        usable = free - self.disk_reserve_bytes
+        # pending 中除本次以外的预留仍需占位
+        others = self._pending_bytes() - int(expected or 0)
+        ok = actual <= quota_left - others and actual <= usable
+        if ok:
+            return
+        raise ArtifactError(
+            "实际写入 %d 字节超出预算（stage 剩余 %d，磁盘可用 %d，"
+            "其它预留 %d）" % (actual, quota_left, usable, others),
+            code="RESOURCE_EXHAUSTED", http_status=503)
+
     # -------------------------------------------------- 生命周期
 
     def acquire(self, artifact_id):
-        """consumer 取引用；期间清理不得删除该文件。"""
-        self.get(artifact_id)      # 不存在直接 404
+        """consumer 取引用；get 与加引用在同一把锁内完成。"""
         with self._lock:
+            if artifact_id not in self._index:
+                raise ArtifactError("artifact 不存在: %s" % artifact_id,
+                                    code="ARTIFACT_NOT_FOUND", http_status=404)
             self._refs[artifact_id] = self._refs.get(artifact_id, 0) + 1
         return artifact_id
 
@@ -414,45 +555,101 @@ class ArtifactStore(object):
             return self._refs.get(artifact_id, 0)
 
     def delete(self, artifact_id, *, force=False):
-        """删除 artifact；仍被引用且非 force 时拒绝。"""
-        manifest = self.get(artifact_id)
-        if not force and self.refcount(artifact_id):
-            raise ArtifactError("artifact 正被引用，暂不能删除: %s" % artifact_id,
-                                code="ACTIVE_BINDING", http_status=409)
-        filename = manifest["filename"]
-        path = self.path_for(filename)
-        for p in (path, self._manifest_path(artifact_id)):
-            try:
-                os.unlink(p)
-            except FileNotFoundError:
-                pass
+        """删除 artifact；引用检查与 unlink 在同一把锁内完成。"""
         with self._lock:
+            manifest = self._index.get(artifact_id)
+            if manifest is None:
+                raise ArtifactError("artifact 不存在: %s" % artifact_id,
+                                    code="ARTIFACT_NOT_FOUND", http_status=404)
+            if not force and self._refs.get(artifact_id):
+                raise ArtifactError("artifact 正被引用，暂不能删除: %s"
+                                    % artifact_id,
+                                    code="ACTIVE_BINDING", http_status=409)
+            filename = manifest["filename"]
+            path = self.path_for(filename)
+            for p in (path, self._manifest_path(artifact_id)):
+                try:
+                    os.unlink(p)
+                except FileNotFoundError:
+                    pass
             self._index.pop(artifact_id, None)
+            self._refs.pop(artifact_id, None)
         return True
 
-    def cleanup(self, *, now=None, limit=None):
-        """清理过期且未被引用的 artifact。返回已删 ID 列表。"""
-        now = time.time() if now is None else float(now)
-        removed = []
-        with self._lock:
-            candidates = list(self._index.values())
-        for manifest in sorted(candidates, key=lambda m: m.get("created_at") or 0):
+    def _delete_expired_locked(self, now, limit, removed):
+        for manifest in sorted(list(self._index.values()),
+                               key=lambda m: m.get("created_at") or 0):
+            if limit is not None and len(removed) >= int(limit):
+                break
             aid = manifest["id"]
             created = float(manifest.get("created_at") or 0)
             if now - created < self.ttl_s:
                 continue
-            if self.refcount(aid):
+            if self._refs.get(aid):
                 continue
-            try:
-                self.delete(aid)
-                removed.append(aid)
-            except ArtifactError:
-                continue
-            if limit is not None and len(removed) >= int(limit):
-                break
+            filename = manifest["filename"]
+            for p in (self.path_for(filename), self._manifest_path(aid)):
+                try:
+                    os.unlink(p)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    continue
+            self._index.pop(aid, None)
+            removed.append(aid)
+
+    def cleanup(self, *, now=None, limit=None):
+        """清理过期且未被引用的 artifact（引用检查与删除在同一把锁内）。"""
+        now = time.time() if now is None else float(now)
+        removed = []
+        with self._lock:
+            self._delete_expired_locked(now, limit, removed)
         return removed
 
     # -------------------------------------------------- 落盘入口
+
+    def _validate_metadata(self, metadata):
+        """写入前把 metadata 规范成 JSON 字符串字典（safetensors 只收 str）。
+
+        非 dict / 键含控制字符 / 值不是 str|int|float|bool|None / 不可 JSON
+        序列化 → 400；不引入额外依赖，也不把错误留到 manifest 落盘后才暴露。
+        """
+        if metadata is None:
+            return {}
+        if not isinstance(metadata, dict):
+            raise ArtifactError("metadata 必须是 dict", code="INVALID_REQUEST",
+                                http_status=400)
+        out = {}
+        for key, value in metadata.items():
+            if not isinstance(key, str) or not key:
+                raise ArtifactError("metadata 键必须是非空字符串",
+                                    code="INVALID_REQUEST", http_status=400)
+            if any(ord(c) < 0x20 for c in key):
+                raise ArtifactError("metadata 键不能包含控制字符: %r" % key,
+                                    code="INVALID_REQUEST", http_status=400)
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                out[key] = "true" if value else "false"
+            elif isinstance(value, str):
+                out[key] = value
+            elif isinstance(value, int):
+                out[key] = str(value)
+            elif isinstance(value, float):
+                if value != value or value in (float("inf"), float("-inf")):
+                    raise ArtifactError("metadata.%s 不是有限数字" % key,
+                                        code="INVALID_REQUEST", http_status=400)
+                out[key] = repr(value)
+            else:
+                try:
+                    out[key] = json.dumps(value, ensure_ascii=False,
+                                          allow_nan=False)
+                except (TypeError, ValueError):
+                    raise ArtifactError(
+                        "metadata.%s 不是 JSON 可序列化值: %r"
+                        % (key, type(value).__name__),
+                        code="INVALID_REQUEST", http_status=400)
+        return out
 
     def commit(self, kind, filename, data, *, metadata=None, fmt=None):
         """写入一个 artifact（唯一文件名 + 原子改名 + manifest）。
@@ -468,48 +665,70 @@ class ArtifactStore(object):
         """用 ``writer(tmp_path)`` 落盘大文件（如 safetensors），再原子改名。
 
         writer 必须把完整内容写到给定路径；任何异常都不留半写产物。
-        ``expected_bytes`` 用于预算预检（None 时按 0 预检，写前再复核）。
+        流程：校验 → 配额预留 → 写临时文件 → **实际字节复核** → 确认目标名未被
+        占用 → 原子改名 → 写 manifest。manifest 失败只回滚本次数据文件。
         """
         validate_stage_name(filename)
-        self.ensure_budget(expected_bytes or 0)
+        if kind not in ("cond", "latent"):
+            raise ArtifactError("未知 artifact kind: %r" % (kind,),
+                                code="INVALID_REQUEST", http_status=400)
+        meta = self._validate_metadata(metadata)
+        expected = max(0, int(expected_bytes or 0))
+        token = self.reserve(expected)
         artifact_id = self.new_id(kind)
         path = self.path_for(filename)
-        if os.path.lexists(path):
-            raise ArtifactError("文件名已被占用: %s" % filename,
-                                code="INVALID_REQUEST", http_status=409)
-        directory = os.path.dirname(path) or "."
-        fd, tmp = tempfile.mkstemp(prefix=".tmp_", suffix=".part", dir=directory)
-        os.close(fd)
+        data_written = False
         try:
-            writer(tmp)
-            with open(tmp, "r+b") as f:
-                os.fsync(f.fileno())
-            size = os.path.getsize(tmp)
-            if expected_bytes and size > expected_bytes * 2 + (1 << 20):
-                raise ArtifactError(
-                    "写入结果 %d 字节远超预估 %d，拒绝提交（疑似异常膨胀）"
-                    % (size, expected_bytes),
-                    code="RESOURCE_EXHAUSTED", http_status=503)
-            os.replace(tmp, path)
-            _fsync_dir(directory)
-        except BaseException:
+            if os.path.lexists(path):
+                raise ArtifactError("文件名已被占用: %s" % filename,
+                                    code="INVALID_REQUEST", http_status=409)
+            directory = os.path.dirname(path) or "."
+            fd, tmp = tempfile.mkstemp(prefix=".tmp_", suffix=".part",
+                                       dir=directory)
+            os.close(fd)
             try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        manifest = {
-            "id": artifact_id,
-            "kind": kind,
-            "format": fmt,
-            "filename": filename,
-            "bytes": size,
-            "sha256": _sha256_file(path),
-            "created_at": time.time(),
-            "metadata": dict(metadata or {}),
-        }
-        self._write_manifest(manifest)
-        return self.public(artifact_id)
+                writer(tmp)
+                with open(tmp, "r+b") as f:
+                    os.fsync(f.fileno())
+                size = os.path.getsize(tmp)
+                with self._lock:
+                    self._check_actual_locked(size, expected)
+                # 目标名必须仍然空着（防并发抢占）
+                if os.path.lexists(path):
+                    raise ArtifactError("文件名已被占用: %s" % filename,
+                                        code="INVALID_REQUEST", http_status=409)
+                os.replace(tmp, path)
+                data_written = True
+                _fsync_dir(directory)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+
+            manifest = {
+                "id": artifact_id,
+                "kind": kind,
+                "format": fmt,
+                "filename": filename,
+                "bytes": size,
+                "sha256": _sha256_file(path),
+                "created_at": time.time(),
+                "metadata": meta,
+            }
+            try:
+                self._write_manifest(manifest)
+            except BaseException:
+                # manifest 未落地 → 数据文件成为无索引孤儿，只回滚本次写入
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                raise
+            return self.public(artifact_id)
+        finally:
+            self.release_reservation(token)
 
 
 # ================================================================== 序列化层（P3）
