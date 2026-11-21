@@ -1,0 +1,299 @@
+"""自检 H3 真实 adapter（本机可跑）：stub 注入的 Comfy 语义。
+
+stub 只模拟已核实的真实行为：device 透传构造、meta 零 storage、
+strict 绑定缺 key 抛错。量化 ops（mixed_precision）不在本机验证，
+probe 20/21 在远端用真 ops 跑。Comfy 以来模块缺失时必须 ComfyUnavailable。
+"""
+import json
+import os
+import sys
+import threading
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+fails = []
+
+
+def check(name, fn):
+    try:
+        value = fn()
+        if value is False:
+            raise AssertionError("returned False")
+        print("  OK   %-46s %s" % (name, value))
+    except Exception as e:  # noqa: BLE001
+        print("  FAIL %-46s %s: %s" % (name, type(e).__name__, e))
+        fails.append(name)
+
+
+import torch  # noqa: E402
+from torch import nn  # noqa: E402
+
+from dit_svc import weights as W  # noqa: E402
+from dit_svc.model_adapters import (ComfyUnavailable, H3ComfyAdapter,  # noqa: E402
+                                    ShapeProxySD, WAIVED_KEYS)
+
+
+# -- stub comfy（语义对标真实快照，不冒充量化） --
+class StubOps:
+    class Linear(nn.Linear):
+        pass
+
+    RMSNorm = nn.RMSNorm
+    disable_weight_init = None  # 下方回填
+
+    @staticmethod
+    def mixed_precision_ops(quant_config, dtype):
+        raise AssertionError("quant ops not under local test (see probe 20/21)")
+
+
+StubOps.disable_weight_init = StubOps
+
+
+class StubBlock(nn.Module):
+    def __init__(self, hidden, ffn, device=None, operations=None, dtype=None):
+        super().__init__()
+        op = operations
+        self.norm1 = op.RMSNorm(hidden, device=device, dtype=dtype)
+        self.norm2 = op.RMSNorm(hidden, device=device, dtype=dtype)
+        self.attn_qkv = op.Linear(hidden, 3 * hidden, bias=False,
+                                   device=device, dtype=dtype)
+        self.attn_out = op.Linear(hidden, hidden, bias=False,
+                                   device=device, dtype=dtype)
+        self.mlp_fc1 = op.Linear(hidden, ffn, bias=False, device=device, dtype=dtype)
+        self.mlp_fc2 = op.Linear(ffn, hidden, bias=False, device=device, dtype=dtype)
+
+
+class StubRefinerBlock(nn.Module):
+    def __init__(self, hidden, device=None, operations=None, dtype=None):
+        super().__init__()
+        self.attn_qkv = operations.Linear(hidden, 3 * hidden, bias=False,
+                                            device=device, dtype=dtype)
+
+
+class StubH3(nn.Module):
+    def __init__(self, num_layers=4, hidden_size=64, ffn_hidden_size=128,
+                 token_refiner_num_layers=1, rope_inv_freq_len=16,
+                 time_embed_dim=32, image_model=None, device=None,
+                 operations=None, dtype=None, **kwargs):
+        super().__init__()
+        op = operations
+        self.blocks = nn.ModuleList(
+            [StubBlock(hidden_size, ffn_hidden_size, device=device,
+                       operations=op, dtype=dtype) for _ in range(num_layers)])
+        self.token_refiner = nn.Module()
+        self.token_refiner.blocks = nn.ModuleList(
+            [StubRefinerBlock(hidden_size, device=device, operations=op, dtype=dtype)
+             for _ in range(token_refiner_num_layers)])
+        self.condition_proj = op.Linear(32, hidden_size, bias=False,
+                                          device=device, dtype=dtype)
+        self.video_patch_proj = op.Linear(8, hidden_size, bias=False,
+                                          device=device, dtype=dtype)
+        self.register_buffer("adaln_t_table",
+                             torch.empty(8, time_embed_dim, device=device))
+        self.rope = nn.Module()
+        self.rope.register_buffer("inv_freq",
+                                  torch.empty(rope_inv_freq_len, device=device))
+
+
+class StubDetection:
+    @staticmethod
+    def detect_unet_config(sd, prefix, metadata=None):
+        assert "blocks.0.attn_qkv.weight" in sd
+        assert hasattr(sd["blocks.0.attn_qkv.weight"], "shape")
+        return {"image_model": "minimax_h3", "num_layers": 4,
+                "token_refiner_num_layers": 1, "hidden_size": 64,
+                "ffn_hidden_size": 128, "rope_inv_freq_len": 16,
+                "time_embed_dim": 32}
+
+
+def _adapter():
+    return H3ComfyAdapter(torch_mod=torch, ops_mod=StubOps,
+                          model_cls=StubH3, detection_mod=StubDetection)
+
+
+def _shapes():
+    s = {}
+    for i in range(4):
+        s["blocks.%d.attn_qkv.weight" % i] = (192, 64)
+        s["blocks.%d.attn_out.weight" % i] = (64, 64)
+        s["blocks.%d.mlp_fc1.weight" % i] = (128, 64)
+        s["blocks.%d.mlp_fc2.weight" % i] = (64, 128)
+        s["blocks.%d.norm1.weight" % i] = (64,)
+        s["blocks.%d.norm2.weight" % i] = (64,)
+    s["token_refiner.blocks.0.attn_qkv.weight"] = (192, 64)
+    s["condition_proj.weight"] = (64, 32)
+    s["video_patch_proj.weight"] = (64, 8)
+    s["adaln_t_table"] = (8, 32)
+    s["rope.inv_freq"] = (16,)
+    return s
+
+
+def t_shape_proxy():
+    p = ShapeProxySD({"a": (2, 3)})
+    assert "a" in p and "b" not in p
+    assert p["a"].shape == (2, 3)
+    assert sorted(p.keys()) == ["a"]
+    return "mapping ok"
+
+
+def t_quant_config_gate():
+    a = _adapter()
+    qc, rep = a.quant_config_from_metadata({})
+    assert qc == {} and rep["quantized"] is False
+    good = {"_quantization_metadata": json.dumps(
+        {"format_version": "1.0",
+         "layers": {"blocks.0.attn": {"format": "int8_tensorwise"}}})}
+    qc, rep = a.quant_config_from_metadata(good)
+    assert rep["formats"] == ["int8_tensorwise"], rep
+    bad = {"_quantization_metadata": json.dumps({"format_version": "2.0",
+                                                 "layers": {}})}
+    try:
+        a.quant_config_from_metadata(bad)
+    except Exception as e:
+        assert "format_version" in str(e), e
+        return "gate ok (refuses 2.0)"
+    raise AssertionError("bad version accepted")
+
+
+def t_detect_and_skeleton_meta():
+    a = _adapter()
+    shapes = _shapes()
+    cfg, rep = a.detect_unet_config(shapes, None)
+    assert rep["num_layers"] == 4, rep
+    header = {k: {"dtype": "F32", "shape": list(v)} for k, v in shapes.items()}
+    cat = W.build_catalog_from_header("dit", header, "dit")
+    model = a.build_skeleton(cat, cfg, None, torch.bfloat16, device="meta")
+    assert len(model.blocks) == 4
+    inv = W.storage_inventory(model, owner="dit").to_summary()
+    assert inv["total_cpu"] == 0 and inv["total_cuda"] == 0, inv
+    assert inv["meta_tensors"] > 0, inv
+    return "meta skeleton, %d meta tensors" % inv["meta_tensors"]
+
+
+def t_holders_and_waived():
+    a = _adapter()
+    assert a.unit_holders("dit.blocks.2", "dit") == [("blocks.2", "module")]
+    assert a.unit_holders("dit.refiner", "dit") == [("token_refiner", "module"),
+                                                   ("condition_proj", "module")]
+    assert a.unit_holders("dit.modules.adaln_t_table", "dit") == [("", "buffer:adaln_t_table")]
+    assert "adaln_basis" in WAIVED_KEYS and "adaln_mean" in WAIVED_KEYS
+    return "holders ok"
+
+
+def _env():
+    shapes = _shapes()
+    header = {k: {"dtype": "F32", "shape": list(v)} for k, v in shapes.items()}
+    cat = W.build_catalog_from_header("dit", header, "dit")
+    a = _adapter()
+    cfg, _ = a.detect_unet_config(shapes, None)
+    model = a.build_skeleton(cat, cfg, None, torch.float32, device="meta")
+    return a, cat, model
+
+
+def t_strict_bind_and_audit():
+    a, cat, model = _env()
+    uid = "dit.blocks.0"
+    torch.manual_seed(1)
+    sub = {}
+    for k in cat.units[uid].checkpoint_keys:
+        if k.endswith("norm1.weight") or k.endswith("norm2.weight"):
+            sub[k] = torch.ones(64)
+        elif "mlp_fc1" in k:
+            sub[k] = torch.randn(128, 64)
+        elif "mlp_fc2" in k:
+            sub[k] = torch.randn(64, 128)
+        elif "attn_out" in k:
+            sub[k] = torch.randn(64, 64)
+        else:
+            sub[k] = torch.randn(192, 64)
+    rep = a.materialize_unit(model, uid, sub, device="cpu")
+    audit = a.audit_after_bind(cat, model, uid, rep, expect_loaded=True)
+    assert audit["verdict"] == "ok", audit
+    # 缺 key 必须抛（strict 关门），不留随机参数
+    bad = dict(sub)
+    bad.pop(sorted(bad.keys())[0])
+    try:
+        a.materialize_unit(model, uid, bad, device="cpu")
+    except Exception as e:
+        assert "strict" in str(e).lower() or "missing" in str(e).lower(), e
+        return "bind ok, strict refuses missing"
+    raise AssertionError("missing key accepted")
+
+
+def t_purge_keeps_slots():
+    a, cat, model = _env()
+    uid = "dit.blocks.1"
+    torch.manual_seed(2)
+    sub = {k: torch.randn(64, 64) if k.endswith("attn_out.weight")
+           else torch.randn(192, 64) if "attn_qkv" in k
+           else torch.randn(128, 64) if "mlp_fc1" in k
+           else torch.randn(64, 128) if "mlp_fc2" in k
+           else torch.ones(64)
+           for k in cat.units[uid].checkpoint_keys}
+    a.materialize_unit(model, uid, sub, device="cpu")
+    n_before = len(model.blocks)
+    mod_before = model.blocks[1]
+    a.purge_unit(model, uid)
+    assert len(model.blocks) == n_before and model.blocks[1] is mod_before
+    audit = a.audit_after_bind(cat, model, uid,
+                               {"bound_keys": [], "waived": []},
+                               expect_loaded=False)
+    assert audit["verdict"] == "ok", audit
+    return "purge ok, slots kept"
+
+
+def t_registry_lock_smoke():
+    reg = W.WeightRegistry()
+    h = {"a.weight": {"dtype": "F32", "shape": [4]},
+         "b.weight": {"dtype": "F32", "shape": [4]}}
+    reg.register_recipe(W.recipe_from_header_dict("m", "dit", "fake://x", h))
+    reg.attach_catalog(W.build_catalog_from_header("m", h, "dit"))
+    errs = []
+
+    def writer(n):
+        try:
+            for _ in range(50):
+                reg.set_unit_loaded("m", "m.modules.a", "cpu",
+                                    resident_bytes_cpu=16)
+                reg.snapshot()
+                reg.set_unit_absent("m", "m.modules.a")
+        except Exception as e:  # noqa: BLE001
+            errs.append(e)
+
+    # header 只有顶层 keys -> dit.modules.a/b；用真实 unit id
+    assert not errs
+    ths = [threading.Thread(target=writer, args=(i,)) for i in range(4)]
+    [t.start() for t in ths]
+    [t.join() for t in ths]
+    assert not errs, errs[:1]
+    snap = reg.snapshot()
+    json.dumps(snap)
+    return "4 threads x 50 cycles clean"
+
+
+def t_no_comfy_gives_clear_error():
+    a = H3ComfyAdapter()
+    try:
+        a.build_skeleton({}, {}, None)
+    except Exception as e:
+        assert "injected" in str(e), e
+        return "ComfyUnavailable ok"
+    raise AssertionError("no error without comfy")
+
+
+print("== _selftest_h3_adapter ==")
+check("shape proxy mapping", t_shape_proxy)
+check("quant config version gate", t_quant_config_gate)
+check("detect + meta skeleton zero storage", t_detect_and_skeleton_meta)
+check("unit holders + waived", t_holders_and_waived)
+check("strict bind + audit; missing refused", t_strict_bind_and_audit)
+check("purge keeps slots, zero storage", t_purge_keeps_slots)
+check("registry lock concurrency", t_registry_lock_smoke)
+check("no-comfy clear error", t_no_comfy_gives_clear_error)
+
+print()
+if fails:
+    print("FAILED: %s" % fails)
+    raise SystemExit(1)
+print("ALL OK")

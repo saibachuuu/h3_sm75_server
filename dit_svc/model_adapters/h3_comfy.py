@@ -1,0 +1,419 @@
+"""真实 H3 Comfy adapter（P0 构造证据落地，P2 选择性绑定）。
+
+Comfy 第三方模块全部经构造参数注入（torch / ops / MiniMaxH3Model /
+model_detection），本文件 import 时不碰任何 Comfy 包，远端 probe 传真模块，
+本机单测传 stub。绝不复用 stock 不完整 sd 路径：
+每个 unit 按子模块 `load_state_dict(strict=True, assign=True)` 精确绑定，
+缺 key 直接抛（关掉 strict=False 留随机参数的门）。
+
+已核实快照依据（只读，未改）：
+- detect 形状集：comfy/model_detection.py:401-433
+- stock 全量 eager：comfy/sd.py:2431-2524；strict=False：model_base.py:381
+- 量化绑定：comfy/ops.py:_load_quantized_module:1256-1397（comfy_quant 描述符
+  + per-format scales；缺 weight 只 warning -> 本 adapter 用 strict=True 关门）
+- 构造 device 透传：minimax/model.py:476-518；blocks ModuleList 索引稳定
+- adaln_basis/mean 在 minimax/model.py 中无消费点（仅 adaln_t_table 被用），
+  本 adapter 显式 waive（见 WAIVED_KEYS），不静默丢弃。
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+from ..weights import UnitCatalog, WeightsError, audit_unit
+
+from .fake import AdapterError, ModelAdapter, SkeletonNoStorage
+
+
+# ---------------------------------------------------------------------------
+# 常量：版本门 + waive 清单
+# ---------------------------------------------------------------------------
+
+QUANT_META_KEY = "_quantization_metadata"
+QUANT_FORMAT_VERSION = "1.0"
+
+#: 有真实 tensor 但模型前向不消费、stock loader 只会 warn-unexpected 的 keys。
+#: 显式 waive（绑定报告中记录），不是静默丢弃；模型类变更时重审。
+WAIVED_KEYS = {
+    "adaln_basis": "curve basis host-side only; MiniMaxH3Model consumes only adaln_t_table",
+    "adaln_mean": "curve basis host-side only; MiniMaxH3Model consumes only adaln_t_table",
+}
+
+#: H3 推理必需的绑定 keys（waived 除外全要齐；由 catalog 派生，禁止手写）。
+REQUIRED_TOP_KEYS = ("adaln_t_table", "rope.inv_freq")
+
+
+class ComfyUnavailable(WeightsError):
+    code = "COMFY_UNAVAILABLE"
+
+
+def _need(name: str, value: Any) -> Any:
+    if value is None:
+        raise ComfyUnavailable(
+            "real H3 adapter needs injected %r (pass real comfy module in probe, stub in test)" % (name,),
+            recovery=["远端 probe 传真 comfy 模块；本机单测传 stub"],
+            details={"missing": name})
+    return value
+
+
+# ---------------------------------------------------------------------------
+# header-only detect 形状代理（不读权重值）
+# ---------------------------------------------------------------------------
+
+
+class _ShapeProxy:
+    __slots__ = ("shape",)
+
+    def __init__(self, shape: Sequence[int]):
+        self.shape = tuple(shape)
+
+
+class ShapeProxySD(Mapping):
+    """只读 header 形状的 sd 代理：支持 detect 用的 keys/in/[]/.shape。"""
+
+    def __init__(self, shapes: Mapping[str, Sequence[int]]):
+        self._shapes = dict(shapes)
+
+    def __getitem__(self, key: str) -> _ShapeProxy:
+        return _ShapeProxy(self._shapes[key])
+
+    def __iter__(self):  # type: ignore[override]
+        return iter(self._shapes)
+
+    def __len__(self) -> int:
+        return len(self._shapes)
+
+    def keys(self):  # type: ignore[override]
+        return self._shapes.keys()
+
+
+# ---------------------------------------------------------------------------
+# 真实 H3 adapter
+# ---------------------------------------------------------------------------
+
+
+class H3ComfyAdapter(ModelAdapter):
+    family = "dit-h3"
+
+    def __init__(self, *, torch_mod: Any = None, ops_mod: Any = None,
+                 model_cls: Any = None, detection_mod: Any = None):
+        self.torch = torch_mod
+        self.ops = ops_mod
+        self.model_cls = model_cls
+        self.detection = detection_mod
+
+    # -- 版本/quant 配置 --
+    def quant_config_from_metadata(self, metadata: Mapping[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """从 checkpoint header metadata 建 quant_config。
+
+        只接受 format_version == "1.0"；layers 为 {layer: {format, ...}}。
+        返回 (quant_config, report)。未知版本直接拒绝，不猜。
+        """
+        raw = metadata.get(QUANT_META_KEY, None) if metadata else None
+        if raw is None:
+            return {}, {"quantized": False, "reason": "no _quantization_metadata"}
+        import json as _json
+        try:
+            parsed = _json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except Exception as e:
+            raise AdapterError("bad _quantization_metadata: %s" % (e,)) from None
+        ver = parsed.get("format_version", None)
+        if ver != QUANT_FORMAT_VERSION:
+            raise AdapterError(
+                "unsupported quantization format_version %r (want %r)" % (ver, QUANT_FORMAT_VERSION),
+                recovery=["等主代理确认新格式后再扩展 adapter，不静默按旧格式绑"],
+                details={"format_version": ver})
+        layers = parsed.get("layers", {})
+        if not isinstance(layers, dict):
+            raise AdapterError("quant layers is not a dict")
+        formats = sorted(set(v.get("format") for v in layers.values()
+                             if isinstance(v, dict)))
+        return (dict(layers), {"quantized": True, "format_version": ver,
+                               "num_layers": len(layers), "formats": formats})
+
+    def detect_unet_config(self, shapes: Mapping[str, Sequence[int]],
+                           metadata: Optional[Mapping[str, Any]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """header-only detect：只给形状，不给权重值。"""
+        detection = _need("model_detection", self.detection)
+        proxy = ShapeProxySD(shapes)
+        try:
+            cfg = detection.detect_unet_config(proxy, "", metadata)
+        except Exception as e:
+            raise AdapterError("detect_unet_config failed: %s: %s"
+                               % (type(e).__name__, e)) from None
+        if not cfg or cfg.get("image_model") != "minimax_h3":
+            raise AdapterError("header is not minimax_h3: %r" % (cfg,),
+                               details={"config": cfg})
+        return (dict(cfg), {"image_model": cfg.get("image_model"),
+                            "num_layers": cfg.get("num_layers"),
+                            "token_refiner_num_layers": cfg.get("token_refiner_num_layers"),
+                            "hidden_size": cfg.get("hidden_size")})
+
+    # -- 骨架 --
+    def build_skeleton(self, catalog: UnitCatalog,
+                       unet_config: Optional[Mapping[str, Any]] = None,
+                       quant_config: Optional[Mapping[str, Any]] = None,
+                       compute_dtype: Any = None,
+                       device: str = "meta") -> Any:
+        """无存储骨架：device="meta" 零真实 storage；device 仅 skeleton 阶段用。
+
+        注意 MiniMaxH3Model 构造即定 factory device；选择性物化时 materialize
+        会把选中子模块 to_empty 到目标设备并修正 factory_kwargs（见下）。
+        """
+        torch_mod = _need("torch", self.torch)
+        ops_mod = _need("comfy.ops", self.ops)
+        model_cls = _need("MiniMaxH3Model", self.model_cls)
+        if unet_config is None:
+            raise AdapterError("build_skeleton needs detected unet_config (header-only)")
+        dtype = compute_dtype if compute_dtype is not None else torch_mod.bfloat16
+        if quant_config:
+            operations = ops_mod.mixed_precision_ops(dict(quant_config), dtype)
+        else:
+            operations = ops_mod.disable_weight_init
+        cfg = dict(unet_config)
+        try:
+            model = model_cls(**cfg, device=device, operations=operations, dtype=dtype)
+        except Exception as e:
+            raise AdapterError("skeleton construct failed: %s: %s"
+                               % (type(e).__name__, e),
+                               details={"device": device}) from None
+        for _m in model.modules():
+            if hasattr(_m, "requires_grad_"):
+                try:
+                    _m.requires_grad_(False)
+                except Exception:
+                    pass
+        model.eval()
+        return model
+
+    # -- unit -> 模型持有人路径 --
+    def unit_holders(self, unit_id: str, model_id: str) -> List[Tuple[str, str]]:
+        """返回 [(holder_path, kind)]；holder_path 为模型下点路径（""=模型自身）。
+
+        kind: "module"（子模块整体绑定）/ "buffer"（holder 上的单个 buffer）。
+        """
+        if unit_id == "%s.refiner" % model_id:
+            return [("token_refiner", "module"), ("condition_proj", "module")]
+        if unit_id.startswith("%s.blocks." % model_id):
+            idx = unit_id.rsplit(".", 1)[1]
+            return [("blocks.%s" % idx, "module")]
+        if unit_id.startswith("%s.modules." % model_id):
+            leaf = unit_id.rsplit(".", 1)[1]
+            if leaf == "adaln_t_table":
+                return [("", "buffer:adaln_t_table")]
+            return [(leaf, "module")]
+        if unit_id == "%s.root" % model_id:
+            return [("", "module-rootscalars")]
+        raise AdapterError("H3 adapter has no holder mapping for %r" % (unit_id,),
+                           details={"unit": unit_id})
+
+    def _resolve(self, model: Any, path: str) -> Any:
+        cur = model
+        if not path:
+            return cur
+        for part in path.split("."):
+            if part.isdigit() and hasattr(cur, "__getitem__"):
+                try:
+                    cur = cur[int(part)]
+                    continue
+                except Exception:
+                    pass
+            cur = getattr(cur, part)
+        return cur
+
+    # -- 选择性物化：只读所选 unit keys，未选不动 --
+    def materialize_unit(self, model: Any, unit_id: str,
+                         key_tensors: Mapping[str, Any],
+                         device: str = "cpu") -> Dict[str, Any]:
+        """把该 unit 的 checkpoint keys 精确绑定进骨架（strict=True）。
+
+        key_tensors: {checkpoint全key: tensor}，必须恰为该 unit 所需
+        （waived 除外）；多读/漏读直接拒绝。未选 unit 的模块保持 meta/None。
+        返回绑定报告（含 waived、per-layer quant format 日志）。
+        """
+        torch_mod = _need("torch", self.torch)
+        model_id = unit_id.split(".")[0]
+        bound: List[str] = []
+        waived: List[str] = []
+        quant_formats: Dict[str, str] = {}
+        for holder_path, kind in self.unit_holders(unit_id, model_id):
+            if kind.startswith("buffer:"):
+                name = kind.split(":", 1)[1]
+                full = name  # 顶层 buffer key 即名
+                if full not in key_tensors:
+                    raise AdapterError("missing buffer key %r for %r" % (full, unit_id),
+                                       details={"unit": unit_id, "key": full})
+                holder = self._resolve(model, holder_path)
+                holder.register_buffer(name, torch_mod.as_tensor(key_tensors[full]).to(device))
+                bound.append(full)
+                continue
+            if kind == "module-rootscalars":
+                raise AdapterError("root unit has no module home; expand catalog first",
+                                   details={"unit": unit_id})
+            holder = self._resolve(model, holder_path)
+            # holder 消费的 keys：holder_path 点转 checkpoint 前缀
+            prefix = holder_path.replace(".", ".") + "."
+            # 顶层模块名与 checkpoint 顶层名一致（blocks.N / token_refiner /
+            # condition_proj / video_patch_proj / ...），rope 除外：
+            sub = {k: v for k, v in key_tensors.items() if k == holder_path
+                   or k.startswith(prefix)}
+            if holder_path == "rope":
+                # rope.inv_freq 的 holder 是 rope 模块，key 前缀 "rope."
+                pass
+            if kind == "module" and holder_path in ("token_refiner",):
+                # token_refiner holder 消费 token_refiner.* 全体（refiner unit 含
+                # condition_proj 时由另一 holder 条目处理，此处只取本前缀）
+                sub = {k: v for k, v in key_tensors.items()
+                       if k.startswith("token_refiner.")}
+            # waived keys 不进绑定
+            for w in WAIVED_KEYS:
+                if w in sub:
+                    sub.pop(w)
+                    waived.append(w)
+            # to_empty：meta/None 安全；把 factory device 修正到目标设备
+            try:
+                holder.to_empty(device=device)
+            except Exception as e:
+                raise AdapterError("to_empty(%s) failed for %r: %s"
+                                   % (device, holder_path, e),
+                                   details={"holder": holder_path}) from None
+            fk = getattr(holder, "factory_kwargs", None)
+            if isinstance(fk, dict):
+                fk["device"] = device
+            # 同一 holder 下的量化子层也可能有 factory_kwargs（MixedPrecision
+            # Linear 各自持有）；递归修正
+            for _m in holder.modules():
+                _fk = getattr(_m, "factory_kwargs", None)
+                if isinstance(_fk, dict):
+                    _fk["device"] = device
+            # 相对前缀：holder_path 本身对应 checkpoint 同名前缀
+            rel = {}
+            for k, v in sub.items():
+                if k == holder_path:
+                    rel[k] = v
+                elif k.startswith(prefix):
+                    rel[k[len(prefix):]] = v
+                else:
+                    raise AdapterError("key %r not under holder %r" % (k, holder_path),
+                                       details={"unit": unit_id})
+            try:
+                missing, unexpected = holder.load_state_dict(rel, strict=True, assign=True)
+            except RuntimeError as e:
+                raise AdapterError("strict bind failed for %r: %s" % (holder_path, e),
+                                   recovery=["检查所选 keys 是否与该 holder 精确对应；绝不用 strict=False 重试"],
+                                   details={"holder": holder_path,
+                                            "error": str(e)[:300]}) from None
+            assert not missing and not unexpected, (missing, unexpected)
+            bound.extend(k for k in sub.keys())
+            # quant format 日志：comfy_quant 描述符（82B 小 key 允许读）
+            for k, v in sub.items():
+                if k.endswith("comfy_quant"):
+                    quant_formats[k] = self._read_quant_format(v)
+        return {"unit": unit_id, "bound_keys": sorted(bound),
+                "waived": sorted(waived), "quant_formats": quant_formats,
+                "device": device}
+
+    @staticmethod
+    def _read_quant_format(descriptor_tensor: Any) -> str:
+        try:
+            import json as _json
+            raw = descriptor_tensor.numpy().tobytes()
+            return str(_json.loads(raw).get("format", "unknown"))
+        except Exception as e:  # noqa: BLE001
+            return "unreadable:%s" % type(e).__name__
+
+    # -- purge：换 meta，不删槽位 --
+    def purge_unit(self, model: Any, unit_id: str) -> Dict[str, Any]:
+        """释放该 unit 全部真实 storage（params/buffers 置 meta 空壳）。
+
+        不删除 ModuleList 索引、不碰未选 unit。返回释放报告。
+        """
+        torch_mod = _need("torch", self.torch)
+        model_id = unit_id.split(".")[0]
+        touched: List[str] = []
+        for holder_path, kind in self.unit_holders(unit_id, model_id):
+            if kind.startswith("buffer:"):
+                name = kind.split(":", 1)[1]
+                holder = self._resolve(model, holder_path)
+                old = holder.get_buffer(name)
+                holder.register_buffer(
+                    name, torch_mod.empty(old.shape, device="meta", dtype=old.dtype))
+                touched.append(holder_path or "model" + ":" + name)
+                continue
+            holder = self._resolve(model, holder_path)
+            with torch_mod.no_grad():
+                for _name, p in list(holder.named_parameters(recurse=False)):
+                    if p is not None and not getattr(p, "is_meta", False):
+                        holder._parameters[_name] = torch_mod.nn.Parameter(
+                            torch_mod.empty(p.shape, device="meta",
+                                            dtype=p.dtype),
+                            requires_grad=False)
+                for _name, b in list(holder.named_buffers(recurse=False)):
+                    if b is not None and not getattr(b, "is_meta", False):
+                        holder.register_buffer(
+                            _name, torch_mod.empty(b.shape, device="meta", dtype=b.dtype))
+                # 递归子模块（quant Linear 的 weight=None 保持 None）
+                for _m in holder.modules():
+                    if _m is holder:
+                        continue
+                    for _name, p in list(_m.named_parameters(recurse=False)):
+                        if p is not None and not getattr(p, "is_meta", False):
+                            _m._parameters[_name] = torch_mod.nn.Parameter(
+                                torch_mod.empty(p.shape, device="meta",
+                                                dtype=p.dtype),
+                                requires_grad=False)
+                    for _name, b in list(_m.named_buffers(recurse=False)):
+                        if b is not None and not getattr(b, "is_meta", False):
+                            _m.register_buffer(
+                                _name, torch_mod.empty(b.shape, device="meta", dtype=b.dtype))
+            touched.append(holder_path)
+        return {"unit": unit_id, "purged_holders": touched}
+
+    # -- move：整 unit 子树 .to(device)，随后由 inventory 核对 --
+    def move_unit(self, model: Any, unit_id: str, device: str) -> Dict[str, Any]:
+        """把该 unit 子树整体搬到 device（数据搬运，非权重管理绕过）。
+
+        不做跨 unit 事务回滚（plan 02.6）；调用方按 unit 逐个 move，
+        每 unit 后用 inventory 校验，OOM 即停并 mark_error。
+        """
+        _need("torch", self.torch)
+        model_id = unit_id.split(".")[0]
+        touched: List[str] = []
+        for holder_path, kind in self.unit_holders(unit_id, model_id):
+            if kind.startswith("buffer:"):
+                name = kind.split(":", 1)[1]
+                holder = self._resolve(model, holder_path)
+                buf = holder.get_buffer(name)
+                holder.register_buffer(name, buf.to(device))
+                touched.append((holder_path or "model") + ":" + name)
+                continue
+            holder = self._resolve(model, holder_path)
+            holder.to(device)
+            touched.append(holder_path)
+        return {"unit": unit_id, "device": device, "moved_holders": touched}
+
+    # -- inventory 证据：unit 子树真实张量 --
+    def resident_tensors(self, model: Any, unit_id: str) -> Dict[str, Any]:
+        """返回该 unit 子树的真实张量容器，供 storage_inventory 测量。"""
+        model_id = unit_id.split(".")[0]
+        out: Dict[str, Any] = {}
+        for holder_path, kind in self.unit_holders(unit_id, model_id):
+            if kind.startswith("buffer:"):
+                name = kind.split(":", 1)[1]
+                holder = self._resolve(model, holder_path)
+                out[(holder_path or "model") + "." + name] = holder.get_buffer(name)
+                continue
+            out[holder_path] = self._resolve(model, holder_path)
+        return out
+
+    def audit_after_bind(self, catalog: UnitCatalog, model: Any,
+                         unit_id: str, bind_report: Mapping[str, Any],
+                         expect_loaded: bool = True) -> Dict[str, Any]:
+        """绑定后交叉自证：catalog × 真实绑定记录 × 物理 inventory。"""
+        from ..weights import audit_unit, storage_inventory
+        bound = list(bind_report.get("bound_keys", []))
+        waived = list(bind_report.get("waived", []))
+        inv = storage_inventory(self.resident_tensors(model, unit_id),
+                                owner=unit_id)
+        return audit_unit(catalog, unit_id, bound, inv,
+                          expect_loaded=expect_loaded, waived=waived)
