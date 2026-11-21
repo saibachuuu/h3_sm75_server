@@ -79,11 +79,42 @@ def run_job(job, ctx):
     job.stage = "cond"
 
     # ---------- 1. 取条件 ----------
-    # 默认走本机编码器（cond server，缓存命中即时）；/api/jobs/cond 直接喂 cond 时
-    # 完全跳过 cond server —— 不依赖 ssh -R 隧道。
+    # 优先级：
+    # 1) /api/jobs/cond 直接喂 cond 时完全跳过 cond server / 本地 TE；
+    # 2) DiT server 自己加载了本地 TE（--te-4b/--te-proj 或 --te-gguf）时，
+    #    本地 encode，不再回调本机 cond server；
+    # 3) 否则走 cond_client.fetch() 回调本机 cond server。
     t0 = time.perf_counter()
     if getattr(job, "cond_source", None):
         cond_bytes, cstats = _load_direct_cond(job)
+        job.cond_stats = cstats
+        job.log.append("cond: %s" % json.dumps(cstats, ensure_ascii=False))
+        _stage(job, "cond", t0)
+        tmp_dir = tmp_dir_of(ctx["out_dir"])
+        cond_path = os.path.join(tmp_dir, job.id + ".cond.safetensors")
+        with open(cond_path, "wb") as f:
+            f.write(cond_bytes)
+    elif runtime._te_model() is not None:
+        # 本地 TE 模式：encode 直接在本机完成，结果写 slim cond 文件。
+        job.log.append("cond: 本地 TE 编码")
+        out, cstats = runtime.encode_condition(
+            params["prompt"],
+            params.get("image_b64s") or [params["image_b64"]],
+            mode=params["mode"],
+            width=params["width"],
+            height=params["height"],
+            ref_image_size=params["ref_image_size"],
+        )
+        job.cond_stats = cstats
+        job.log.append("cond stats: %s" % json.dumps(cstats, ensure_ascii=False))
+        _stage(job, "cond", t0)
+        tmp_dir = tmp_dir_of(ctx["out_dir"])
+        cond_path = os.path.join(tmp_dir, job.id + ".cond.safetensors")
+        from safetensors.torch import save_file
+        tosave = {"cond": out["cond"]}
+        if out.get("minimax_token_tags") is not None:
+            tosave["minimax_token_tags"] = out["minimax_token_tags"]
+        save_file(tosave, cond_path)
     else:
         from dit_svc import cond_client
         cond_bytes, cstats = cond_client.fetch(ctx["cond_url"], {
@@ -94,14 +125,13 @@ def run_job(job, ctx):
             "height": params["height"],
             "ref_image_size": params["ref_image_size"],
         })
-    job.cond_stats = cstats
-    job.log.append("cond: %s" % json.dumps(cstats, ensure_ascii=False))
-    _stage(job, "cond", t0)
-
-    tmp_dir = tmp_dir_of(ctx["out_dir"])
-    cond_path = os.path.join(tmp_dir, job.id + ".cond.safetensors")
-    with open(cond_path, "wb") as f:
-        f.write(cond_bytes)
+        job.cond_stats = cstats
+        job.log.append("cond: %s" % json.dumps(cstats, ensure_ascii=False))
+        _stage(job, "cond", t0)
+        tmp_dir = tmp_dir_of(ctx["out_dir"])
+        cond_path = os.path.join(tmp_dir, job.id + ".cond.safetensors")
+        with open(cond_path, "wb") as f:
+            f.write(cond_bytes)
 
     try:
         _run_with_cond(job, ctx, cond_path)
