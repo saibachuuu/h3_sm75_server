@@ -5,15 +5,18 @@ ComfyUI 的 VAE 由 ``comfy.sd.VAE(sd=..., metadata=..., device=...)`` 一次构
 （复用 runtime._build_video_vae）。因此 unit 首版是整组一个
 ``<model>.model``，等真实结构拆分验证后再细化为 encoder/decoder/shared。
 
-disk2ram 使用 runner 的 ``stream_load_safetensors_to_dict(path, device="cpu")``：
-真实读取该 VAE 文件到 CPU，不构造 DiT/TE，也不上卡。
+重要：量化 VAE（int8_convrot）的量化 Linear 在 CPU 构造后仅靠 ``.to(cuda)``
+不会同步内部设备选择，decode 时 attention 的 q/k/v 仍在 CPU（实测
+``q,k,v must be on the same CUDA device``）。因此 ``ram2vram`` 对 VAE 采用
+“在目标设备重建”的等价搬运：先释放 CPU 实例，再以 device=cuda 构造。
 """
+import gc
 import os
 
 from dit_svc import weights as W
 from dit_svc.group_weights import GroupBackend
 
-ADAPTER_VERSION = "vae-comfy-v0"
+ADAPTER_VERSION = "vae-comfy-v1"
 
 
 class VaeBackend(GroupBackend):
@@ -38,7 +41,12 @@ class VaeBackend(GroupBackend):
             capabilities={"encode": self.video, "decode": True,
                           "video": self.video})]
 
+    # ---------------------------------------------------------- 构造
     def construct_cpu(self, operation=None):
+        import torch
+        self._build(torch.device("cpu"), operation)
+
+    def _build(self, device, operation=None):
         import torch
         import comfy.sd
 
@@ -47,30 +55,48 @@ class VaeBackend(GroupBackend):
                          "stream_load_safetensors_to_dict", None)
         if loader is None:
             raise RuntimeError("runner 缺少 stream_load_safetensors_to_dict")
-        self._stage("读取 %s 到 CPU" % self.MODEL_ID, operation)
+        self._stage("读取 %s 到 %s" % (self.MODEL_ID, device), operation)
         state, metadata = loader(self.config["path"], device="cpu")
         try:
             if self.video:
                 from dit_svc.runtime import _build_video_vae
-                vae = _build_video_vae(comfy, state, metadata,
-                                       torch.device("cpu"), torch)
+                vae = _build_video_vae(comfy, state, metadata, device, torch)
             else:
-                vae = comfy.sd.VAE(sd=state, metadata=metadata,
-                                   device=torch.device("cpu"))
+                vae = comfy.sd.VAE(sd=state, metadata=metadata, device=device)
         finally:
             state.clear()
         vae.first_stage_model.requires_grad_(False)
         vae.patcher.offload_device = torch.device("cpu")
+        self._attach(vae)
+
+    def _attach(self, vae):
         self.obj = vae
         if self.video:
             self.runtime.vvae = vae
         else:
             self.runtime.avae = vae
 
+    # ---------------------------------------------------------- 搬运
     def move_to(self, device):
         if self.obj is None:
             raise RuntimeError("%s 未加载" % self.MODEL_ID)
-        self.obj.patcher.model.to(device)
+        if device == "cpu":
+            self.obj.patcher.model.to("cpu")
+            return
+        # 量化 VAE 的 CPU 实例不能靠 .to(cuda) 正确 decode；在目标设备重建。
+        import torch
+        self._detach()
+        gc.collect()
+        if torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
+        self._build(torch.device(device))
+
+    def _detach(self):
+        self.obj = None
+        if self.video:
+            self.runtime.vvae = None
+        else:
+            self.runtime.avae = None
 
     def release(self):
         refs = []
@@ -80,11 +106,7 @@ class VaeBackend(GroupBackend):
             except Exception:
                 pass
             refs.append(self._release_ref(self.obj))
-        if self.video:
-            self.runtime.vvae = None
-        else:
-            self.runtime.avae = None
-        self.obj = None
+        self._detach()
         return refs
 
     def inventory(self):

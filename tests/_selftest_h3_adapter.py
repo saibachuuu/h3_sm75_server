@@ -417,6 +417,26 @@ def t_noncompute_short_circuit():
     return "waived-only never materialized"
 
 
+def t_buffer_dtype_follows_model():
+    """模型声明的 buffer dtype 优先于 checkpoint dtype。
+
+    真实 H3 把 adaln_t_table 注册为 float32，checkpoint 里是 bf16；
+    assign 不做 cast 会让 torch.lerp 的 input/weight dtype 不一致。
+    """
+    a, cat, model = _env()
+    table = model.get_buffer("adaln_t_table")
+    assert table.dtype == torch.float32, table.dtype
+    rep = a.materialize_unit(
+        model, "dit.modules.adaln_t_table",
+        {"adaln_t_table": torch.zeros(8, 32, dtype=torch.bfloat16)},
+        device="cpu", expected_keys=["adaln_t_table"])
+    assert rep["bound_keys"] == ["adaln_t_table"], rep
+    bound = model.get_buffer("adaln_t_table")
+    assert bound.dtype == torch.float32, bound.dtype
+    assert not bound.is_meta and bound.device.type == "cpu"
+    return "buffer cast to declared float32"
+
+
 print("== _selftest_h3_adapter ==")
 check("shape proxy mapping", t_shape_proxy)
 check("quant config version gate", t_quant_config_gate)
@@ -426,6 +446,7 @@ check("strict bind + audit; missing refused", t_strict_bind_and_audit)
 check("purge keeps slots, zero storage", t_purge_keeps_slots)
 check("waived-only short-circuit", t_noncompute_short_circuit)
 check("quant factory_kwargs sync", t_quant_factory_kwargs)
+check("buffer dtype follows model declaration", t_buffer_dtype_follows_model)
 check("registry lock concurrency", t_registry_lock_smoke)
 check("no-comfy clear error", t_no_comfy_gives_clear_error)
 
