@@ -69,6 +69,9 @@ class VaeBackend(GroupBackend):
                 vae = comfy.sd.VAE(sd=state, metadata=metadata, device=device)
         finally:
             state.clear()
+        # sd 已在目标设备时这一步是补漏：VAE 构造仍会用默认 device 创建部分
+        # 非 checkpoint buffer/参数，必须把它们一并搬到目标设备。
+        vae.first_stage_model.to(device)
         vae.first_stage_model.requires_grad_(False)
         vae.patcher.offload_device = torch.device("cpu")
         self._attach(vae)
