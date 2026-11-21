@@ -118,6 +118,9 @@ star7 的 gate 会判 dense，所以 warmup/bench 的 ms 数只是 **dense 回�
 GET  /api/status                     服务/cond/显存/队列状态
 GET  /api/defaults                   表单默认值与可选采样器
 GET  /api/jobs                       任务列表
+GET  /api/te/state                  本地 TE 状态机快照（device/VRAM/当前步骤）
+POST /api/te/step                   单步执行 TE 原子操作
+POST /api/te/probe                  仅搬运 TE 权重 RAM<->VRAM（不推理，测 GPU 承受力）
 GET  /api/jobs/<id>                  任务详情（含日志尾部）
 POST /api/jobs                       JSON {prompt, image_b64, mode, width, height,
                                      length, steps, sampler, scheduler, seed,
@@ -284,6 +287,13 @@ PY
 
 - **模型常驻**：DiT + 双 VAE + token_refiner 均不卸载（refiner 二次 refine 0.01s）；
   实测空闲显存 18.25 GB，解码峰值 20.28/23.62 GB（余量 ~3.3 GB）。
+- **本地文本编码器（TE）模式**：
+  启动时带 `--te-4b <path> --te-proj <name>` 或 `--te-gguf <path>` 即可让 DiT server
+  自己加载文本编码器；`/api/jobs` 会优先本地 encode，不再回调本机 cond server，
+  也不依赖 `ssh -R` 隧道。TE 权重常驻 CPU，encode 前才上卡，encode 完立即退回。
+- **TE 原子化 API**：远程高密度 GPU 容易卡死时，可用 `/api/te/step` 把 VAE 让位、
+  TE 上卡、encode、TE 退回、VAE 归位拆成单步；`/api/te/probe` 只搬运权重不推理，
+  专门测试 GPU 对 TE 上卡/退卡的承受力。详见 docs/te_atomic_api.md。
 - **cond 内容哈希缓存**：同 prompt+图+参数免重复编码（命中 <0.1s）。
 - **cond 文件 slim**：只含文本编码器输出（cond/minimax_token_tags…），不带图像像素；
   参考帧由 dit server 从任务 `image_b64` 本地解码 + 缩放 + VAE 编码
