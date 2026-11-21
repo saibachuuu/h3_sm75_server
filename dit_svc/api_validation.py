@@ -233,26 +233,57 @@ def parse_selector(selector):
     return "group", selector, None, None
 
 
+def _read_catalog_member(catalog, name):
+    """读取 catalog 成员，同时支持 ``UnitCatalog.unit_ids()`` 方法与 stub 属性。
+
+    真实 ``UnitCatalog`` 用 ``unit_ids(self)`` 方法（返回有序 ID 列表），早期
+    测试 stub 用同名属性。两种形态都要能用：先取值，可调用就调用，再转 list。
+    形状不对（例如返回 int）时按“catalog 未就绪”处理，不抛 TypeError 到上层。
+    """
+    raw = getattr(catalog, name, None)
+    if callable(raw):
+        raw = raw()
+    if raw is None:
+        return []
+    try:
+        return list(raw)
+    except TypeError:
+        raise ApiError("unit catalog 的 %s 接口形状不对（期望可迭代）" % name,
+                       code="ENV_NOT_READY", http_status=503)
+
+
 def expand_units(selectors, catalog):
     """把 selector 展开成按 catalog 原序去重的 unit ID 列表。
 
-    ``catalog`` 需提供 ``unit_ids``（有序序列）与可选 ``groups``（组名→unit 列表）。
-    catalog 未就绪（unit_ids 为空）时抛 ENV_NOT_READY，而不是返回空选择。
+    ``catalog`` 需提供 ``unit_ids``（有序序列**或返回该序列的方法**）与可选
+    ``groups``（组名→unit 列表）。catalog 未就绪（unit_ids 为空）时抛
+    ENV_NOT_READY，而不是返回空选择。
+
+    解析优先级（03 §3）：
+    - 与 catalog unit ID 精确相同的 selector 一律按精确 ID 处理，即使它看起来
+      像组名（如 ``dit.refiner`` / ``dit.modules.rope`` / ``vae.video.encoder``）；
+    - 否则才按 groups 里的组名展开；
+    - ``<prefix>.<a>-<b>`` 闭区间必须**逐个索引在 catalog 中存在**，缺任何一个
+      都 400，不允许静默 clamp 到命中的子集。
     """
-    unit_ids = list(getattr(catalog, "unit_ids", None) or ())
+    unit_ids = _read_catalog_member(catalog, "unit_ids")
     if not unit_ids:
         raise ApiError("unit catalog 尚未就绪，无法展开选择器",
                        code="ENV_NOT_READY", http_status=503)
-    groups = dict(getattr(catalog, "groups", None) or {})
+    raw_groups = getattr(catalog, "groups", None)
+    if callable(raw_groups):
+        raw_groups = raw_groups()
+    groups = dict(raw_groups or {})
     unit_set = set(unit_ids)
     selected = set()
 
     for selector in selectors:
+        # 语法始终先校验，即使该 selector 随后会被当作精确 ID
         kind, head, a, b = parse_selector(selector)
-        if kind == "exact":
-            if head not in unit_set:
-                raise invalid_selector("未知 unit: %s" % head, selector=selector)
-            selected.add(head)
+        if selector in unit_set:
+            selected.add(selector)
+        elif kind == "exact":
+            raise invalid_selector("未知 unit: %s" % head, selector=selector)
         elif kind == "group":
             matched = groups.get(selector)
             if matched is None:
@@ -265,20 +296,13 @@ def expand_units(selectors, catalog):
             selected.update(matched)
         else:  # range
             prefix = head + "."
-            hits = []
-            for unit in unit_ids:
-                if not unit.startswith(prefix):
-                    continue
-                rest = unit[len(prefix):]
-                if not rest.isdigit():
-                    continue
-                value = int(rest)
-                if a <= value <= b:
-                    hits.append(unit)
-            if not hits:
-                raise invalid_selector("区间未命中任何 unit: %s" % selector,
-                                       selector=selector)
-            selected.update(hits)
+            wanted = [prefix + str(i) for i in range(a, b + 1)]
+            missing = [u for u in wanted if u not in unit_set]
+            if missing:
+                raise invalid_selector(
+                    "区间越界：catalog 缺少 %d 个索引（首个 %s）"
+                    % (len(missing), missing[0]), selector=selector)
+            selected.update(wanted)
 
     return [u for u in unit_ids if u in selected]
 
@@ -286,14 +310,24 @@ def expand_units(selectors, catalog):
 # ------------------------------------------------------------------ weights 请求
 
 _RECIPE_ALLOWED = {"kind", "path", "proj", "mmproj", "options"}
+_RECIPE_KINDS = ("4b", "gguf", "checkpoint")
 
 
-def _validate_recipe(recipe, *, where):
+def _validate_recipe(recipe, *, where, model=None, action=None):
+    """校验 recipe 结构。
+
+    - 非 TE 模型（dit 等）：recipe 缺 ``kind`` 是合法的（默认按 checkpoint
+      处理），这里保留 ``kind=None``，**不伪造**成某个 kind；真正的 effective
+      配方由主代理在拿到 defaults/候选值后验证。
+    - TE（``model == "te"``）：``kind`` 允许省略，表示继承
+      ``defaults.model_recipes``；也不在这里补值。
+    - 显式给出的 ``kind`` 仍然必须属于 ``_RECIPE_KINDS``。
+    """
     if not isinstance(recipe, dict):
         raise invalid("%s 必须是 JSON 对象" % where)
     _reject_unknown(recipe, _RECIPE_ALLOWED, where=where)
-    kind = _string(recipe, "kind", required=True, max_len=64, where=where)
-    if kind not in ("4b", "gguf", "checkpoint"):
+    kind = _string(recipe, "kind", max_len=64, where=where)
+    if kind is not None and kind not in _RECIPE_KINDS:
         raise invalid("%s.kind 不支持: %s" % (where, kind), field="kind")
     for key, max_len in (("path", 1024), ("proj", 200), ("mmproj", 1024)):
         value = _string(recipe, key, max_len=max_len, where=where)
@@ -318,7 +352,7 @@ def validate_weights_request(payload, action):
                        code="INVALID_REQUEST", http_status=400)
     _require_object(payload)
     _reject_unknown(payload, {"model", "models", "mode", "units", "dry_run",
-                              "request_id", "recipe", "recipes"})
+                              "request_id", "recipe", "recipes", "options"})
 
     has_model, has_models = "model" in payload, "models" in payload
     if has_model == has_models:
@@ -372,6 +406,19 @@ def validate_weights_request(payload, action):
     dry_run = _strict_bool(payload, "dry_run", False)
     request_id = _request_id(payload)
 
+    # 顶层 options 只在 disk2ram 允许（03 §3 的 disk2ram 例子带 "options": {}）；
+    # 其它动作出现即拒绝，避免“看起来被接受其实被忽略”。原样保留 cleaned，
+    # 优先级（顶层 vs recipe.options）由主代理在构造 effective 配方时决定。
+    top_options = payload.get("options")
+    if top_options is not None:
+        if action != "disk2ram":
+            raise invalid("options 仅 disk2ram 支持", field="options")
+        if not isinstance(top_options, dict):
+            raise invalid("options 必须是 JSON 对象", field="options")
+        top_options = dict(top_options)
+    else:
+        top_options = None
+
     recipe = payload.get("recipe")
     recipes = payload.get("recipes")
     if action != "disk2ram":
@@ -384,7 +431,8 @@ def validate_weights_request(payload, action):
     if recipe is not None:
         if len(models) != 1:
             raise invalid("多模型请使用 recipes: {model_id: {...}}")
-        recipe_out = _validate_recipe(recipe, where="recipe")
+        recipe_out = _validate_recipe(recipe, where="recipe", model=models[0],
+                                      action=action)
     if recipes is not None:
         if len(models) == 1:
             raise invalid("单模型请使用 recipe，不用 recipes")
@@ -394,7 +442,8 @@ def validate_weights_request(payload, action):
         if unknown:
             raise invalid("recipes 含未在 models 中声明的模型: %s"
                           % ", ".join(unknown))
-        recipes_out = {m: _validate_recipe(v, where="recipes.%s" % m)
+        recipes_out = {m: _validate_recipe(v, where="recipes.%s" % m, model=m,
+                                           action=action)
                        for m, v in recipes.items()}
 
     return {
@@ -406,6 +455,7 @@ def validate_weights_request(payload, action):
         "request_id": request_id,
         "recipe": recipe_out,
         "recipes": recipes_out,
+        "options": top_options,
     }
 
 

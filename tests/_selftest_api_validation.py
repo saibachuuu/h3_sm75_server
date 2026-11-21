@@ -58,17 +58,48 @@ def expect_error(name, fn, *, code=None, http=None, contains=None):
     check(name, run)
 
 
-class FakeCatalog(object):
+class FakeUnitCatalog(object):
+    """模拟真实 ``UnitCatalog``：``unit_ids()`` 是**方法**，groups 是属性。
+
+    主代理接入时发现的正是这点：真实实现只有 ``unit_ids(self)`` 方法，旧
+    ``list(catalog.unit_ids)`` 会拿到 bound method 并 TypeError。
+    """
+
     def __init__(self):
-        self.unit_ids = (["dit.embed"] +
-                         ["dit.blocks.%d" % i for i in range(4)] +
-                         ["dit.refiner"])
+        self._ids = (["dit.embed"] +
+                     ["dit.blocks.%d" % i for i in range(4)] +
+                     ["dit.refiner", "dit.modules.rope",
+                      "vae.video.encoder"])
         self.groups = {"dit.blocks": ["dit.blocks.%d" % i for i in range(4)]}
+
+    def unit_ids(self):
+        return list(self._ids)
+
+
+class StubCatalogAttr(object):
+    """早期 stub 形态：unit_ids 是属性。两种形态都必须支持。"""
+
+    def __init__(self):
+        self.unit_ids = ["a.b.one", "a.b.two"]
+        self.groups = {"a.b": ["a.b.one", "a.b.two"]}
 
 
 class FakeCatalog0(object):
-    unit_ids = ()
+    def unit_ids(self):
+        return []
+
     groups = {}
+
+
+class GappyCatalog(object):
+    """索引不连续（缺 2），用于验证 range 必须逐索引全覆盖。"""
+
+    def __init__(self):
+        self._ids = ["dit.blocks.0", "dit.blocks.1", "dit.blocks.3"]
+        self.groups = {}
+
+    def unit_ids(self):
+        return list(self._ids)
 
 
 print("== selector 解析 ==")
@@ -87,7 +118,7 @@ expect_error("拒绝空段", lambda: parse_selector("dit..1"), code="INVALID_SEL
 expect_error("拒绝负数", lambda: parse_selector("dit.blocks.-3"), code="INVALID_SELECTOR")
 
 print("== selector 展开 ==")
-cat = FakeCatalog()
+cat = FakeUnitCatalog()
 check("exact 展开",
       lambda: expand_units(["dit.blocks.2"], cat) == ["dit.blocks.2"])
 check("range 按 catalog 原序",
@@ -105,6 +136,53 @@ expect_error("未知组", lambda: expand_units(["dit.nope"], cat),
              code="INVALID_SELECTOR", contains="未知组名")
 expect_error("空 catalog", lambda: expand_units(["dit.blocks.0"], FakeCatalog0()),
              code="ENV_NOT_READY", http=503)
+
+print("== catalog 接口：unit_ids() 方法 / 属性 stub ==")
+check("方法形态 unit_ids() 可用",
+      lambda: expand_units(["dit.blocks.1"], cat) == ["dit.blocks.1"])
+_check_attr_cat = StubCatalogAttr()
+check("属性形态 stub 也可用",
+      lambda: expand_units(["a.b.two"], _check_attr_cat) == ["a.b.two"])
+check("属性形态组名可用",
+      lambda: expand_units(["a.b"], _check_attr_cat) == ["a.b.one", "a.b.two"])
+
+
+class BadCatalogShape(object):
+    def unit_ids(self):
+        return 42
+
+    groups = {}
+
+
+expect_error("unit_ids 形状不对报 ENV_NOT_READY",
+             lambda: expand_units(["dit.blocks.0"], BadCatalogShape()),
+             code="ENV_NOT_READY", http=503)
+
+print("== 非数字精确 ID 不得被当成组名 ==")
+for exact_id in ("dit.refiner", "dit.modules.rope", "vae.video.encoder"):
+    check("精确选择 %s" % exact_id,
+          lambda i=exact_id: expand_units([i], cat) == [i])
+    check("groups 不含 %s 也仍精确" % exact_id,
+          lambda i=exact_id: i not in cat.groups)
+check("精确 ID 与组名混用保序",
+      lambda: expand_units(["dit.refiner", "dit.blocks"], cat) ==
+      ["dit.blocks.0", "dit.blocks.1", "dit.blocks.2", "dit.blocks.3",
+       "dit.refiner"])
+
+print("== range 必须逐索引全覆盖（不静默 clamp）==")
+gap = GappyCatalog()
+expect_error("缺中间索引的 range 400",
+             lambda: expand_units(["dit.blocks.0-3"], gap),
+             code="INVALID_SELECTOR", contains="越界")
+check("恰好全覆盖的 range 通过",
+      lambda: expand_units(["dit.blocks.0-1"], gap) ==
+      ["dit.blocks.0", "dit.blocks.1"])
+expect_error("range 上界越界 400",
+             lambda: expand_units(["dit.blocks.0-4"], gap),
+             code="INVALID_SELECTOR", contains="越界")
+expect_error("0-99 对 4 项 catalog 必须 400（不能只取 0-3）",
+             lambda: expand_units(["dit.blocks.0-99"], cat),
+             code="INVALID_SELECTOR", contains="越界")
 
 
 print("== weights 请求（四动作同一契约）==")
@@ -172,6 +250,44 @@ expect_error("recipe 未知字段",
              contains="device")
 expect_error("request_id 控制字符",
              lambda: W({"model": "dit", "request_id": "a\x01b"}), contains="控制字符")
+
+print("== disk2ram 顶层 options ==")
+check("disk2ram 顶层 options {} 通过",
+      lambda: W({"model": "te", "mode": "all", "options": {},
+                 "recipe": {"kind": "4b"}})["options"] == {})
+check("顶层 options 保留内容（优先级留给主代理）",
+      lambda: W({"model": "dit", "options": {"mlp_chunk": 2048}})["options"] ==
+      {"mlp_chunk": 2048})
+check("顶层 options 缺省为 None",
+      lambda: W({"model": "dit"})["options"] is None)
+for action in ("ram2vram", "vram2ram", "purgefromram"):
+    expect_error("%s 拒绝顶层 options" % action,
+                 lambda a=action: W({"model": "dit", "options": {}}, a),
+                 contains="仅 disk2ram")
+expect_error("顶层 options 非对象",
+             lambda: W({"model": "dit", "options": []}), contains="JSON 对象")
+
+print("== recipe.kind：非 TE 可缺省 checkpoint，TE 可继承 defaults ==")
+info_dit = W({"model": "dit", "recipe": {"path": "D:\\d.safetensors"}})
+check("非 TE 缺 kind 通过且不伪造 kind",
+      lambda: info_dit["recipe"]["kind"] is None and
+      info_dit["recipe"]["path"] == "D:\\d.safetensors")
+info_te = W({"model": "te", "recipe": {"path": "D:\\te.safetensors"}})
+check("TE 缺 kind 通过（继承 defaults）",
+      lambda: info_te["recipe"]["kind"] is None)
+check("TE 显式 4b 仍保留",
+      lambda: W({"model": "te", "recipe": {"kind": "4b"}})["recipe"]["kind"] == "4b")
+check("多模型 recipes 各自可缺 kind",
+      lambda: W({"models": ["dit", "te"],
+                 "recipes": {"dit": {"path": "D:\\d.safetensors"},
+                             "te": {}}})["recipes"]["dit"]["kind"] is None)
+expect_error("显式 kind 非枚举仍拒绝（非 TE）",
+             lambda: W({"model": "dit", "recipe": {"kind": "fp8"}}), contains="kind")
+expect_error("显式 kind 非枚举仍拒绝（TE）",
+             lambda: W({"model": "te", "recipe": {"kind": "fp8"}}), contains="kind")
+expect_error("recipe.options 非对象",
+             lambda: W({"model": "dit", "recipe": {"options": "x"}}),
+             contains="JSON 对象")
 
 print("== infer.encode ==")
 E = validate_encode_request
