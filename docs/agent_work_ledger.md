@@ -43,7 +43,10 @@ Four children created; no model duplicated. Slot E remains unused, not replaced 
 - A `9353342` / `66467fe` / `9e5464e` / `0c9023f`: review continues; actual
   meta construction and strict quantized materialization require additional
   proof/corrections before use. Session A is reused for every follow-up.
-- D `083b885` / `b3169d6` / `e3b95f7` / `5dddcbf`: reviewed and locally
-  retested; additional concrete storage/serialization corrections requested
-  in the same session D, not a replacement agent.
+- D `083b885` / `b3169d6` / `e3b95f7` / `5dddcbf` / `5651128`: personally
+  reviewed/retested and integrated as `4a364cd` / `b1b02ab` / `56de65b` /
+  `2a74dcd` / `b5076bd`. Primary additionally fixed reserve/transaction
+  boundaries and added safe artifact HTTP downloads and regressions.
+- B runner `a08e30e`: personally reviewed/retested and integrated as `f1c9c6b`;
+  primary review narrowed subsystem discovery and covered that regression.
 - C: original assigned work still pending acceptance; no replacement agent.

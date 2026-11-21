@@ -28,7 +28,8 @@ class RunnerTests(unittest.TestCase):
                           "execution_boundary", "check_call_sites"])
         review = runner.P0_SPECS[-1]
         self.assertEqual(review.filename, "_selftest_registry_review.py")
-        self.assertIn("_selftest_*review*.py", review.globs)
+        self.assertIn("_selftest_*weights*review*.py", review.globs)
+        self.assertIn("_selftest_*registry*review*.py", review.globs)
 
         with tempfile.TemporaryDirectory() as directory:
             tests = Path(directory)
@@ -56,6 +57,14 @@ class RunnerTests(unittest.TestCase):
             path, resolution = runner.resolve_script(legacy_spec, tests)
             self.assertEqual(path, actual)
             self.assertEqual(resolution, "glob:_selftest_*review*.py")
+
+    def test_weights_review_does_not_run_unrelated_artifact_review(self):
+        review = next(spec for spec in runner.P0_SPECS if spec.label == "weights_review")
+        with tempfile.TemporaryDirectory() as directory:
+            tests = Path(directory)
+            _write_script(tests / "_selftest_artifact_review.py", "# wrong subsystem\n")
+            path, _ = runner.resolve_script(review, tests)
+            self.assertIsNone(path)
 
     def test_execute_statuses_utf8_and_missing(self):
         with tempfile.TemporaryDirectory() as directory:

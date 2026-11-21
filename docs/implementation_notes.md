@@ -29,7 +29,7 @@ Implementation authorized on 2026-11-21. The user allows the listed agents, dedi
 | P0 feasibility/version baseline | In progress | Selective materialization, resident Comfy bookkeeping, VEDA lifecycle, actual dependency signatures |
 | P1 empty shell/executor | Local foundation integrated | Process-only CLI, no startup loader, environment/compute split, one worker, operation HTTP views; real empty boot pending |
 | P2 partial weight lifecycle | Not integrated | Real selective read/materialize/purge/reload, quant storage, error recovery |
-| P3 resident inference/artifacts | Not integrated | Strict weight-device invariants and complete AV latent roundtrip |
+| P3 resident inference/artifacts | Artifact component locally integrated | CPU safetensors roundtrip and safe downloads; resident inference and real GPU invariants pending |
 | P4 attention/VEDA | Not integrated | Correct rollback/clear and no implicit predictor copies |
 | P5 compatibility/UI/routes | Not integrated | Explicit migration, public state sanitation, safe downloads |
 | P6 GPU acceptance | Not run | Same-input latent/frames/resources and real sparse-call evidence |
@@ -64,10 +64,23 @@ No GPU load, inference baseline, or attention kernel verification has been perfo
   the synchronization hook completes, just like operations.
 - The four weight POSTs and resident inference are not yet wired; a working empty HTTP foundation is not full explicit-weight acceptance.
 
+### Reviewed artifact component
+
+- D initial `083b885`/`b3169d6`, corrections `e3b95f7`/`5dddcbf`/`5651128`:
+  personally reviewed and reran storage, serialization and API-validation suites.
+  Integrated as `4a364cd`, `b1b02ab`, `56de65b`, `2a74dcd`, `b5076bd`.
+- Primary additionally retained the configured disk reserve after actual writes,
+  extended the writer lease through hash/manifest publication, and pinned artifact
+  downloads against cleanup. Primary regressions pass (2 storage, 3 HTTP).
+- `GET /api/artifacts/<id>` and safe `/outputs/stage/<name>` are wired; invalid
+  paths are rejected rather than flattened with basename. Suffix ranges and 416
+  responses are covered. These CPU/HTTP tests are not GPU inference acceptance.
+- B staged runner `a08e30e` was personally reviewed/tested and integrated as
+  `f1c9c6b`; the primary narrowed weights-review discovery to its subsystem.
+
 ### Other reviews still open
 
 - A `9353342`/`66467fe`: CPU catalog/storage/fake lifecycle evidence, but real H3 materialization is not yet proven. Primary requested recipe-option conflict, deep snapshot, catalog replacement, header bounds and recovery fixes; real adapter work continues in the same session.
-- D `083b885`/`b3169d6`: primary found stage-root symlink, reference/delete race, quota/manifest rollback, batch_index and artifact validation edge cases. Primary reran `e3b95f7`/`5dddcbf`; all three suites passed, but concrete near-quota, no-clobber publication, invalid builder and failed-cleanup counterexamples still require correction in the same session. Existing green tests do not constitute merge approval.
 - C: resident Comfy and VEDA lifecycle work continues; no result has been accepted yet.
 
 Four fixed children are recorded in `agent_work_ledger.md`; slot E remains unused because its exact model was not listed by the provider.

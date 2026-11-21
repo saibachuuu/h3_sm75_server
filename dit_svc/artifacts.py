@@ -17,6 +17,7 @@
 ``dit_svc/operations.py`` 的统一错误。
 """
 import hashlib
+from contextlib import contextmanager
 import json
 import math
 import os
@@ -246,7 +247,7 @@ class ArtifactStore(object):
         self._lock = threading.RLock()
         # 串行化“写临时文件 → 实际字节复核 → 无覆盖发布”。它只在提交方之间排队，
         # 不持有 ``_lock``，所以 GET/list/引用不需要等一次 8GB 落盘。
-        self._write_lock = threading.Lock()
+        self._write_lock = threading.RLock()
         self.last_cleanup_failures = []   # 最近一次 cleanup 中删不掉/只剩孤儿
         self._refs = {}          # artifact_id -> active 引用计数
         self._index = {}         # artifact_id -> manifest dict
@@ -553,7 +554,8 @@ class ArtifactStore(object):
         # 本次预留对应的临时文件已计入 usage，只有其它预留还需要占位
         others = max(0, self._pending_bytes() - int(expected or 0))
         required = usage + others + reserve
-        if required <= self.quota_bytes and free >= reserve:
+        disk_required = self.disk_reserve_bytes + others + reserve
+        if required <= self.quota_bytes and free >= disk_required:
             return
         raise ArtifactError(
             "实际写入后超出预算（占据 %d = stage 已用 %d + 其它预留 %d + "
@@ -563,7 +565,8 @@ class ArtifactStore(object):
             details={"actual_bytes": actual, "stage_usage_bytes": usage,
                      "pending_bytes": others, "manifest_reserve": reserve,
                      "quota_bytes": self.quota_bytes,
-                     "disk_free_bytes": free})
+                     "disk_free_bytes": free,
+                     "disk_required_bytes": disk_required})
 
     # -------------------------------------------------- 生命周期
 
@@ -575,6 +578,26 @@ class ArtifactStore(object):
                                     code="ARTIFACT_NOT_FOUND", http_status=404)
             self._refs[artifact_id] = self._refs.get(artifact_id, 0) + 1
         return artifact_id
+
+    @contextmanager
+    def download_lease(self, name):
+        """Pin every indexed owner of a filename until its download finishes.
+
+        Resolve and refcount under the metadata lock; do not hold that lock
+        while streaming. Pinning all owners also protects older duplicate
+        manifests that refer to the same data filename.
+        """
+        with self._lock:
+            path = self.resolve(name)
+            owners = [aid for aid, manifest in self._index.items()
+                      if manifest["filename"] == name]
+            for aid in owners:
+                self._refs[aid] = self._refs.get(aid, 0) + 1
+        try:
+            yield path
+        finally:
+            for aid in owners:
+                self.release(aid)
 
     def release(self, artifact_id):
         with self._lock:
@@ -747,6 +770,18 @@ class ArtifactStore(object):
 
     def commit_stream(self, kind, filename, writer, *, metadata=None, fmt=None,
                       expected_bytes=None):
+        # A published data file already consumes its reservation, but it is not
+        # an indexed artifact until the hash/manifest commits. Keep the writer
+        # lease through that entire transaction, not just through os.link, or a
+        # second writer counts the first data file plus its still-live promise.
+        # GET/read metadata uses _lock only and remains responsive.
+        with self._write_lock:
+            return self._commit_stream_locked(
+                kind, filename, writer, metadata=metadata, fmt=fmt,
+                expected_bytes=expected_bytes)
+
+    def _commit_stream_locked(self, kind, filename, writer, *, metadata=None,
+                              fmt=None, expected_bytes=None):
         """用 ``writer(tmp_path)`` 落盘大文件（如 safetensors），再原子发布。
 
         writer 必须把完整内容写到给定路径；任何异常都不留半写产物。

@@ -1,15 +1,37 @@
 """dit server 的 HTTP 层：WebUI 静态页 + 任务 API + 成果文件（含 Range 断点）。"""
 import json
 import os
+import re
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from common.protocol import DEFAULTS, DIRECTOR_MAX_SHOTS, SAMPLERS, SCHEDULERS, dumps
 from dit_svc.operations import OperationError
+from dit_svc.artifacts import ArtifactStore, safe_join
 
 WEBUI_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webui")
 MAX_BODY = 96 * 1024 * 1024
+
+
+def byte_range(header, size):
+    """Return one RFC byte range; invalid/unsatisfiable requests raise ValueError."""
+    if not header:
+        return 0, size - 1, 200
+    match = re.fullmatch(r"bytes=([0-9]*)-([0-9]*)", header.strip())
+    if match is None or not any(match.groups()):
+        raise ValueError("invalid byte range")
+    first, last = match.groups()
+    if first:
+        start = int(first)
+        end = int(last) if last else size - 1
+        if start >= size or end < start:
+            raise ValueError("unsatisfiable byte range")
+        return start, min(end, size - 1), 206
+    suffix = int(last)
+    if suffix <= 0 or size <= 0:
+        raise ValueError("unsatisfiable suffix range")
+    return max(0, size - suffix), size - 1, 206
 
 # 导演台（镜头序列）前端默认值与上限；契约见仓库外 _ada_director_api.md
 DIRECTOR_DEFAULTS = {
@@ -47,6 +69,11 @@ def _veda_calls_snapshot():
 
 def make_handler(runtime, queue, ctx):
     out_dir = ctx["out_dir"]
+    artifacts = ctx.get("artifacts")
+    if artifacts is None:
+        artifacts = ArtifactStore(out_dir)
+        ctx["artifacts"] = artifacts
+    runtime.artifacts = artifacts
     _RUNTIME_HOLDER["runtime"] = runtime
 
     class DitHandler(BaseHTTPRequestHandler):
@@ -83,27 +110,25 @@ def make_handler(runtime, queue, ctx):
             self.end_headers()
             self.wfile.write(body)
 
+        def _error(self, exc):
+            error = OperationError.from_exception(exc)
+            self._json({"ok": False, "error": error.to_dict()}, error.http_status)
+
         def _file(self, path, ctype=None, allow_range=True):
             if not (os.path.isfile(path) and os.path.getsize(path) > 0):
                 self._json({"ok": False, "error": "文件不存在"}, 404)
                 return
             size = os.path.getsize(path)
             ctype = ctype or "application/octet-stream"
-            start, end = 0, size - 1
-            code = 200
             range_hdr = self.headers.get("Range") if allow_range else None
-            if range_hdr and range_hdr.startswith("bytes="):
-                try:
-                    spec = range_hdr[len("bytes="):].split(",")[0].strip()
-                    a, _, b = spec.partition("-")
-                    start = int(a) if a else 0
-                    end = int(b) if b else size - 1
-                    end = min(end, size - 1)
-                    if start > end or start >= size:
-                        raise ValueError
-                    code = 206
-                except ValueError:
-                    start, end, code = 0, size - 1, 200
+            try:
+                start, end, code = byte_range(range_hdr, size)
+            except ValueError:
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % size)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             length = end - start + 1
             self.send_response(code)
             self.send_header("Content-Type", ctype)
@@ -224,6 +249,12 @@ def make_handler(runtime, queue, ctx):
                     self._json({"ok": False, "error": err.to_dict()}, 404)
                 else:
                     self._json({"ok": True, "operation": operation.public(include_log=True)})
+            elif path.startswith("/api/artifacts/"):
+                try:
+                    artifact_id = path[len("/api/artifacts/"):]
+                    self._json({"ok": True, "artifact": artifacts.public(artifact_id)})
+                except Exception as exc:
+                    self._error(exc)
             elif path == "/api/jobs":
                 self._json(queue.snapshot())
             elif path.startswith("/api/jobs/"):
@@ -234,15 +265,19 @@ def make_handler(runtime, queue, ctx):
                 else:
                     self._json(job.public(with_log=True))
             elif path.startswith("/outputs/"):
-                name = os.path.basename(path[len("/outputs/"):])
-                if "/" in name or "\\" in name or ".." in name:
-                    self._json({"ok": False, "error": "bad name"}, 400)
-                    return
-                p = os.path.join(out_dir, name)
-                ctype = ("video/mp4" if name.endswith(".mp4")
-                         else "application/json" if name.endswith(".json")
-                         else "image/png" if name.endswith(".png") else None)
-                self._file(p, ctype)
+                try:
+                    name = path[len("/outputs/"):]
+                    ctype = ("video/mp4" if name.endswith(".mp4")
+                             else "application/json" if name.endswith(".json")
+                             else "image/png" if name.endswith(".png") else None)
+                    if name.startswith("stage/"):
+                        name = name[len("stage/"):]
+                        with artifacts.download_lease(name) as p:
+                            self._file(p, ctype)
+                    else:
+                        self._file(safe_join(out_dir, name), ctype)
+                except Exception as exc:
+                    self._error(exc)
             else:
                 self._json({"ok": False, "error": "not found"}, 404)
 

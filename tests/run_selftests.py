@@ -18,6 +18,7 @@
 import argparse
 import datetime
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -54,7 +55,7 @@ P0_SPECS = (
     TestSpec(
         "weights_review",
         "_selftest_registry_review.py",
-        ("_selftest_*review*.py", "_weights_review.py"),
+        ("_selftest_*weights*review*.py", "_selftest_*registry*review*.py", "_weights_review.py"),
         "旧 _weights_review.py 名称缺失；优先实际 registry_review，glob 兜底",
     ),
 )
@@ -320,7 +321,7 @@ def main(argv=None):
                         help="只列出计划/可见性，不执行测试")
     args = parser.parse_args(argv)
 
-    if args.timeout <= 0:
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("--timeout 必须大于 0")
     if args.list and args.report:
         parser.error("--list 不能与 --report 同用（list 不执行测试）")
