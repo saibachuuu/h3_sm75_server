@@ -29,8 +29,10 @@ def free_port():
 
 
 class Client:
-    def __init__(self, port, timeout=30):
-        self.base = "http://127.0.0.1:%d" % port
+    def __init__(self, port=None, timeout=30, base_url=None):
+        if port is None and base_url is None:
+            raise ValueError("port or base_url is required")
+        self.base = base_url.rstrip("/") if base_url is not None else "http://127.0.0.1:%d" % port
         self.timeout = timeout
 
     def request(self, method, path, body=None):

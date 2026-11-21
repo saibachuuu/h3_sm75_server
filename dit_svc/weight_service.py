@@ -109,6 +109,10 @@ class WeightService:
     def encode(self, request, operation=None):
         return self.backends["te"].run_encode(request, operation)
 
+    def probe(self, request, operation=None):
+        from dit_svc.te_probe import run_probe
+        return run_probe(self.backends["te"], request, operation)
+
     def preflight_encode(self, request=None):
         return self.backends["te"].preflight_encode(request)
 

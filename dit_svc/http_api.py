@@ -263,8 +263,8 @@ def make_handler(runtime, queue, ctx):
             except Exception as exc:
                 self._error(exc)
 
-        def _post_encode(self):
-            """POST /api/infer/encode → 202；显式要求 te 已在显存。"""
+        def _post_encode(self, probe=False):
+            """Encode/probe share admission and the only operation worker."""
             payload = self._read_json_body()
             if payload is None:
                 self._json({"ok": False, "error": {
@@ -272,14 +272,17 @@ def make_handler(runtime, queue, ctx):
                     "http_status": 400, "retryable": False, "details": None}}, 400)
                 return
             try:
-                request = api_validation.validate_encode_request(payload)
+                validator = (api_validation.validate_te_probe_request if probe
+                             else api_validation.validate_encode_request)
+                request = validator(payload)
                 runtime.te.preflight_encode(request)
+                callback = runtime.run_infer_te_probe if probe else runtime.run_infer_encode
                 operation = queue.submit_operation(
-                    "infer.encode", request,
-                    lambda op: runtime.run_infer_encode(request, op),
+                    "infer.te_probe" if probe else "infer.encode", request,
+                    lambda op: callback(request, op),
                     request_id=request["request_id"])
                 receipt = operation.receipt()
-                receipt["capability"] = "encode"
+                receipt["capability"] = "te_probe" if probe else "encode"
                 self._json(receipt, 202)
             except OperationError as exc:
                 self._json({"ok": False, "error": exc.to_dict()}, exc.http_status)
@@ -414,6 +417,9 @@ def make_handler(runtime, queue, ctx):
             path = urllib.parse.urlparse(self.path).path
             if path.startswith("/api/weights/"):
                 self._post_weights(path)
+                return
+            if path == "/api/infer/te_probe":
+                self._post_encode(probe=True)
                 return
             if path == "/api/infer/encode":
                 self._post_encode()

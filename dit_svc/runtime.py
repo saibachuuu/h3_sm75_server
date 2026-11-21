@@ -147,7 +147,7 @@ class Runtime:
 
     def capabilities(self):
         models = self.weights_snapshot()["models"]
-        needs = {"encode": ("te",), "sample": ("dit",),
+        needs = {"encode": ("te",), "te_probe": ("te",), "sample": ("dit",),
                  "decode": ("vae.video", "vae.audio"),
                  "video_from_cond": ("dit", "vae.video", "vae.audio")}
         result = {}
@@ -155,7 +155,7 @@ class Runtime:
             missing = []
             for model in required:
                 state = models[model]["state"]
-                ok = (state == "vram") if name == "encode" else (
+                ok = (state == "vram") if name in ("encode", "te_probe") else (
                     state in ("ram", "vram")) if name == "decode" else (
                     state == "vram" if model == "dit" else state in ("ram", "vram"))
                 if not ok:
@@ -201,7 +201,7 @@ class Runtime:
             raise OperationError("ENV_NOT_READY", self.error or "环境尚未就绪", 503, True)
         if not self.device_healthy:
             raise OperationError("DEVICE_UNHEALTHY", "CUDA 设备不可用，需检查或重启", 503, False)
-        if kind == "infer.encode":
+        if kind in ("infer.encode", "infer.te_probe"):
             # 只查状态，不自动上卡；缺资源时给有序建议。
             self.weights.preflight_encode(None)
 
@@ -212,6 +212,9 @@ class Runtime:
     def run_infer_encode(self, request, operation=None):
         """infer.encode 的唯一执行入口（单 worker 调用）。"""
         return self.weights.encode(request, operation)
+
+    def run_infer_te_probe(self, request, operation=None):
+        return self.weights.probe(request, operation)
 
     def operation_synchronize(self, operation):
         if self.torch is not None and self.torch.cuda.is_initialized():
@@ -787,7 +790,7 @@ class Runtime:
         result = self.te.run_action("ram2vram", _all_request())
         return {
             "elapsed_s": result.get("elapsed_s", 0.0),
-            "device": (result.get("audit") or {}).get("model_device"),
+            "device": ((result.get("audit") or {}).get("units") or {}).get("te.model", {}).get("device"),
             "alloc_gb": round(torch.cuda.memory_allocated() / 1e9, 3),
             "audit": result.get("audit"),
         }
@@ -799,39 +802,16 @@ class Runtime:
         result = self.te.run_action("vram2ram", _all_request())
         return {
             "elapsed_s": result.get("elapsed_s", 0.0),
-            "device": (result.get("audit") or {}).get("model_device"),
+            "device": ((result.get("audit") or {}).get("units") or {}).get("te.model", {}).get("device"),
             "audit": result.get("audit"),
         }
 
     def _te_preprocess_refs(self, image_bytes_list, mode, width, height, ref_image_size):
-        """参考图预处理：bytes -> ref_items / images（CPU 张量）。"""
-        import io
-        import numpy as np
-        import torch
-        from PIL import Image
-        import comfy.utils as cu
-        from common.protocol import target_frame_size
-
-        imgs = [b for b in (image_bytes_list or []) if b]
-        if not (1 <= len(imgs) <= 9):
-            raise ValueError("参考图须为 1–9 张")
-        if mode == "fl2va" and len(imgs) != 1:
-            raise ValueError("fl2va 仅支持单图")
-
-        qwen_sizes = []
-        ref_items = []
-        for b in imgs:
-            img = Image.open(io.BytesIO(b)).convert("RGB")
-            arr = np.asarray(img).astype(np.float32) / 255.0
-            frame = torch.from_numpy(arr).unsqueeze(0)
-            rh, rw = int(frame.shape[1]), int(frame.shape[2])
-            tw, th = target_frame_size(mode, rw, rh, width, height, ref_image_size)
-            samples = frame[..., :3].movedim(-1, 1)
-            samples = cu.common_upscale(samples, tw, th, "lanczos", "disabled")
-            rz = samples.movedim(1, -1)
-            qwen_sizes.append([int(rz.shape[1]), int(rz.shape[2])])
-            ref_items.append({"type": "image", "data": rz})
-        return imgs, ref_items, qwen_sizes
+        """Legacy input decoding delegates to the same CPU preprocessing."""
+        import base64
+        images = [base64.b64encode(value).decode("ascii")
+                  for value in image_bytes_list or [] if value]
+        return self.te._preprocess(images, mode, width, height, ref_image_size)
 
     def te_encode_tokens(self, prompt, ref_items, mode="ref2va"):
         """Legacy 调试入口也复用受保护的 TE 推理，不再维护第二份实现。"""
@@ -1021,23 +1001,17 @@ class Runtime:
         返回 (dict 含 cond/minimax_token_tags, stats)。调用方（pipeline/HTTP）
         必须先通过 POST /api/weights/te/disk2ram + ram2vram 把 TE 放上卡。
         """
-        import base64 as _b64
         import torch
         t_all = time.perf_counter()
         self.te.preflight_encode(None)
-
-        # 参考图预处理（CPU）
-        images = [_b64.b64encode(b).decode("ascii")
-                  for b in (image_bytes_list or []) if b]
-        images = [s if s.startswith("data:") else s for s in images]
-        _, ref_items, qwen_sizes = self.te._preprocess(
-            images, mode, width, height, ref_image_size)
+        _, ref_items, qwen_sizes = self._te_preprocess_refs(
+            image_bytes_list, mode, width, height, ref_image_size)
 
         out, enc_stats = self.te._encode_tokens(prompt, ref_items, mode=mode)
         audit = self.te._refresh()
-        if audit["model_device"] != "cuda:0":
-            raise RuntimeError("encode 期间 TE 权重被移出显存: %s"
-                               % audit["model_device"])
+        if audit["units"]["te.model"]["device"] != "cuda:0":
+            raise OperationError("WEIGHT_MUTATED", "encode 期间 TE 权重被移出显存",
+                                 500, False, audit)
 
         total_s = time.perf_counter() - t_all
         result = {

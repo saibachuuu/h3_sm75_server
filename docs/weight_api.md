@@ -1,6 +1,6 @@
 # 显式权重 API（统一四动作）
 
-更新时间：2026-11-21。目标：**所有模型权重只能通过 API 管理**，无参数启动是纯空壳；
+本文以当前源码为准。目标：**所有模型权重只能通过 API 管理**，无参数启动是纯空壳；
 推理与权重操作共用同一个单 worker 执行器。
 
 ## 1. 模型与粒度
@@ -130,6 +130,23 @@ POST /api/weights/te/purgefromram {"mode": "all"} # 释放并证明零存储
 旧 `POST /api/te/step`、`/api/te/probe` 保留为 legacy 调试路径，也由同一
 worker 执行；有界等待 1800s，超时返回 operation 回执，不再在 HTTP 线程里
 并发搬模型或编码。
+
+### 3.1 TE 规模探针（真实计算，不写 artifact）
+
+```text
+POST /api/infer/te_probe
+```
+
+```json
+{"scale": {"text_chars": 1024, "image_width": 512, "image_height": 512, "images": 1},
+ "warmup": 1, "repeat": 5, "seed": 0, "min_free_mb": 256}
+```
+
+只需已配置的 TE/投影计算副本都在显存，其它模型不必在场。返回 202 并通过
+operation 轮询；结果含每轮耗时、输出条件长度、显存峰值及整次请求的驻留审计。
+规模是输入字符和图片像素，**不是精确的内部 token 数**。内存不足或 NaN/Inf
+明确失败，不自动减小规模、卸载其它模型重试；探针不保存 cond/video。
+参数范围、指标含义和现有服务客户端见 [te_resident_probe.md](te_resident_probe.md)。
 
 ## 4. 启动与配置
 

@@ -14,6 +14,7 @@ tokenizer/视觉塔），``te.proj`` 是 ClipProj 投影。Comfy 的 ``load_clip
 
 本模块不 import torch/Comfy：只有真正执行动作时才惰性导入。
 """
+import contextlib
 import base64
 import json
 import os
@@ -137,6 +138,7 @@ class TeBackend(GroupBackend):
             self._projected = True
         self._clip = clip
         self.obj = pc
+        self._clip_model().eval().requires_grad_(False)
 
     def _clip_model(self):
         return self.obj.patcher.model if self.obj is not None else None
@@ -407,22 +409,31 @@ class TeBackend(GroupBackend):
             ref_items.append({"type": "image", "data": rz})
         return imgs, ref_items, qwen_sizes
 
-    def _encode_tokens(self, prompt, ref_items, mode, operation=None):
-        """All encode callers share the resident guard, including legacy endpoints."""
+    @contextlib.contextmanager
+    def _encode_session(self, operation=None):
+        """One guarded session can encode once or perform a whole probe batch."""
         import torch
         with self._lock:
             self.preflight_encode()
-            try:
-                with self.runtime.te_residence.inference(self, operation) as proof:
-                    with torch.no_grad():
-                        out, stats = self._encode_tokens_impl(prompt, ref_items, mode)
-                stats["residence"] = proof
-                return out, stats
-            except torch.OutOfMemoryError as exc:
-                audit = self._refresh()
-                # No weights moved: insufficient workspace does not corrupt TE.
-                raise OperationError("CUDA_OOM", "TE 推理工作区不足，未自动卸载其它模型",
-                                     409, True, {"actual": audit}) from exc
+            with self.runtime.te_residence.inference(self, operation) as proof:
+                def encode(prompt, refs, mode):
+                    self.preflight_encode()
+                    try:
+                        with torch.no_grad():
+                            return self._encode_tokens_impl(prompt, refs, mode)
+                    except torch.OutOfMemoryError as exc:
+                        # Classify encoder workspace OOM, not unrelated CPU setup failures.
+                        audit = self._refresh()
+                        raise OperationError("CUDA_OOM", "TE 推理工作区不足，未自动卸载其它模型",
+                                             409, True, {"actual": audit}) from exc
+                yield encode, proof
+
+    def _encode_tokens(self, prompt, ref_items, mode, operation=None):
+        """All callers share the same resident session, including legacy endpoints."""
+        with self._encode_session(operation) as (encode, proof):
+            out, stats = encode(prompt, ref_items, mode)
+        stats["residence"] = proof
+        return out, stats
 
     def _encode_tokens_impl(self, prompt, ref_items, mode):
         pc = self.obj

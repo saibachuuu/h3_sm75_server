@@ -7,7 +7,9 @@
 * 未知 model/unit/动作、URL 与 body.model 冲突都是 4xx；
 * infer.encode 在 TE 未上卡时返回 409 + 有序 suggested。
 """
+import contextlib
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -136,6 +138,51 @@ def main():
 
             status, body = request("POST", "/api/infer/encode", {"prompt": "a cat"})
             assert status == 400, (status, body)
+            status, body = request("POST", "/api/infer/te_probe", {"scale": {}})
+            assert status == 409 and body["error"]["code"] == "MISSING_UNITS", (status, body)
+            status, body = request("POST", "/api/infer/te_probe", {"scale": {"tokens": 1024}})
+            assert status == 400, (status, body)
+
+            for uid in ("te.model", "te.proj"):
+                runtime.weights.registry.set_unit_loaded("te", uid, "cuda:0",
+                                                         resident_bytes_cpu=0,
+                                                         resident_bytes_cuda=16)
+            probe_calls = []
+            def te_probe(spec, operation):
+                assert threading.current_thread().name == "h3-worker"
+                assert runtime.weights.model_summary("dit")["state"] == "absent"
+                probe_calls.append(spec)
+                return {"kind": "te_probe", "scale": spec["scale"], "runs": []}
+            runtime.weights.probe = te_probe
+            payload = {"scale": {"text_chars": 200, "image_width": 64,
+                                 "image_height": 96, "images": 2},
+                       "repeat": 2, "warmup": 0, "request_id": "probe-1"}
+            status, body = request("POST", "/api/infer/te_probe", payload)
+            assert status == 202 and body["capability"] == "te_probe", (status, body)
+            operation_id = body["operation_id"]
+            operation = wait_operation(operation_id)
+            assert operation["status"] == "done" and operation["kind"] == "infer.te_probe", operation
+            assert operation["result"]["scale"] == payload["scale"], operation
+            status, body = request("POST", "/api/infer/te_probe", payload)
+            assert status == 202 and body["operation_id"] == operation_id, (status, body)
+            assert len(probe_calls) == 1, probe_calls
+            status, body = request("POST", "/api/infer/te_probe", dict(payload, repeat=3))
+            assert status == 409 and body["error"]["code"] == "REQUEST_ID_CONFLICT", (status, body)
+
+            # The standalone probe client reuses HTTP helpers, and never starts a
+            # server or loads any weights itself.
+            sys.path.insert(0, str(ROOT / "tests" / "probes"))
+            import te_infer_probe
+            report_path = Path(directory) / "te_probe_client.json"
+            cli_args = ["te_infer_probe.py", "--url", "http://127.0.0.1:%d" % server.server_port,
+                        "--text-chars", "200", "--image-width", "64", "--image-height", "96",
+                        "--images", "2", "--repeat", "2", "--warmup", "0",
+                        "--out", str(report_path)]
+            with patch.object(sys, "argv", cli_args), contextlib.redirect_stdout(io.StringIO()):
+                assert te_infer_probe.main() == 0
+            client_report = json.loads(report_path.read_text(encoding="utf-8"))
+            assert client_report["status"] == "done", client_report
+            assert len(probe_calls) == 2, probe_calls
 
             # Legacy TE operations may not race the worker through HTTP threads.
             entered, release = threading.Event(), threading.Event()

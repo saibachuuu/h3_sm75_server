@@ -507,6 +507,12 @@ def validate_encode_request(payload, *, allow_text_only=False):
     }
 
 
+def validate_te_probe_request(payload):
+    """Synthetic-input TE probe scale; no promised internal token count."""
+    from dit_svc.te_probe import validate_request
+    return validate_request(payload)
+
+
 # ------------------------------------------------------------------ infer.sample
 
 _SAMPLE_ALLOWED = {"cond_artifact", "cond_file", "cond_b64", "image_b64s",
