@@ -149,21 +149,45 @@ class Runtime:
                  "video_from_cond": ("dit", "vae.video", "vae.audio")}
         result = {}
         for name, required in needs.items():
-            missing = [model for model in required if models[model]["state"] != "vram"]
+            missing = []
+            for model in required:
+                state = models[model]["state"]
+                ok = (state == "vram") if name == "encode" else (
+                    state in ("ram", "vram")) if name == "decode" else (
+                    state == "vram" if model == "dit" else state in ("ram", "vram"))
+                if not ok:
+                    missing.append(model)
             result[name] = {"ready": self.env_ready and self.device_healthy and not missing,
                             "missing": missing}
         return result
 
     def job_admission(self, job):
-        """Cheap locked admission hook; specific unit requirements follow in P2/P3."""
+        """Cheap locked admission hook.
+
+        sample 只需要 DiT 在显存；VAE 允许停在 RAM（decode 前 pipeline 会上卡，
+        首版仍是其原有的 `.to(device)`）。缺失的模型仍拒绝，不自动搬运。
+        具体 unit 依赖在 P3 推理原语里继续细化。
+        """
         from dit_svc.operations import OperationError
         capability = "decode" if job.kind == "vae_probe" else "video_from_cond"
-        required = ("vae.video",) if job.kind == "vae_probe" else ("dit", "vae.video", "vae.audio")
         models = self.weights_snapshot()["models"]
-        missing = [model for model in required if models[model]["state"] != "vram"]
-        if missing:
-            raise OperationError("MISSING_UNITS", "任务所需权重尚未在显存中", 409, False,
-                                 {"capability": capability, "missing": missing})
+        issues = []
+        if job.kind == "vae_probe":
+            for model in ("vae.video",):
+                if models[model]["state"] not in ("ram", "vram"):
+                    issues.append((model, models[model]["state"]))
+        else:
+            if models["dit"]["state"] != "vram":
+                issues.append(("dit", models["dit"]["state"]))
+            for model in ("vae.video", "vae.audio"):
+                if models[model]["state"] not in ("ram", "vram"):
+                    issues.append((model, models[model]["state"]))
+        if issues:
+            raise OperationError(
+                "MISSING_UNITS", "任务所需权重尚未就绪", 409, False,
+                {"capability": capability,
+                 "missing": [model for model, _ in issues],
+                 "states": {model: state for model, state in issues}})
 
     def require_job_execution(self, job):
         self.job_admission(job)

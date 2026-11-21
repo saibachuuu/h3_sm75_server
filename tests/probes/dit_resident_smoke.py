@@ -124,12 +124,11 @@ def main():
                 "bytes": model["bytes"]}
             assert model["state"] == "vram", model["state"]
 
-            # 3) VAE 上卡（decode 需要）
+            # 3) VAE 到 RAM（decode 前由 pipeline 上卡；采样阶段不占显存）
             for vae in ("vae.video", "vae.audio"):
                 action(client, vae, "disk2ram", {"mode": "all"}, 900, report)
-                action(client, vae, "ram2vram", {"mode": "all"}, 600, report)
                 model = weights_of(client, vae)
-                assert model["state"] == "vram", (vae, model["state"])
+                assert model["state"] == "ram", (vae, model["state"])
 
             # 4) 最小 video job（cond 文件来自 TE artifact）
             payload = {
