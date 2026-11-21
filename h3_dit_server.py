@@ -62,6 +62,12 @@ def main():
                     help="文本编码器主权重 GGUF；加载后整份常驻 RAM（cpu），不占显卡")
     ap.add_argument("--te-mmproj", default=None,
                     help="文本编码器视觉塔 mmproj GGUF（与 --te-gguf 配套）")
+    ap.add_argument("--te-4b", default=None,
+                    help="4B 文本编码器 safetensors（ComfyUI int8_convrot 格式）；"
+                         "加载后整份常驻 RAM，encode 时才上卡，配合 --te-proj 使用")
+    ap.add_argument("--te-proj", default=None,
+                    help="ClipProj 投影文件名（放在 ComfyUI/models/clip_projections/ 下），"
+                         "把 4B 的 2560 维 hidden 投到 H3 要的 5120 维")
     ap.add_argument("--attn", choices=["int8", "sage", "w8a8", "sdpa", "veda"], default="int8",
                     help="服务级 attention 后端（int8=已验证默认；sage/w8a8=调试档；veda=dev 实验）")
     ap.add_argument("--veda-bundle", default=DEFAULT_VEDA_BUNDLE,

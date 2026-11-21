@@ -51,10 +51,12 @@ class Runtime:
         self.veda_patch = None      # --attn veda 时：star7 VedaPatch（运行期统计）
         self.ffmpeg = None
         self.attn = args.attn
-        # 分块卸载 / 文本编码器常驻（--offload-dit-blocks / --te-gguf）
+        # 分块卸载 / 文本编码器常驻（--offload-dit-blocks / --te-gguf / --te-4b）
         self.offloaded_blocks = []
         self.text_encoder = None
+        self.te_proj = None         # ClipProj 包装后的 4B 编码器（--te-4b + --te-proj）
         self.te_load_s = 0.0
+        self.te_swaps = 0           # 已发生的 VAE↔TE 交换次数
 
     # ---------- 阶段上报 ----------
     def set_stage(self, name):
@@ -318,7 +320,7 @@ class Runtime:
             self._offload_dit_blocks(n_off, torch)
 
         # ---- 7. 可选：文本编码器整份常驻 RAM（cpu），不占显卡 ----
-        if getattr(args, "te_gguf", None):
+        if getattr(args, "te_gguf", None) or getattr(args, "te_4b", None):
             self._load_text_encoder_ram(torch)
 
         gc.collect()
@@ -370,6 +372,8 @@ class Runtime:
         import importlib
         import types
         args = self.args
+        if getattr(args, "te_4b", None):
+            return self._load_te_4b_proj(torch)
         path = args.te_gguf
         self.set_stage("文本编码器加载到 RAM")
         t0 = time.perf_counter()
@@ -469,6 +473,227 @@ class Runtime:
             self.te_load_s = time.perf_counter() - t0
             print("[te] 加载失败（DiT 照常待命）: %s: %s" % (type(e).__name__, e), flush=True)
             traceback.print_exc()
+
+
+    # ---------- 4B 编码器 + ClipProj（--te-4b / --te-proj） ----------
+    def _load_te_4b_proj(self, torch):
+        """Qwen3-VL-4B（int8_convrot）+ ClipProj 投影，整份常驻 CPU。
+
+        4B 的 hidden 是 2560 维，H3 的 condition_proj 只收 5120，
+        中间靠 ClipProj 的投影补上（ridge + 残差，作者自报 cos≈0.79）。
+        投影按 tap=24 取第 24 层 hidden，且不做 final norm —— 与 H3 契约一致。
+
+        加载完一切都在 CPU：encode 时才上卡，算完立刻退回（见 encode_condition）。
+        """
+        import gc
+        args = self.args
+        te_path = args.te_4b
+        proj_name = args.te_proj
+        self.set_stage("4B 编码器 + 投影加载到 RAM")
+        t0 = time.perf_counter()
+        try:
+            if not os.path.isfile(te_path):
+                raise FileNotFoundError(te_path)
+            if not proj_name:
+                raise ValueError("--te-4b 需要配套的 --te-proj")
+            import comfy
+            import comfy.sd
+
+            # 定位 ComfyUI 根（comfy 是 namespace package，__file__ 可能是 None）
+            cands = []
+            cpath = getattr(comfy, "__path__", None)
+            if cpath:
+                cands.append(os.path.dirname(os.path.abspath(list(cpath)[0])))
+            cfile = getattr(comfy, "__file__", None)
+            if cfile:
+                cands.append(os.path.dirname(os.path.dirname(os.path.abspath(cfile))))
+            cands.extend(os.path.abspath(p) for p in sys.path if p)
+            comfy_root = None
+            for c in cands:
+                if os.path.isdir(os.path.join(c, "custom_nodes")):
+                    comfy_root = c
+                    break
+            if comfy_root is None:
+                raise FileNotFoundError("找不到 ComfyUI 根目录（custom_nodes 所在处）")
+            cn = os.path.join(comfy_root, "custom_nodes")
+            if cn not in sys.path:
+                sys.path.insert(0, cn)
+            if not os.path.isdir(os.path.join(cn, "clipproj")):
+                raise FileNotFoundError("custom_nodes/clipproj 缺失（ClipProj 节点未安装）")
+            print("[te4b] ComfyUI 根: %s" % comfy_root, flush=True)
+
+            print("[te4b] 读编码器: %s" % os.path.basename(te_path), flush=True)
+            clip = comfy.sd.load_clip(
+                ckpt_paths=[te_path],
+                embedding_directory=[],
+                clip_type=comfy.sd.CLIPType.MINIMAX,
+                model_options={
+                    # 构造就落 CPU，不占显存；encode 时按 load_device 上卡
+                    "initial_device": torch.device("cpu"),
+                    "load_device": torch.device("cuda:0"),
+                    "offload_device": torch.device("cpu"),
+                },
+            )
+            nparam = sum(p.numel() for p in clip.patcher.model.parameters())
+            print("[te4b] 编码器就绪 %.1fs | %.2f B 参数 | 主设备 %s"
+                  % (time.perf_counter() - t0, nparam / 1e9,
+                     clip.patcher.model.device), flush=True)
+
+            from clipproj.clipproj_projection import register_folder
+            register_folder()          # 把 models/clip_projections 登记给 folder_paths
+            from clipproj.clipproj_nodes import ProjectedCLIP
+            pc = ProjectedCLIP(clip, proj_name)
+            proj = pc._proj
+            print("[te4b] 投影 %s | d_in=%d d_out=%d tap=%d | mlp=%s | cos_test=%s"
+                  % (proj_name, proj["mean_in"].shape[0], proj["mean_out"].shape[0],
+                     proj.get("tap"), "mlp" in str(proj.get("mlp", "")).lower() or ("mlp.0.weight" in proj),
+                     proj.get("cos_test")), flush=True)
+
+            self.te_proj = pc
+            self.text_encoder = pc      # 兼容既有引用
+            self.te_load_s = time.perf_counter() - t0
+            devs = {}
+            try:
+                for p in pc.patcher.model.parameters():
+                    d = str(p.device)
+                    devs[d] = devs.get(d, 0) + 1
+            except Exception:
+                pass
+            print("[te4b] 4B+投影 就绪 %.1fs | 参数分布 %s（全部待命在 RAM）"
+                  % (self.te_load_s, devs), flush=True)
+        except Exception as e:
+            import traceback
+            self.te_load_s = time.perf_counter() - t0
+            print("[te4b] 加载失败（DiT 照常待命）: %s: %s" % (type(e).__name__, e), flush=True)
+            traceback.print_exc()
+
+    def _vae_to(self, device, torch, label=""):
+        """把视频 VAE 整份搬到 device；返回释放的显存（GB，负数为占用）。"""
+        if self.vvae is None:
+            return 0.0
+        before = torch.cuda.memory_allocated()
+        try:
+            self.vvae.patcher.model.to(device)
+        except Exception as e:
+            print("[swap] VAE -> %s 失败: %s: %s" % (device, type(e).__name__, e), flush=True)
+            return 0.0
+        torch.cuda.empty_cache()
+        after = torch.cuda.memory_allocated()
+        freed = (before - after) / 1e9
+        print("[swap] VAE -> %-5s alloc %.2f -> %.2f GB (%+.2f) %s"
+              % (str(device).replace("cuda:0", "gpu"), before / 1e9, after / 1e9, -freed, label),
+              flush=True)
+        return freed
+
+    def encode_condition(self, prompt, image_bytes_list=None, mode="ref2va",
+                         width=640, height=960, ref_image_size="match"):
+        """VAE 让位 -> TE 上卡算 condition -> TE 退回 RAM -> VAE 归位。
+
+        串行独占：调用方须保证没有并发的生成任务（DiT 正在跑时不要调）。
+        返回 (dict 含 cond/minimax_token_tags, stats)。
+        """
+        import gc
+        import io
+
+        import numpy as np
+        import torch
+        from PIL import Image
+
+        import comfy.utils as cu
+        from common.protocol import target_frame_size
+
+        pc = self.te_proj
+        if pc is None:
+            raise RuntimeError("4B 编码器未加载：启动需 --te-4b 与 --te-proj（且加载不能失败）")
+
+        prompt = (prompt or "").strip()
+        if not prompt:
+            raise ValueError("prompt 不能为空")
+        imgs = [b for b in (image_bytes_list or []) if b]
+        if not (1 <= len(imgs) <= 9):
+            raise ValueError("参考图须为 1–9 张")
+        if mode == "fl2va" and len(imgs) != 1:
+            raise ValueError("fl2va 仅支持单图")
+
+        dev = torch.device("cuda:0")
+        cpu = torch.device("cpu")
+        t_all = time.perf_counter()
+
+        # ---- 1. VAE 让位 ----
+        t0 = time.perf_counter()
+        vae_freed = self._vae_to(cpu, torch, "为 TE 让位")
+        swap_out_s = time.perf_counter() - t0
+
+        # ---- 2. 参考图预处理（CPU，尺寸按 mode 策略） ----
+        qwen_sizes = []
+        ref_items = []
+        for b in imgs:
+            img = Image.open(io.BytesIO(b)).convert("RGB")
+            arr = np.asarray(img).astype(np.float32) / 255.0
+            frame = torch.from_numpy(arr).unsqueeze(0)
+            rh, rw = int(frame.shape[1]), int(frame.shape[2])
+            tw, th = target_frame_size(mode, rw, rh, width, height, ref_image_size)
+            samples = frame[..., :3].movedim(-1, 1)
+            samples = cu.common_upscale(samples, tw, th, "lanczos", "disabled")
+            rz = samples.movedim(1, -1)
+            qwen_sizes.append([int(rz.shape[1]), int(rz.shape[2])])
+            ref_items.append({"type": "image", "data": rz})
+
+        # ---- 3. TE 上卡编码（wrapper 内部会 load_models_gpu），用完必退 ----
+        t0 = time.perf_counter()
+        err = None
+        cond_list = None
+        try:
+            if mode == "fl2va":
+                tokens = pc.tokenize(prompt, images=[ref_items[0]["data"]])
+            else:
+                tokens = pc.tokenize(prompt, minimax_ref_items=ref_items)
+            cond_list = pc.encode_from_tokens_scheduled(tokens)
+        except Exception as e:
+            err = e
+            raise
+        finally:
+            # ---- 4. TE 退回 RAM（成败都退，别把卡占死） ----
+            try:
+                pc.patcher.model.to(cpu)
+                torch.cuda.empty_cache()
+            except Exception as _e:
+                print("[swap] TE 退回 RAM 失败: %s: %s" % (type(_e).__name__, _e), flush=True)
+            if err is not None:
+                print("[encode] 失败已捕获，TE 已退回", flush=True)
+        encode_s = time.perf_counter() - t0
+
+        # ---- 5. VAE 归位 ----
+        t0 = time.perf_counter()
+        self._vae_to(dev, torch, "TE 用完，归位")
+        swap_back_s = time.perf_counter() - t0
+        self.te_swaps += 1
+
+        tensor, values = cond_list[0][0], cond_list[0][1]
+        tags = values.get("minimax_token_tags")
+        out = {
+            "cond": tensor.detach().float().cpu().contiguous(),
+            "minimax_token_tags": (tags.detach().cpu().contiguous() if tags is not None else None),
+        }
+        stats = {
+            "n_tokens": int(tensor.shape[1]),
+            "cond_shape": list(tensor.shape),
+            "n_images": len(imgs),
+            "mode": mode,
+            "qwen_hw": qwen_sizes,
+            "encode_s": round(encode_s, 3),
+            "swap_out_s": round(swap_out_s, 3),
+            "swap_back_s": round(swap_back_s, 3),
+            "total_s": round(time.perf_counter() - t_all, 3),
+            "vae_freed_gb": round(vae_freed, 3),
+            "swaps": self.te_swaps,
+        }
+        print("[encode] %d tokens | %d 图 | mode=%s | encode=%.2fs swap_out=%.2fs "
+              "swap_back=%.2fs total=%.2fs"
+              % (stats["n_tokens"], len(imgs), mode, encode_s, swap_out_s, swap_back_s,
+                 stats["total_s"]), flush=True)
+        self._vram_ledger("encode后", torch)
+        return out, stats
 
 
 def _build_video_vae(comfy, vsd, vmd, device, torch):

@@ -1,6 +1,7 @@
 """dit server 的 HTTP 层：WebUI 静态页 + 任务 API + 成果文件（含 Range 断点）。"""
 import json
 import os
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -282,6 +283,61 @@ def make_handler(runtime, queue, ctx):
                 except ValueError as e:
                     self._json({"ok": False, "error": str(e)}, 400)
                 except Exception as e:
+                    self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
+            elif path == "/api/encode":
+                # 探针：只算 condition，不进 DiT。
+                # 流程：VAE 让位 -> 4B TE+投影上卡 -> encode -> TE 退回 RAM -> VAE 归位。
+                # {prompt, image_b64s? 1–9, mode?, width?, height?, ref_image_size?,
+                #  save_cond?: bool}
+                payload = self._read_json_body()
+                if payload is None:
+                    self._json({"ok": False, "error": "请求体不是合法 JSON 或过大"}, 400)
+                    return
+                snap = queue.snapshot(limit=1)
+                counts = snap.get("counts") or {}
+                if counts.get("running") or counts.get("queued"):
+                    self._json({"ok": False,
+                                "error": "队列非空（生成任务在跑或在排队）。TE 交换要独占显存，等它结束再试。"},
+                               409)
+                    return
+                try:
+                    import base64 as _b64
+                    import os as _os
+                    prompt = payload.get("prompt", "")
+                    raw = payload.get("image_b64s") or []
+                    imgs = []
+                    for s in raw:
+                        if not isinstance(s, str):
+                            continue
+                        if s.startswith("data:"):
+                            s = s.split(",", 1)[1]
+                        imgs.append(_b64.b64decode(s))
+                    mode = payload.get("mode", "ref2va")
+                    width = int(payload.get("width", 640))
+                    height = int(payload.get("height", 960))
+                    ref_size = payload.get("ref_image_size", "match")
+                    out, stats = runtime.encode_condition(
+                        prompt, imgs, mode=mode, width=width, height=height,
+                        ref_image_size=ref_size)
+                    resp = {"ok": True, "stats": stats}
+                    if payload.get("save_cond"):
+                        from safetensors.torch import save_file
+                        name = "cond_probe_%d.safetensors" % int(time.time())
+                        out_dir = getattr(runtime.args, "out_dir", "outputs")
+                        _os.makedirs(out_dir, exist_ok=True)
+                        fp = _os.path.join(out_dir, name)
+                        tosave = {"cond": out["cond"]}
+                        if out["minimax_token_tags"] is not None:
+                            tosave["minimax_token_tags"] = out["minimax_token_tags"]
+                        save_file(tosave, fp)
+                        resp["cond_file"] = name
+                        resp["cond_bytes"] = _os.path.getsize(fp)
+                    self._json(resp, 200)
+                except ValueError as e:
+                    self._json({"ok": False, "error": str(e)}, 400)
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
                     self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
             elif path == "/api/jobs/drop":
                 payload = self._read_json_body() or {}
