@@ -550,7 +550,8 @@ def _run_with_cond(job, ctx, cond_path):
     # ---------- 9. 视频解码（DiT 权重常驻，基线已证安全） ----------
     job.stage = "decode_video"
     t0 = time.perf_counter()
-    runtime.vvae.first_stage_model.to(device)
+    # 显式上卡：量化 VAE 不能靠裸 .to(cuda)，由后端在目标设备重建。
+    runtime.weights.prepare_vae("vae.video")
     with torch.no_grad():
         decoded = runtime.vvae.decode(out2["samples"].unbind()[0])
     if decoded.ndim == 5:
@@ -588,6 +589,7 @@ def _run_with_cond(job, ctx, cond_path):
     job.stage = "decode_audio"
     t0 = time.perf_counter()
     from comfy_extras.nodes_audio import vae_decode_audio
+    runtime.weights.prepare_vae("vae.audio")
     with torch.no_grad():
         audio = vae_decode_audio(runtime.avae, out2)
     sr = audio["sample_rate"]

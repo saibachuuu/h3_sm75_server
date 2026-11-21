@@ -112,6 +112,22 @@ class WeightService:
     def preflight_encode(self, request=None):
         return self.backends["te"].preflight_encode(request)
 
+    def prepare_vae(self, model_id):
+        """把已 disk2ram 的 VAE 放到显存（量化 VAE 走目标设备重建）。
+
+        供 decode 阶段使用；未配置/未加载直接 409，不自动 disk2ram。
+        """
+        backend = self.backend(model_id)
+        if not backend.configured() or backend.obj is None:
+            raise OperationError(
+                "MISSING_UNITS", "%s 未在 RAM，先 disk2ram" % model_id,
+                409, False, {"missing": [model_id]})
+        record = self.registry.unit_record(model_id, backend.PRIMARY_UNIT)
+        if record["state"] != "vram":
+            backend.move_to("cuda:0")
+            backend._refresh()
+        return backend.obj
+
     @property
     def te(self):
         return self.backends["te"]

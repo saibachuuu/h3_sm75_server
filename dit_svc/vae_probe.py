@@ -117,7 +117,7 @@ def run_vae_probe(job, ctx):
 
     if getattr(runtime, "mm", None) is not None:
         _unhook_dit(runtime, runtime.mm, torch)
-    runtime.vvae.first_stage_model.to(runtime.device)
+    runtime.weights.prepare_vae("vae.video")
 
     # ---------- 1. 编码探针（+ round-trip） ----------
     frame = None
