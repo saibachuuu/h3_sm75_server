@@ -1,13 +1,40 @@
-"""串行任务队列（单 GPU，一次只跑一个；手动逐个提交）。"""
+"""串行任务队列（单 GPU，一次只跑一个；手动逐个提交）。
+
+这里是**唯一执行器**：旧 Job（视频/VAE 探针/导演台/warmup）与新 Operation
+（权重、attention、单步推理等长操作）共用同一个 worker、同一把 admission
+Condition。旧 Job 的 public 字段与提交接口保持不变；新 Operation 见
+``dit_svc/operations.py`` 与 ``docs/operation_executor.md``。
+
+admission 规则（与规划 02 §8.2 一致）：
+
+* 空闲：旧 job 接受；control operation 接受并占用唯一保留位；
+* 有旧 job 运行/排队：旧 job 继续排队；control operation 一律 409；
+* 有 control operation 运行/排队：旧 job 409；新 control 409（最多一个）。
+
+所有检查都在 ``self._cond`` 内完成；preflight/文件扫描在锁外完成，callback
+（可能跑 GPU）绝不持锁。
+"""
 import random
 import threading
 import time
 import traceback
 import uuid
 
+from dit_svc.operations import (ACTIVE_STATUSES, Operation, OperationError,
+                                TERMINAL_STATUSES, payload_fingerprint)
 
-class BusyError(Exception):
-    """服务未就绪（模型加载中/加载失败）。"""
+
+class BusyError(OperationError):
+    """服务未就绪 / 执行器被占用。
+
+    继承 ``OperationError`` 以便新 HTTP 层统一映射；旧 handler 仍按
+    ``except BusyError`` 处理，``str(e)`` 也仍是原来的中文消息。
+    """
+
+    def __init__(self, message, code="BUSY", http_status=409, retryable=True,
+                 details=None):
+        super().__init__(code, message, http_status, retryable, details)
+
 
 class Job:
     def __init__(self, params, kind="video"):
@@ -72,12 +99,18 @@ class Job:
 
 
 class QueueManager:
-    def __init__(self, runtime, ctx):
+    def __init__(self, runtime, ctx, operation_retention=200):
         self.runtime = runtime
         self.ctx = ctx
-        self.jobs = {}          # id -> Job
+        self.jobs = {}          # id -> Job（旧 public view）
         self.order = []         # 保持提交顺序
+        # 新 operation view（与 jobs 共用同一 worker / 同一把锁）
+        self.operations = {}    # id -> Operation
+        self._op_order = []
+        self._request_index = {}    # request_id -> operation id（有界去重）
+        self._operation_retention = max(1, int(operation_retention))
         self._cond = threading.Condition()
+        self._stopping = threading.Event()
         self._worker = threading.Thread(target=self._loop, name="h3-worker", daemon=True)
         self._worker.start()
 
@@ -89,6 +122,45 @@ class QueueManager:
             raise BusyError("模型加载中（%s，已 %.0f 秒），请稍后再提交"
                             % (self.runtime.stage, self.runtime.stage_elapsed()))
 
+    # ---------- 旧 job 的 admission（与 operation 共用同一把锁） ----------
+    def _require_job_submit(self, payload):
+        """主代理可选接入的旧 job require hook（锁外调用，允许慢操作）。
+
+        runtime 若提供 ``require_job(payload)``，在旧 job 校验后、入队前调用。
+        未接入 weights 模块时不存在该属性，行为与旧版完全一致。
+        hook 抛 ``OperationError`` 时转换为旧 handler 认识的 BusyError/ValueError，
+        避免旧 HTTP 端点把 409/400 误报成 500。
+        """
+        hook = getattr(self.runtime, "require_job", None)
+        if not callable(hook):
+            return
+        try:
+            hook(payload)
+        except BusyError:
+            raise
+        except OperationError as e:
+            if e.http_status == 400:
+                raise ValueError(str(e)) from e
+            raise BusyError(str(e), code=e.code, http_status=e.http_status,
+                            retryable=e.retryable, details=e.details) from e
+
+    def _enqueue_job(self, job):
+        """原子检查 control 保留位后入队；旧 job 之间仍正常排队。"""
+        with self._cond:
+            if self._stopping.is_set():
+                raise BusyError("执行器正在关闭，不再接受新任务",
+                                code="SHUTTING_DOWN", http_status=503,
+                                retryable=True)
+            active = self._active_control_locked()
+            if active is not None:
+                raise BusyError(
+                    "有 control 操作在运行或排队（%s %s），生成任务需等它结束后再提交"
+                    % (active.kind, active.id),
+                    details={"operation_id": active.id})
+            self.jobs[job.id] = job
+            self.order.append(job.id)
+            self._cond.notify_all()
+
     def submit(self, payload):
         from common.protocol import validate_job
 
@@ -99,10 +171,8 @@ class QueueManager:
         if params["seed"] is None or params["seed"] < 0:
             params["seed"] = random.randint(0, 2 ** 63 - 1)
         job = Job(params)
-        with self._cond:
-            self.jobs[job.id] = job
-            self.order.append(job.id)
-            self._cond.notify_all()
+        self._require_job_submit(payload)
+        self._enqueue_job(job)
         print("[queue] submitted %s seed=%d" % (job.id, params["seed"]), flush=True)
         return job
 
@@ -120,10 +190,8 @@ class QueueManager:
             params["seed"] = random.randint(0, 2 ** 63 - 1)
         job = Job(params)
         job.cond_source = cond
-        with self._cond:
-            self.jobs[job.id] = job
-            self.order.append(job.id)
-            self._cond.notify_all()
+        self._require_job_submit(payload)
+        self._enqueue_job(job)
         print("[queue] submitted %s (直接喂 cond: %s, %d 图, %d bytes) seed=%d"
               % (job.id, params["cond_label"], len(params["image_b64s"]),
                  cond["size"], params["seed"]), flush=True)
@@ -163,10 +231,8 @@ class QueueManager:
         job = Job(params, kind="director")
         job.shots = shots
         job.stage = "序列排队中"
-        with self._cond:
-            self.jobs[job.id] = job
-            self.order.append(job.id)
-            self._cond.notify_all()
+        self._require_job_submit(payload)
+        self._enqueue_job(job)
         print("[queue] submitted %s (director: %d 镜头, mode=%s, 引用上段帧数=%s)"
               % (job.id, len(shots), gp.get("mode"), gp.get("ref_prev_frames")), flush=True)
         return job
@@ -183,10 +249,8 @@ class QueueManager:
             params["seed"] = random.randint(0, 2 ** 63 - 1)
         job = Job(params, kind="vae_probe")
         job.stage = "vae 探针排队中"
-        with self._cond:
-            self.jobs[job.id] = job
-            self.order.append(job.id)
-            self._cond.notify_all()
+        self._require_job_submit(payload)
+        self._enqueue_job(job)
         print("[queue] submitted %s (vae_probe: encode=%s decode=%s latent=%s)"
               % (job.id, "image_b64" in params, params.get("decode"), params.get("latent")),
               flush=True)
@@ -205,13 +269,280 @@ class QueueManager:
         job = Job({"tokens": tokens, "repeat": repeat,
                    "compare": compare, "profile": bool(profile)}, kind="warmup")
         job.stage = "warmup 排队中"
-        with self._cond:
-            self.jobs[job.id] = job
-            self.order.append(job.id)
-            self._cond.notify_all()
+        self._require_job_submit({"kind": "warmup", "tokens": tokens,
+                                  "repeat": repeat, "compare": compare,
+                                  "profile": bool(profile)})
+        self._enqueue_job(job)
         print("[queue] submitted warmup %s tokens=%d x%d compare=%s profile=%s"
               % (job.id, tokens, repeat, compare, bool(profile)), flush=True)
         return job
+
+    # ---------- 新 operation：提交 / 查询 / 取消（统一回执） ----------
+    def _active_control_locked(self):
+        for oid in self._op_order:
+            op = self.operations.get(oid)
+            if op is not None and op.status in ACTIVE_STATUSES:
+                return op
+        return None
+
+    def _active_job_locked(self):
+        for jid in self.order:
+            job = self.jobs.get(jid)
+            if job is not None and job.status in ("queued", "running"):
+                return job
+        return None
+
+    def _request_operation_locked(self, request_id, fingerprint):
+        """锁内查 request_id：命中同请求返回 Operation，冲突抛 409，未命中返回 None。"""
+        if request_id is None:
+            return None
+        existing = self.operations.get(self._request_index.get(request_id))
+        if existing is None:
+            self._request_index.pop(request_id, None)
+            return None
+        if existing.fingerprint != fingerprint:
+            raise OperationError(
+                "REQUEST_ID_CONFLICT",
+                "相同 request_id 对应不同请求", 409, False,
+                {"request_id": request_id,
+                 "operation_id": existing.id,
+                 "existing_kind": existing.kind})
+        return existing
+
+    def _operation_preflight(self, kind, payload, preflight=None):
+        """锁外执行 preflight；显式 callback 优先，否则用 runtime 可选 hook。"""
+        fn = preflight
+        if not callable(fn):
+            fn = getattr(self.runtime, "operation_preflight", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn(kind, payload)
+        except OperationError:
+            raise
+        except ValueError as e:
+            raise OperationError("INVALID_REQUEST", str(e), 400,
+                                 details={"phase": "preflight"}) from e
+        except Exception as e:
+            raise OperationError(
+                "EXECUTION_FAILED", "%s: %s" % (type(e).__name__, e), 500,
+                False, {"phase": "preflight",
+                        "exception": type(e).__name__}) from e
+
+    def _operation_admission_locked(self, kind, payload):
+        """runtime 可选 hook：在 admission 锁内做**廉价**状态检查。
+
+        该 hook 不得做 GPU/文件扫描，也不得回调 QueueManager，否则会死锁。
+        """
+        hook = getattr(self.runtime, "operation_admission", None)
+        if not callable(hook):
+            return
+        try:
+            hook(kind, payload)
+        except OperationError:
+            raise
+        except ValueError as e:
+            raise OperationError("INVALID_REQUEST", str(e), 400,
+                                 details={"phase": "admission"}) from e
+        except Exception as e:
+            raise OperationError(
+                "EXECUTION_FAILED", "%s: %s" % (type(e).__name__, e), 500,
+                False, {"phase": "admission",
+                        "exception": type(e).__name__}) from e
+
+    def _operation_revalidate(self, op, preflight_token):
+        """执行前重验：runtime 可选 hook，锁外、worker 内、callback 之前。"""
+        hook = getattr(self.runtime, "operation_revalidate", None)
+        if not callable(hook):
+            return
+        try:
+            hook(op.kind, op.payload, preflight_token)
+        except OperationError:
+            raise
+        except ValueError as e:
+            raise OperationError("INVALID_REQUEST", str(e), 400,
+                                 details={"phase": "revalidate"}) from e
+        except Exception as e:
+            raise OperationError(
+                "EXECUTION_FAILED", "%s: %s" % (type(e).__name__, e), 500,
+                False, {"phase": "revalidate",
+                        "exception": type(e).__name__}) from e
+
+    def submit_operation(self, kind, payload, run_callback, preflight=None,
+                         request_id=None):
+        """提交一个 control operation，返回 ``Operation`` 回执。
+
+        * preflight 在锁外执行（可慢），admission/去重在锁内原子完成；
+        * 同一 request_id + 相同 kind/payload 返回**同一个** Operation；
+          不同请求返回 409 REQUEST_ID_CONFLICT；
+        * 有旧 job 或另一个 control 在运行/排队时返回 409 BUSY；
+        * run_callback(operation) 在唯一 worker 中执行，结果/异常写入回执。
+        """
+        if not isinstance(kind, str) or not kind.strip():
+            raise OperationError("INVALID_REQUEST", "kind 必须为非空字符串", 400)
+        if not callable(run_callback):
+            raise OperationError("INVALID_REQUEST",
+                                 "run_callback 必须可调用", 400)
+        if request_id is not None:
+            if not isinstance(request_id, str) or not request_id.strip():
+                raise OperationError("INVALID_REQUEST",
+                                     "request_id 必须为非空字符串", 400)
+
+        fingerprint = payload_fingerprint(kind, payload)
+
+        # 先去重再 preflight：重复请求直接返回原回执，不重复做耗时检查。
+        with self._cond:
+            if self._stopping.is_set():
+                raise OperationError("SHUTTING_DOWN", "执行器正在关闭，不再接受新操作",
+                                     503, True)
+            existing = self._request_operation_locked(request_id, fingerprint)
+        if existing is not None:
+            return existing
+
+        token = self._operation_preflight(kind, payload, preflight)
+
+        with self._cond:
+            if self._stopping.is_set():
+                raise OperationError("SHUTTING_DOWN", "执行器正在关闭，不再接受新操作",
+                                     503, True)
+            # preflight 在锁外期间可能有人先提交了同一 request_id
+            existing = self._request_operation_locked(request_id, fingerprint)
+            if existing is not None:
+                return existing
+
+            active = self._active_control_locked()
+            if active is not None:
+                raise OperationError(
+                    "BUSY",
+                    "已有 control 操作在运行或排队（%s %s）"
+                    % (active.kind, active.id),
+                    409, True, {"operation_id": active.id})
+            job = self._active_job_locked()
+            if job is not None:
+                raise OperationError(
+                    "BUSY",
+                    "有生成任务在运行或排队（%s %s），control 操作需空闲执行器"
+                    % (job.kind, job.id),
+                    409, True, {"job_id": job.id})
+
+            self._operation_admission_locked(kind, payload)
+            op = Operation(kind, payload, run_callback,
+                           preflight=preflight, request_id=request_id,
+                           fingerprint=fingerprint,
+                           preflight_token=token)
+            self.operations[op.id] = op
+            self._op_order.append(op.id)
+            if request_id is not None:
+                self._request_index[request_id] = op.id
+            self._prune_operations_locked()
+            self._cond.notify_all()
+        print("[queue] submitted operation %s (%s)%s"
+              % (op.id, kind, " request_id=%s" % request_id if request_id else ""),
+              flush=True)
+        return op
+
+    def get_operation(self, operation_id):
+        return self.operations.get(operation_id)
+
+    def cancel_operation(self, operation_id):
+        """取消 queued operation；running/已结束返回 409。
+
+        返回 public dict；不存在抛 OPERATION_NOT_FOUND(404)。
+        """
+        with self._cond:
+            op = self.operations.get(operation_id)
+            if op is None:
+                raise OperationError("OPERATION_NOT_FOUND", "operation 不存在",
+                                     404)
+            if op.status == "queued":
+                op.status = "cancelled"
+                op.stage = "已取消"
+                op.finished = time.time()
+                op.cancel_reason = "client"
+                self._cond.notify_all()
+                return op.public()
+            if op.status == "cancelled":
+                return op.public()
+            raise OperationError(
+                "OPERATION_NOT_CANCELLABLE",
+                "只有排队中的 operation 可以取消（当前: %s）" % op.status,
+                409, False, {"operation_id": op.id, "status": op.status})
+
+    def operations_snapshot(self, limit=20):
+        """非阻塞快照：只读内存 metadata，不等待运行中的 callback。"""
+        with self._cond:
+            ids = list(self._op_order)[-limit:][::-1] if limit else []
+            ops = [self.operations[i].public() for i in ids
+                   if i in self.operations]
+            counts = {"queued": 0, "running": 0, "done": 0,
+                      "failed": 0, "cancelled": 0}
+            running_id = None
+            for op in self.operations.values():
+                counts[op.status] = counts.get(op.status, 0) + 1
+                if op.status == "running":
+                    running_id = op.id
+            return {"operations": ops, "counts": counts,
+                    "running": running_id}
+
+    def executor_state(self):
+        """status 端点用的廉价执行器摘要（不复用 job/operation 原始 payload）。"""
+        with self._cond:
+            active_op = None
+            queued_ops = 0
+            for oid in self._op_order:
+                op = self.operations.get(oid)
+                if op is None:
+                    continue
+                if op.status == "running":
+                    active_op = op.id
+                elif op.status == "queued":
+                    queued_ops += 1
+            active_job = None
+            queued_jobs = 0
+            for jid in self.order:
+                job = self.jobs.get(jid)
+                if job is None:
+                    continue
+                if job.status == "running":
+                    active_job = job.id
+                elif job.status == "queued":
+                    queued_jobs += 1
+            if active_op or active_job:
+                state = "running"
+            elif queued_ops or queued_jobs:
+                state = "queued"
+            else:
+                state = "idle"
+            return {"state": state,
+                    "active_operation": active_op,
+                    "active_job": active_job,
+                    "queued": queued_ops + queued_jobs,
+                    "queued_operations": queued_ops,
+                    "queued_jobs": queued_jobs,
+                    "control_reserved": active_op is not None or queued_ops > 0}
+
+    def _prune_operations_locked(self):
+        """有界保留：只淘汰最老的 terminal operation，不丢 queued/running。"""
+        excess = len(self._op_order) - self._operation_retention
+        if excess <= 0:
+            return
+        removed = 0
+        for oid in list(self._op_order):
+            if removed >= excess:
+                break
+            op = self.operations.get(oid)
+            if op is None:
+                self._op_order.remove(oid)
+                continue
+            if op.status not in TERMINAL_STATUSES:
+                continue
+            self.operations.pop(oid, None)
+            self._op_order.remove(oid)
+            if op.request_id is not None and \
+                    self._request_index.get(op.request_id) == oid:
+                self._request_index.pop(op.request_id, None)
+            removed += 1
+
     def drop(self, job_id):
         with self._cond:
             job = self.jobs.get(job_id)
@@ -252,46 +583,135 @@ class QueueManager:
                     running_id = j.id
             return {"jobs": jobs, "counts": counts, "running": running_id}
 
-    # ---------- worker ----------
+    # ---------- worker（唯一执行器：operation 优先，其次旧 job） ----------
+    def _next_queued_operation_locked(self):
+        for oid in self._op_order:
+            op = self.operations.get(oid)
+            if op is not None and op.status == "queued":
+                return op
+        return None
+
+    def _next_queued_job_locked(self):
+        for jid in self.order:
+            job = self.jobs.get(jid)
+            if job is not None and job.status == "queued":
+                return job
+        return None
+
     def _loop(self):
-        from dit_svc import pipeline
         while True:
             with self._cond:
+                if self._stopping.is_set():
+                    return
+                op = self._next_queued_operation_locked()
                 job = None
-                for jid in self.order:
-                    cand = self.jobs[jid]
-                    if cand.status == "queued":
-                        job = cand
-                        break
-                if job is None:
+                if op is not None:
+                    op.status = "running"
+                    op.started = time.time()
+                    op.stage = "执行中"
+                else:
+                    job = self._next_queued_job_locked()
+                if op is None and job is None:
                     self._cond.wait(timeout=5.0)
                     continue
-                job.status = "running"
-                job.started = time.time()
-            print("[queue] running %s (%s)" % (job.id, job.kind), flush=True)
-            try:
-                if job.kind == "warmup":
-                    self._run_warmup(job)
-                elif job.kind == "vae_probe":
-                    from dit_svc import vae_probe
-                    vae_probe.run_vae_probe(job, self.ctx)
-                elif job.kind == "director":
-                    from dit_svc import director
-                    director.run_director(job, self.ctx)
-                else:
-                    pipeline.run_job(job, self.ctx)
-                job.status = "done"
-                job.stage = "完成"
-            except Exception as e:
-                job.status = "failed"
-                job.stage = "失败"
-                job.error = "%s: %s" % (type(e).__name__, e)
-                job.log.append("ERROR: %s" % job.error)
-                job.log.append(traceback.format_exc()[-2000:])
+                if job is not None:
+                    job.status = "running"
+                    job.started = time.time()
+            if op is not None:
+                self._run_operation(op)
+            else:
+                self._run_job(job)
+
+    def _run_job(self, job):
+        """旧 job 的执行分发；保持原有异常字段/日志/完成语义。"""
+        print("[queue] running %s (%s)" % (job.id, job.kind), flush=True)
+        try:
+            if job.kind == "warmup":
+                self._run_warmup(job)
+            elif job.kind == "vae_probe":
+                from dit_svc import vae_probe
+                vae_probe.run_vae_probe(job, self.ctx)
+            elif job.kind == "director":
+                from dit_svc import director
+                director.run_director(job, self.ctx)
+            else:
+                from dit_svc import pipeline
+                pipeline.run_job(job, self.ctx)
+            job.status = "done"
+            job.stage = "完成"
+        except Exception as e:
+            job.status = "failed"
+            job.stage = "失败"
+            job.error = "%s: %s" % (type(e).__name__, e)
+            job.log.append("ERROR: %s" % job.error)
+            job.log.append(traceback.format_exc()[-2000:])
+            traceback.print_exc()
+            print("[queue] job %s FAILED: %s" % (job.id, job.error), flush=True)
+        finally:
+            job.finished = time.time()
+
+    def _run_operation(self, op):
+        """锁外执行 operation；preflight 重验 → runtime revalidate → callback。"""
+        print("[queue] running operation %s (%s)" % (op.id, op.kind), flush=True)
+        try:
+            # 提交时只做了一次 admission；执行前在 worker 内重跑 preflight。
+            token = self._operation_preflight(op.kind, op.payload, op.preflight)
+            self._operation_revalidate(op, token)
+            result = op.cb(op)
+            op.result = result
+            with self._cond:
+                op.status = "done"
+                op.stage = "完成"
+                op.finished = time.time()
+                self._prune_operations_locked()
+                self._cond.notify_all()
+        except Exception as e:
+            err = OperationError.from_exception(e)
+            op.error = err
+            op.log.append("ERROR: %s: %s" % (err.code, err.message))
+            if not isinstance(e, OperationError):
+                op.log.append(traceback.format_exc()[-2000:])
                 traceback.print_exc()
-                print("[queue] job %s FAILED: %s" % (job.id, job.error), flush=True)
-            finally:
-                job.finished = time.time()
+            with self._cond:
+                op.status = "failed"
+                op.stage = "失败"
+                op.finished = time.time()
+                self._prune_operations_locked()
+                self._cond.notify_all()
+            print("[queue] operation %s FAILED: %s: %s"
+                  % (op.id, err.code, err.message), flush=True)
+
+    def stop(self, timeout=5.0):
+        """停止 worker；queued 的 operation/job 标记 cancelled，running 等其自然结束。
+
+        返回 worker 是否已退出。可在测试/服务退出时调用；不应在 callback 内调用
+        自己以外的线程 stop 阻塞过久。
+        """
+        self._stopping.set()
+        now = time.time()
+        with self._cond:
+            for oid in self._op_order:
+                op = self.operations.get(oid)
+                if op is not None and op.status == "queued":
+                    op.status = "cancelled"
+                    op.stage = "服务关闭"
+                    op.finished = now
+                    op.cancel_reason = "shutdown"
+            for jid in self.order:
+                job = self.jobs.get(jid)
+                if job is not None and job.status == "queued":
+                    job.status = "cancelled"
+                    job.stage = "服务关闭"
+                    job.finished = now
+            self._cond.notify_all()
+        worker = self._worker
+        if worker is not None and worker.is_alive() \
+                and worker is not threading.current_thread():
+            worker.join(timeout)
+        return not (worker is not None and worker.is_alive())
+
+    def shutdown(self, timeout=5.0):
+        return self.stop(timeout=timeout)
 
     # ---------- warmup 执行（队列内串行；用当前 override + fallback 落点） ----------
     def _run_warmup(self, job):
