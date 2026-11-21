@@ -282,8 +282,15 @@ class H3ComfyAdapter(ModelAdapter):
             if full not in key_tensors:
                 raise AdapterError("missing buffer key %r" % (full,),
                                    details={"key": full})
-            holder.register_buffer(
-                name, torch_mod.as_tensor(key_tensors[full]).to(device))
+            # assign 会保留 checkpoint dtype；但模型声明的 buffer dtype 可能不同
+            # （真实 H3 的 adaln_t_table 注册为 float32，checkpoint 里是 bf16）。
+            # 不 cast 会在 torch.lerp 处报 dtype 不匹配。
+            value = torch_mod.as_tensor(key_tensors[full])
+            existing = getattr(holder, "_buffers", {}).get(name)
+            target_dtype = getattr(existing, "dtype", None)
+            if target_dtype is not None and value.dtype != target_dtype:
+                value = value.to(dtype=target_dtype)
+            holder.register_buffer(name, value.to(device))
             bound.append(full)
             return bound, waived, quant_formats, 0
         if kind == "module-rootscalars":
