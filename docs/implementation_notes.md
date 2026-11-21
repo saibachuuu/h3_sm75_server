@@ -167,3 +167,37 @@ Four fixed children are recorded in `agent_work_ledger.md`; slot E remains unuse
 All four actions for all five models passed on the real GPU host. This proves the
 API/state machine and physical accounting; it does **not** prove DiT sampling or
 VAE decode results, nor attention/VEDA sparse execution (C not merged).
+### Resident DiT inference (end-to-end, 2026-11-21)
+
+After all 56 DiT units were materialized and moved to CUDA (13,997,458,496 bytes),
+a minimal video job ran through the existing pipeline:
+
+| stage | time |
+|---|---|
+| sample (1 step, euler/simple, 22 frames, 640x960) | 16.37s |
+| decode video (light VAE, on-demand explicit move) | 3.06s |
+| decode audio | 2.37s |
+| mux | 0.57s |
+| total job | 23.12s |
+
+Output: `outputs/20261121-201027-4793.mp4`, 309,718 bytes. Latent probe
+`min -7.1934 / max 5.1497 / nan 0 / inf 0`.
+
+Fixes required by this run (all in git):
+
+1. `materialize_unit` buffer holders: a top-level buffer unit (`dit.modules.adaln_t_table`)
+   has `holder_path == ""`, so the old prefix produced an empty sub-dict and failed with
+   `missing buffer key`. Buffer holders now select exactly their buffer key.
+2. Buffer binding casts to the dtype declared by the model buffer. The real H3
+   `adaln_t_table` is `float32` while the checkpoint ships `bfloat16`; `assign=True`
+   without a cast broke `torch.lerp` with a dtype mismatch.
+3. `job_admission` requires only `dit` in VRAM for sampling; VAE may stay in RAM.
+   Keeping 14GB DiT + 2.7GB VAE resident OOMs the 22GB 2080Ti during sampling.
+4. Quantized VAE `ram2vram` rebuilds on the target device (and reads the state dict
+   directly to CUDA). A CPU-constructed int8 VAE moved with `.to(cuda)` leaves the
+   decoder's q/k/v on CPU, tripping the int8 attention device check.
+5. `pipeline` / `vae_probe` now call `WeightService.prepare_vae(model)` before
+   decode instead of a bare `.to(device)`.
+
+These are weight-lifecycle fixes, not sampling math changes: the sampler, scheduler,
+sigma shift and decode paths are the original pipeline.

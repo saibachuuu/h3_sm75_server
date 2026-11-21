@@ -147,9 +147,16 @@ python h3_dit_server.py --host 127.0.0.1 --port 8190 `
 
 ## 5. 已知边界
 
-* DiT 只接权重存储（meta 骨架 + 选定 unit 物化 + 搬运/purge）；ModelPatcher /
-  sampling 包装（B 的 `h3_patcher`）尚未接进生产加载，推理仍走旧 job 路径。
+* DiT 已接采样外壳：全量 `ram2vram` 后用 B 的 `wrap_h3_skeleton` 绑定 BaseModel /
+  ModelPatcher + 固定 12/3 SigmaShift；`/api/jobs/cond` 可直接在该 resident DiT
+  上采样。partial（未全量）时不会创建外壳。
 * VAE / VEDA 首版是整组 unit，尚未按 encoder/decoder/层拆分。
+* 量化 VAE（int8_convrot）的 `ram2vram` 不是裸 `.to()`，而是在目标设备重建
+  （先释放 CPU 实例）。原因：CPU 构造后 `.to(cuda)` 不同步量化 Linear 的设备
+  选择，decode 时 int8 attention 的 q/k/v 仍在 CPU。
+* sample 只要求 `dit` 在显存；`vae.video` / `vae.audio` 允许停在 RAM。decode
+  阶段由 pipeline 调 `WeightService.prepare_vae()` 显式上卡（量化 VAE 走重建）。
+  同时驻留 14GB DiT + 2.7GB VAE 会在 2080Ti 22GB 上 OOM。
 * attention 绑定与 VEDA 严格 resident（C 分支）未合并；`/api/status` 的
   `attn` 仍为 none。
 * `purgefromram` 的跨 unit 事务不承诺全回滚：报告 completed/failed/not_attempted

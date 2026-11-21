@@ -151,6 +151,8 @@ def main():
                 "elapsed_s": round(time.perf_counter() - started, 2),
                 "timings": job.get("timings"),
                 "files": job.get("files"),
+                "mp4": job.get("mp4"),
+                "output_url": job.get("output_url"),
                 "latent_probe": job.get("latent_probe"),
                 "cond_stats": job.get("cond_stats"),
                 "error": job.get("error") or job.get("message"),
