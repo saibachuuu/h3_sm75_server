@@ -13,11 +13,14 @@
 
 运行：python tests/_selftest_operation_admission.py
 """
+import gc
+import json
 import os
 import sys
 import threading
 import time
 import traceback
+import weakref
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -26,11 +29,16 @@ from dit_svc.job_queue import BusyError, QueueManager  # noqa: E402
 from dit_svc.operations import OperationError  # noqa: E402
 
 
+_ABSENT = object()
+
+
 class FakeRuntime:
     """只提供 QueueManager 旧 job 路径需要的字段；不 import torch。"""
 
-    def __init__(self, ready=True):
+    def __init__(self, ready=True, env_ready=_ABSENT):
         self.ready = ready
+        if env_ready is not _ABSENT:
+            self.env_ready = env_ready       # 模拟新 runtime；缺省即 legacy
         self.error = None
         self.stage = "fake"
         self.stage_t0 = time.perf_counter()
@@ -39,6 +47,12 @@ class FakeRuntime:
 
     def stage_elapsed(self):
         return time.perf_counter() - self.stage_t0
+
+
+class RefNode:
+    """弱引用测试用的小对象（不进入 payload 指纹的强引用链）。"""
+
+    pass
 
 
 class FakeQueue(QueueManager):
@@ -633,6 +647,289 @@ def t_shutdown_clean():
     return "worker 已退出，queued op/job 已取消"
 
 
+def t_readiness_env_ready():
+    # legacy：没有 env_ready，仍看 ready
+    q = FakeQueue(FakeRuntime(ready=False))
+    try:
+        try:
+            q.submit(job_payload("legacy-not-ready"))
+        except BusyError as e:
+            assert "模型加载中" in str(e), str(e)
+        else:
+            raise AssertionError("legacy ready=false 仍接受 job")
+        op = q.submit_operation("ctrl", {}, lambda o: "ok")
+        wait_status(q, op.id, "done")      # control 不要求模型 ready
+    finally:
+        q.stop()
+
+    # 新 runtime：env_ready=true 但 DiT 未齐，独立 vae_probe/旧 job 可提交
+    q2 = FakeQueue(FakeRuntime(ready=False, env_ready=True))
+    try:
+        job = q2.submit(job_payload("env-ready"))
+        wait_for(lambda: job.status == "done", "env_ready job done")
+    finally:
+        q2.stop()
+
+    # env_ready=false 即使 legacy ready=true 也应拒绝
+    q3 = FakeQueue(FakeRuntime(ready=True, env_ready=False))
+    try:
+        try:
+            q3.submit(job_payload("env-not-ready"))
+        except BusyError as e:
+            assert "环境未就绪" in str(e), str(e)
+        else:
+            raise AssertionError("env_ready=false 仍接受 job")
+    finally:
+        q3.stop()
+    return "legacy/env_ready 分支正确"
+
+
+def t_job_admission_lock():
+    runtime = FakeRuntime()
+    q = FakeQueue(runtime)
+    seen = {}
+
+    def admission(job):
+        seen["owned"] = q._cond._is_owned()
+        seen["status"] = job.status
+        raise OperationError("MISSING_UNITS", "admission 缺权重", 409, False,
+                             {"phase": "job_admission"})
+
+    runtime.job_admission = admission
+    try:
+        try:
+            q.submit(job_payload("admission"))
+        except BusyError as e:
+            assert e.code == "MISSING_UNITS", e.code
+            assert e.http_status == 409
+        else:
+            raise AssertionError("job_admission 拒绝后仍入队")
+        assert seen.get("owned") is True, seen
+        assert seen.get("status") == "queued", seen
+        assert q.snapshot()["counts"]["queued"] == 0
+        return "锁内 hook=%s" % seen
+    finally:
+        q.stop()
+
+
+def t_require_job_execution():
+    runtime = FakeRuntime()
+    q = QueueManager(runtime, {})       # 用生产 _run_job，才能在 dispatch 前调用 hook
+    seen = []
+
+    def execution_hook(job):
+        seen.append(job.status)
+        raise OperationError("MISSING_UNITS", "执行前缺权重", 409, False)
+
+    runtime.require_job_execution = execution_hook
+    try:
+        job = q.submit(job_payload("exec-hook"))
+        wait_for(lambda: job.status == "failed", "job execution hook failed")
+        assert seen == ["running"], seen
+        assert "MISSING_UNITS" in job.error, job.error
+        return "执行前 hook=%s" % seen
+    finally:
+        q.stop()
+
+
+def t_json_result_and_progress():
+    q = FakeQueue()
+    try:
+        op = q.submit_operation("ctrl", {}, lambda o: b"raw-bytes")
+        wait_status(q, op.id, "failed")
+        pub = op.public()
+        json.dumps(pub)                 # 必须能直接 JSON 化
+        assert pub["result"] is None, pub
+        assert pub["error"]["code"] == "EXECUTION_FAILED", pub["error"]
+        assert pub["error"]["details"]["phase"] == "result", pub["error"]
+        assert op.result is None
+
+        def direct_progress(op):
+            op.progress = b"raw-progress"
+            return "ok"
+
+        op2 = q.submit_operation("ctrl", {}, direct_progress)
+        wait_status(q, op2.id, "failed")
+        pub2 = op2.public()
+        json.dumps(pub2)
+        assert op2.progress is None, op2.progress
+        assert pub2["error"]["details"]["phase"] == "progress", pub2["error"]
+
+        def bad_set_stage(op):
+            op.set_stage("step", progress=b"raw")
+            return "unreachable"
+
+        op3 = q.submit_operation("ctrl", {}, bad_set_stage)
+        wait_status(q, op3.id, "failed")
+        json.dumps(op3.public())
+        assert op3.public()["error"]["details"]["phase"] == "progress"
+        return "result/progress 非 JSON 均失败且清理"
+    finally:
+        q.stop()
+
+
+def t_error_details_json_and_detach():
+    q = FakeQueue()
+    try:
+        def cb(op):
+            raise OperationError("MISSING_UNITS", "缺权重", 409, False,
+                                 {"raw": b"not-json"})
+
+        op = q.submit_operation("ctrl", {}, cb)
+        wait_status(q, op.id, "failed")
+        pub = op.public()
+        json.dumps(pub)
+        assert pub["error"]["code"] == "MISSING_UNITS", pub["error"]
+        details = pub["error"]["details"]
+        assert details["invalid"] == "dict", details
+        assert "bytes" in details["reason"], details
+        assert op.error.__traceback__ is None
+        assert op.error.__cause__ is None
+        assert op.error.__context__ is None
+        return "details 已 sanitize，异常已脱栈"
+    finally:
+        q.stop()
+
+
+def t_cleanup_and_synchronize():
+    runtime = FakeRuntime()
+    events = []
+    sync_started = threading.Event()
+    sync_release = threading.Event()
+
+    def cleanup(op):
+        events.append(("cleanup", op.status))
+
+    def synchronize(op):
+        events.append(("sync-start", op.status))
+        sync_started.set()
+        sync_release.wait(5.0)
+        events.append(("sync-end", op.status))
+
+    runtime.operation_cleanup = cleanup
+    runtime.operation_synchronize = synchronize
+    q = FakeQueue(runtime)
+    try:
+        op = q.submit_operation(
+            "ctrl", {}, lambda o: (events.append(("callback", o.status)), "ok")[1])
+        assert sync_started.wait(2.0), events
+        # 同步未完成时仍是 running，control 保留位不能释放
+        assert op.status == "running", op.status
+        assert q.operations_snapshot()["running"] == op.id
+        assert q.executor_state()["state"] == "running"
+        expect_error(lambda: q.submit_operation("ctrl", {}, lambda o: "ok"),
+                     "BUSY")
+        sync_release.set()
+        wait_status(q, op.id, "done")
+        assert events == [("callback", "running"), ("cleanup", "running"),
+                          ("sync-start", "running"), ("sync-end", "running")], events
+
+        # cleanup 抛错：即使 callback 成功也失败；synchronize 仍被调用
+        runtime2 = FakeRuntime()
+        sync_calls = []
+
+        def cleanup_bad(op):
+            raise RuntimeError("cleanup failed")
+
+        runtime2.operation_cleanup = cleanup_bad
+        runtime2.operation_synchronize = lambda op: sync_calls.append(op.id)
+        q2 = FakeQueue(runtime2)
+        try:
+            op2 = q2.submit_operation("ctrl", {}, lambda o: "ok")
+            wait_status(q2, op2.id, "failed")
+            assert op2.public()["error"]["code"] == "EXECUTION_FAILED"
+            assert sync_calls == [op2.id], sync_calls
+        finally:
+            q2.stop()
+
+        # callback 失败路径也要 cleanup
+        runtime3 = FakeRuntime()
+        cleanup_calls = []
+        runtime3.operation_cleanup = lambda op: cleanup_calls.append(op.id)
+        q3 = FakeQueue(runtime3)
+        try:
+            op3 = q3.submit_operation(
+                "ctrl", {}, lambda o: (_ for _ in ()).throw(RuntimeError("bad")))
+            wait_status(q3, op3.id, "failed")
+            assert cleanup_calls == [op3.id], cleanup_calls
+        finally:
+            q3.stop()
+        return "sync 前保持 running；成功/失败均 cleanup"
+    finally:
+        sync_release.set()
+        q.stop()
+
+
+def t_release_input_refs():
+    class Cb:
+        def __init__(self, node):
+            self.node = node
+
+        def __call__(self, op):
+            return {"ok": True}
+
+    class Pre:
+        def __init__(self, node):
+            self.node = node
+
+        def __call__(self, kind, payload):
+            return {"token": 1}
+
+    q = FakeQueue()
+    try:
+        payload_node, cb_node, pre_node = RefNode(), RefNode(), RefNode()
+        refs = [weakref.ref(payload_node), weakref.ref(cb_node),
+                weakref.ref(pre_node)]
+        op = q.submit_operation("ctrl", {"node": payload_node},
+                                Cb(cb_node), preflight=Pre(pre_node))
+        del payload_node, cb_node, pre_node
+        wait_status(q, op.id, "done")
+        assert op.payload is None and op.cb is None
+        assert op.preflight is None and op.preflight_token is None
+        gc.collect()
+        assert all(r() is None for r in refs), [r() for r in refs]
+
+        frame_refs = []
+
+        class BadCb:
+            def __call__(self, op):
+                local = RefNode()
+                frame_refs.append(weakref.ref(local))
+                raise RuntimeError("boom")
+
+        op2 = q.submit_operation("ctrl", {"n": 2}, BadCb())
+        wait_status(q, op2.id, "failed")
+        wait_for(lambda: q.executor_state()["state"] == "idle", "worker idle")
+        assert op2.payload is None and op2.cb is None
+        gc.collect()
+        assert frame_refs and frame_refs[0]() is None, frame_refs
+
+        q2 = PausedQueue()
+        try:
+            p_node, c_node = RefNode(), RefNode()
+            refs2 = [weakref.ref(p_node), weakref.ref(c_node)]
+            op3 = q2.submit_operation("ctrl", {"node": p_node}, Cb(c_node))
+            del p_node, c_node
+            q2.cancel_operation(op3.id)
+            assert op3.payload is None and op3.cb is None
+            gc.collect()
+            assert all(r() is None for r in refs2), [r() for r in refs2]
+
+            p_node, c_node = RefNode(), RefNode()
+            refs3 = [weakref.ref(p_node), weakref.ref(c_node)]
+            op4 = q2.submit_operation("ctrl", {"node": p_node}, Cb(c_node))
+            del p_node, c_node
+            q2.stop()
+            assert op4.payload is None and op4.cb is None
+            gc.collect()
+            assert all(r() is None for r in refs3), [r() for r in refs3]
+        finally:
+            q2.stop()
+        return "success/failure/cancel/shutdown 后闭包与 payload 回收"
+    finally:
+        q.stop()
+
+
 print("== 统一 operation executor / admission 自检（无 torch） ==")
 check("receipt / public view / result", t_receipt_and_result)
 check("preflight 锁外且执行前重验", t_preflight_twice)
@@ -653,6 +950,13 @@ check("runtime require_job（旧 job）", t_runtime_require_job)
 check("snapshot 不等待 callback", t_snapshot_nonblocking)
 check("客户端断线后服务继续", t_client_abandon_keeps_server_working)
 check("shutdown 干净退出", t_shutdown_clean)
+check("env_ready/legacy readiness 分支", t_readiness_env_ready)
+check("job_admission 在锁内且可拒绝", t_job_admission_lock)
+check("require_job_execution 执行前重验", t_require_job_execution)
+check("result/progress 纯 JSON 校验", t_json_result_and_progress)
+check("error details 纯 JSON 且脱栈", t_error_details_json_and_detach)
+check("cleanup/synchronize 后才 terminal", t_cleanup_and_synchronize)
+check("terminal 后释放 payload/闭包/帧", t_release_input_refs)
 
 print()
 if fails:

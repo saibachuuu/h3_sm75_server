@@ -28,8 +28,12 @@
 - 两个并发 control 最多一个获准；另一个在锁内看到 active operation 后拒绝。
 - 旧 job 运行期间提交旧 job 仍可排队（不因“队列非空”拒绝）。
 - control operation 运行/排队期间旧 job 一律 409。
-- 旧 job 的 readiness 检查仍在锁外（`Runtime.ready/error` + 可选
-  `require_job` hook）；因此模型未 ready 不妨碍 weights control operation。
+- 旧 job 的 readiness 检查仍在锁外：新 runtime 优先看 `env_ready`，没有该
+  属性时回退 legacy `ready`；因此 DiT 未齐但环境可用时，独立的 vae_probe
+  等旧 job 仍可提交，`ready=false` 也不妨碍 weights control operation。
+- `runtime.job_admission(job)` 在 **admission 锁内**、入队前调用（廉价），
+  用于锁外 `require_job` preflight 之后再次核对 weights/recipe 状态，避免
+  control 在这段时间完成并改变权重后误接。
 - 入队与检查之间没有“先看队列为空再入队”的窗口。
 
 ## 3. 公共接口
@@ -80,7 +84,16 @@ op.receipt()
 
 - `public()` **不包含** payload、callback、bytes 或 tensor；快照可以安全返回。
 - `public(include_log=True)` 额外给最近 40 行日志，只建议单条 GET 使用。
-- `result` 是 `run_callback` 的返回值，必须能被 HTTP JSON 序列化。
+- `result` / `progress` 必须是**纯 JSON**（不接受 Tensor、bytes、set、NaN/Inf
+  或自定义对象）。回调返回未知类型时 operation 变 `failed`
+  （`EXECUTION_FAILED`，details 带 `phase=result|progress`），不会把 raw
+  result 放进回执；`set_stage(..., progress=...)` 也会立即校验。
+- 进入 terminal 后 `payload / run_callback / preflight / preflight_token`
+  强引用全部释放，只保留 kind/fingerprint/request_id/纯 JSON result 与错误
+  摘要。200 条保留窗口不会常驻 96MB 输入或闭包模型。
+- `op.error` 只保存脱栈的 `OperationError` 快照（`__traceback__`、
+  `__cause__`、`__context__` 均为 None）；details 也会做纯 JSON 校验，
+  非法时替换成小 marker，避免异常栈帧里的 Tensor 被回执长期持有。
 - callback 可以用 `op.set_stage("...", progress=0.5)` 更新进度；不要获取
   admission lock，也不要在 callback 内调用 `queue.stop()`。
 - callback 抛异常不会杀死 worker：operation 变 `failed`，队列继续接受/执行
@@ -149,14 +162,18 @@ preflight 建议抛 `OperationError`；抛 `ValueError` 会归类为
 | hook | 调用时机 | 锁 | 要求 |
 |---|---|---|---|
 | `runtime.require_job(payload)` | 旧 job 校验后、入队前 | 锁外 | 可慢；抛 `OperationError` 会转成旧 `BusyError`/`ValueError` |
+| `runtime.job_admission(job)` | 旧 job 入队前（control 检查之后） | **持锁** | 必须廉价；不得 GPU/文件扫描，不得回调 QueueManager |
+| `runtime.require_job_execution(job)` | worker 已把 job 标 running、真正 dispatch 前 | 锁外 | 执行前重验；抛错让 job `failed` |
 | `runtime.operation_preflight(kind, payload)` | 提交时 + 执行前 | 锁外 | 可慢；建议幂等纯检查 |
 | `runtime.operation_admission(kind, payload)` | admission 锁内 | **持锁** | 必须廉价；不得 GPU/文件扫描，不得回调 QueueManager，否则死锁 |
 | `runtime.operation_revalidate(kind, payload, token)` | 执行前 preflight 之后 | 锁外 | 复核 state revision/recipe fingerprint 等 |
+| `runtime.operation_cleanup(op)` | callback 后、terminal 前（成功/失败都调用） | 锁外 | 释放临时资源；可慢 |
+| `runtime.operation_synchronize(op)` | cleanup 后、terminal 前 | 锁外 | GPU 异步同步；同步完成前 operation 保持 running |
 
-旧 job 的 readiness 仍是原来的 `Runtime.ready/error` 检查；`require_job`
-只作为增量 hook，用来做 weights 相关前置检查。control operation 不要求
-`Runtime.ready`，只由 `operation_admission` 决定（P1 门槛：ready=false 不妨碍
-weights API）。
+旧 job 的 readiness 优先看 `env_ready`，legacy 无此属性时回退 `ready`；
+`require_job` / `job_admission` / `require_job_execution` 都是增量 hook，
+未接入 weights 时不存在即可。control operation 不要求 `Runtime.ready`，只由
+`operation_admission` 决定（P1 门槛：ready=false 不妨碍 weights API）。
 
 ## 6. 错误与旧接口兼容
 
@@ -196,7 +213,10 @@ operation GET 仍返回 200，`status=failed`，`error` 是同一个结构。
 多轮 barrier、job 运行中继续排队、control 占用时 job 409、queued/running
 取消、request_id 去重/冲突/有界淘汰、callback 异常不封锁、提交/执行 preflight
 失败、runtime hooks、admission 拒绝、require_job、快照不阻塞、客户端断线后
-服务继续、shutdown 干净退出。测试不 import torch。
+服务继续、shutdown 干净退出；以及 env_ready/legacy readiness、锁内
+job_admission、require_job_execution、result/progress/error details 纯 JSON
+校验、异常脱栈、cleanup/synchronize 完成前保持 running、弱引用证明
+payload/闭包/异常帧回收。测试不 import torch。
 
 ## 9. 已知限制（P1）
 

@@ -22,6 +22,33 @@ TERMINAL_STATUSES = frozenset(("done", "failed", "cancelled"))
 ACTIVE_STATUSES = frozenset(("queued", "running"))
 
 
+def json_safe_copy(value, what="value"):
+    """严格校验并复制成纯 JSON 值；未知类型/NaN/循环引用抛 ValueError。
+
+    用 dumps→loads 同时完成校验和**脱离原对象**（result 里不再持有 Tensor、
+    bytes 或 callback 闭包引用的内部结构）。GET 回执不会因为未知类型 500。
+    """
+    try:
+        text = json.dumps(value, ensure_ascii=False, allow_nan=False,
+                          separators=(",", ":"))
+        text.encode("utf-8")
+        return json.loads(text)
+    except Exception as e:
+        # 包括 TypeError/ValueError/NaN/循环引用/Unicode/RecursionError；
+        # 未知校验异常一律归一为 ValueError，worker 不会因此退出。
+        raise ValueError("%s 不是纯 JSON: %s" % (what, e)) from e
+
+
+def json_or_marker(value, what="value"):
+    """public view 用：合法就返回副本，非法返回小的 marker，绝不返回 raw 对象。"""
+    if value is None:
+        return None
+    try:
+        return json_safe_copy(value, what)
+    except Exception as e:
+        return {"invalid": type(value).__name__, "reason": str(e)}
+
+
 class OperationError(Exception):
     """新 API 契约里的 error envelope（可安全转成 dict / JSON）。
 
@@ -48,7 +75,7 @@ class OperationError(Exception):
             "message": self.message,
             "http_status": self.http_status,
             "retryable": self.retryable,
-            "details": self.details,
+            "details": json_or_marker(self.details, "error details"),
         }
 
     @classmethod
@@ -61,6 +88,23 @@ class OperationError(Exception):
                        {"exception": type(exc).__name__})
         return cls("EXECUTION_FAILED", "%s: %s" % (type(exc).__name__, exc),
                    500, False, {"exception": type(exc).__name__})
+
+
+def detached_error(err):
+    """把异常复制成不携带 traceback/cause/context 的 OperationError 快照。
+
+    直接保存原始异常会把回调栈帧（可能含 Tensor/模型/96MB 输入）挂在
+    ``__traceback__`` 上；operation 进入 terminal 后只保留这个脱栈副本。
+    """
+    if not isinstance(err, OperationError):
+        err = OperationError.from_exception(err)
+    details = json_or_marker(err.details, "operation error details")
+    clean = OperationError(err.code, err.message, err.http_status,
+                           err.retryable, details)
+    clean.__traceback__ = None
+    clean.__cause__ = None
+    clean.__context__ = None
+    return clean
 
 
 def _canonical_value(value):
@@ -136,7 +180,22 @@ class Operation:
         """callback 内更新进度；不需要/不应该获取 admission lock。"""
         self.stage = str(stage)
         if progress is not None:
-            self.progress = progress
+            try:
+                self.progress = json_safe_copy(progress, "operation progress")
+            except ValueError as e:
+                raise OperationError(
+                    "EXECUTION_FAILED", str(e), 500, False,
+                    {"phase": "progress"}) from e
+
+    def release_inputs(self):
+        """进入 terminal/cancel 后释放 payload、callback、preflight 强引用。
+
+        fingerprint/kind/result/error 摘要保留，供有限窗口内的回执查询。
+        """
+        self.payload = None
+        self.cb = None
+        self.preflight = None
+        self.preflight_token = None
 
     def public(self, include_log=False):
         elapsed = (self.finished or time.time()) - (self.created or time.time())
@@ -151,18 +210,19 @@ class Operation:
             "kind": self.kind,
             "status": self.status,
             "stage": self.stage,
-            "progress": self.progress,
+            # 即使 callback 绕过 set_stage 直接写字段，GET 也绝不吐 raw Tensor
+            "progress": json_or_marker(self.progress, "operation progress"),
             "created": self.created,
             "started": self.started,
             "finished": self.finished,
             "elapsed": round(elapsed, 3),
             "request_id": self.request_id,
-            "result": self.result,
+            "result": json_or_marker(self.result, "operation result"),
             "error": error,
             "operation_url": "/api/operations/" + self.id,
         }
         if include_log:
-            d["log_tail"] = self.log[-40:]
+            d["log_tail"] = [str(x) for x in self.log[-40:]]
         return d
 
     def receipt(self):

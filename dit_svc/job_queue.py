@@ -21,7 +21,8 @@ import traceback
 import uuid
 
 from dit_svc.operations import (ACTIVE_STATUSES, Operation, OperationError,
-                                TERMINAL_STATUSES, payload_fingerprint)
+                                TERMINAL_STATUSES, detached_error,
+                                json_safe_copy, payload_fingerprint)
 
 
 class BusyError(OperationError):
@@ -116,11 +117,23 @@ class QueueManager:
 
     # ---------- 提交 ----------
     def _require_ready(self):
+        """旧 job 的 readiness：优先 env_ready，未接入新 runtime 时回退 ready。
+
+        新 runtime 的 ``env_ready`` 表示环境/依赖可用，不表示 DiT 权重已齐；
+        因此 DiT 未加载时仍可提交独立的 vae_probe / 其他只依赖环境的旧 job。
+        """
         if self.runtime.error:
             raise BusyError("模型加载失败: %s" % self.runtime.error)
-        if not self.runtime.ready:
-            raise BusyError("模型加载中（%s，已 %.0f 秒），请稍后再提交"
-                            % (self.runtime.stage, self.runtime.stage_elapsed()))
+        env_ready = getattr(self.runtime, "env_ready", None)
+        ready = self.runtime.ready if env_ready is None else env_ready
+        if not ready:
+            if env_ready is None:
+                raise BusyError("模型加载中（%s，已 %.0f 秒），请稍后再提交"
+                                % (self.runtime.stage,
+                                   self.runtime.stage_elapsed()))
+            raise BusyError("环境未就绪（%s，已 %.0f 秒），请稍后再提交"
+                            % (self.runtime.stage,
+                               self.runtime.stage_elapsed()))
 
     # ---------- 旧 job 的 admission（与 operation 共用同一把锁） ----------
     def _require_job_submit(self, payload):
@@ -144,8 +157,22 @@ class QueueManager:
             raise BusyError(str(e), code=e.code, http_status=e.http_status,
                             retryable=e.retryable, details=e.details) from e
 
+    def _job_hook_error(self, e):
+        """把 job admission/execution hook 的 OperationError 转成旧 job 语义。"""
+        if isinstance(e, BusyError):
+            return e
+        if e.http_status == 400:
+            return ValueError(str(e))
+        return BusyError(str(e), code=e.code, http_status=e.http_status,
+                         retryable=e.retryable, details=e.details)
+
     def _enqueue_job(self, job):
-        """原子检查 control 保留位后入队；旧 job 之间仍正常排队。"""
+        """原子检查 control 保留位 + 廉价 job_admission 后入队。
+
+        ``runtime.job_admission(job)`` 在 admission 锁内调用，必须廉价且不得
+        回调 QueueManager；它用于在锁外 require_job preflight 之后、入队之前
+        再核对 weights/recipe 状态，避免 control 在这段时间改变状态后误接。
+        """
         with self._cond:
             if self._stopping.is_set():
                 raise BusyError("执行器正在关闭，不再接受新任务",
@@ -157,6 +184,21 @@ class QueueManager:
                     "有 control 操作在运行或排队（%s %s），生成任务需等它结束后再提交"
                     % (active.kind, active.id),
                     details={"operation_id": active.id})
+            hook = getattr(self.runtime, "job_admission", None)
+            if callable(hook):
+                try:
+                    hook(job)
+                except BusyError:
+                    raise
+                except OperationError as e:
+                    raise self._job_hook_error(e) from e
+                except ValueError:
+                    raise
+                except Exception as e:
+                    raise BusyError(
+                        "job_admission 检查失败: %s: %s"
+                        % (type(e).__name__, e), code="ADMISSION_FAILED",
+                        http_status=503, retryable=True) from e
             self.jobs[job.id] = job
             self.order.append(job.id)
             self._cond.notify_all()
@@ -459,6 +501,7 @@ class QueueManager:
                 op.stage = "已取消"
                 op.finished = time.time()
                 op.cancel_reason = "client"
+                op.release_inputs()
                 self._cond.notify_all()
                 return op.public()
             if op.status == "cancelled":
@@ -536,6 +579,7 @@ class QueueManager:
                 continue
             if op.status not in TERMINAL_STATUSES:
                 continue
+            op.release_inputs()
             self.operations.pop(oid, None)
             self._op_order.remove(oid)
             if op.request_id is not None and \
@@ -626,6 +670,10 @@ class QueueManager:
         """旧 job 的执行分发；保持原有异常字段/日志/完成语义。"""
         print("[queue] running %s (%s)" % (job.id, job.kind), flush=True)
         try:
+            # 执行前重验：提交后到真正开跑之间，weights/env 可能已变化。
+            hook = getattr(self.runtime, "require_job_execution", None)
+            if callable(hook):
+                hook(job)
             if job.kind == "warmup":
                 self._run_warmup(job)
             elif job.kind == "vae_probe":
@@ -642,13 +690,87 @@ class QueueManager:
         except Exception as e:
             job.status = "failed"
             job.stage = "失败"
-            job.error = "%s: %s" % (type(e).__name__, e)
+            if isinstance(e, OperationError):
+                job.error = "%s: %s" % (e.code, e.message)
+            else:
+                job.error = "%s: %s" % (type(e).__name__, e)
             job.log.append("ERROR: %s" % job.error)
             job.log.append(traceback.format_exc()[-2000:])
             traceback.print_exc()
             print("[queue] job %s FAILED: %s" % (job.id, job.error), flush=True)
         finally:
             job.finished = time.time()
+
+    def _operation_cleanup(self, op):
+        """callback 后、terminal 前的可选 cleanup/synchronize hooks。
+
+        两个 hook 都会尝试；同步完成前 operation 保持 running/control 保留位，
+        队列不会提前宣称 idle。返回第一个错误（已脱栈）。
+        """
+        first = None
+        for name in ("operation_cleanup", "operation_synchronize"):
+            hook = getattr(self.runtime, name, None)
+            if not callable(hook):
+                continue
+            try:
+                hook(op)
+            except Exception as e:
+                err = detached_error(e)
+                op.log.append("ERROR: %s: %s: %s"
+                              % (name, err.code, err.message))
+                if first is None:
+                    first = err
+                traceback.print_exc()
+        return first
+
+    def _finalize_operation(self, op, err, result):
+        """校验 JSON、cleanup/synchronize、脱栈、terminal、释放输入引用。"""
+        clean_result = None
+        if err is None:
+            try:
+                clean_result = json_safe_copy(result, "operation result")
+            except ValueError as e:
+                err = OperationError("EXECUTION_FAILED", str(e), 500, False,
+                                     {"phase": "result"})
+
+        # callback 可能绕过 set_stage 直接写 progress；无论成功失败都清理。
+        try:
+            op.progress = json_safe_copy(op.progress, "operation progress")
+        except ValueError as e:
+            op.progress = None
+            if err is None:
+                err = OperationError("EXECUTION_FAILED", str(e), 500, False,
+                                     {"phase": "progress"})
+
+        cleanup_err = self._operation_cleanup(op)
+        if cleanup_err is not None:
+            if err is None:
+                err = cleanup_err
+            else:
+                op.log.append("cleanup error (保留首个错误): %s: %s"
+                              % (cleanup_err.code, cleanup_err.message))
+
+        if err is not None:
+            err = detached_error(err)
+            op.result = None
+        else:
+            op.result = clean_result
+
+        with self._cond:
+            if err is None:
+                op.status = "done"
+                op.stage = "完成"
+            else:
+                op.status = "failed"
+                op.stage = "失败"
+                op.error = err
+            op.finished = time.time()
+            op.release_inputs()
+            self._prune_operations_locked()
+            self._cond.notify_all()
+        if err is not None:
+            print("[queue] operation %s FAILED: %s: %s"
+                  % (op.id, err.code, err.message), flush=True)
 
     def _run_operation(self, op):
         """锁外执行 operation；preflight 重验 → runtime revalidate → callback。"""
@@ -658,28 +780,15 @@ class QueueManager:
             token = self._operation_preflight(op.kind, op.payload, op.preflight)
             self._operation_revalidate(op, token)
             result = op.cb(op)
-            op.result = result
-            with self._cond:
-                op.status = "done"
-                op.stage = "完成"
-                op.finished = time.time()
-                self._prune_operations_locked()
-                self._cond.notify_all()
         except Exception as e:
-            err = OperationError.from_exception(e)
-            op.error = err
-            op.log.append("ERROR: %s: %s" % (err.code, err.message))
+            raw = e
+            op.log.append("ERROR: %s: %s" % (type(e).__name__, e))
             if not isinstance(e, OperationError):
                 op.log.append(traceback.format_exc()[-2000:])
                 traceback.print_exc()
-            with self._cond:
-                op.status = "failed"
-                op.stage = "失败"
-                op.finished = time.time()
-                self._prune_operations_locked()
-                self._cond.notify_all()
-            print("[queue] operation %s FAILED: %s: %s"
-                  % (op.id, err.code, err.message), flush=True)
+            self._finalize_operation(op, raw, None)
+        else:
+            self._finalize_operation(op, None, result)
 
     def stop(self, timeout=5.0):
         """停止 worker；queued 的 operation/job 标记 cancelled，running 等其自然结束。
@@ -697,6 +806,7 @@ class QueueManager:
                     op.stage = "服务关闭"
                     op.finished = now
                     op.cancel_reason = "shutdown"
+                    op.release_inputs()
             for jid in self.order:
                 job = self.jobs.get(jid)
                 if job is not None and job.status == "queued":
