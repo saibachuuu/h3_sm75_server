@@ -106,13 +106,16 @@ blocks.10+ 风格：`F8_E4M3 qdata + weight_codebook + weight_s_channel + weight
 ## 5. 未验证事项（不得宣称通过）
 
 1. 真实 GPU 上卡/量化加载/显存数字（本机无 CUDA；fake move 只改逻辑 device）。
-2. 真实 `MiniMaxH3Model(device="meta")` 骨架 + `operations` 量化分支
-   （`comfy/ops.py`、`quant_ops.py` 未读；真实 `comfy-kitchen` QuantizedTensor
-   内部字段未展开实测——inventory 走通用 `__dict__` 展开，需复验）。
+2. 真实 `MiniMaxH3Model(device="meta")` 骨架 + `mixed_precision_ops` 量化分支
+   （`comfy/ops.py:1256-1397`、`quant_ops.py` 的 consumable 契约未读；
+   真实 `comfy-kitchen` QuantizedTensor 内部字段未展开实测——inventory 走
+   通用 `__dict__` 展开，需复验）。
 3. VAE encoder/decoder 与 shared 的真实 storage 边界（§3 已标 unknown）。
 4. TE（Qwen3VL 32B + ClipProj）真实资源边界（本次无 TE header）。
 5. `load_models_gpu`/CLIP/VAE/sampler 拦截与 VEDA resident engine（P3/P4）。
 6. 远端 torch 2.13 与本机 2.8 的行为差（仅标准张量语义自测，无版本特有 API）。
+   已知一条：torch 2.8 禁止跨 device 原地 `set_`/`p.data=` 赋值
+   （purge 已改槽位替换，见 `h3_comfy.purge_unit`）。
 
 ## 6. 测试（隔离 venv：`explicit_api_env_20261121`，未动全局）
 
@@ -121,6 +124,9 @@ CD C:\Users\88888888\work-on-comfyui\h3_sm75_server_wt_weights
 C:\Users\88888888\AppData\Local\Temp\opencode\explicit_api_env_20261121\Scripts\python.exe tests/_selftest_weights_logic.py
 C:\Users\88888888\AppData\Local\Temp\opencode\explicit_api_env_20261121\Scripts\python.exe tests/_selftest_storage_inventory.py
 C:\Users\88888888\AppData\Local\Temp\opencode\explicit_api_env_20261121\Scripts\python.exe tests/_selftest_partial_lifecycle.py
+C:\Users\88888888\AppData\Local\Temp\opencode\explicit_api_env_20261121\Scripts\python.exe tests/_selftest_registry_review.py
+C:\Users\88888888\AppData\Local\Temp\opencode\explicit_api_env_20261121\Scripts\python.exe tests/_selftest_h3_adapter.py
+C:\Users\88888888\AppData\Local\Temp\opencode\explicit_api_env_20261121\Scripts\python.exe tests/_selftest_real_header_catalog.py
 ```
 
 - `_selftest_weights_logic`：stdlib-clean import、真实 H3 key 命名 catalog
@@ -132,3 +138,15 @@ C:\Users\88888888\AppData\Local\Temp\opencode\explicit_api_env_20261121\Scripts\
   未选无 storage、partial purge 保槽位、补回不碰兄弟 storage（data_ptr 比对）、
   CUDA 残留 purge 拒绝、全量 purge 回 absent。ALL OK。
 - 真实 header catalog 验证：§3 表格（4 checkpoint，`check_cover` 零 unmapped）。
+- `_selftest_registry_review`（主代理 m00424 审查回归）：same_source 含
+  kind/options/version、无驻留换源清旧 catalog 且 generation 单调、
+  驻留换 catalog 拒绝、未知 unit 不得当 absent 通过、四动作遇 error/mixed
+  全拒（recover 必经）、recover 必须附 adapter 实测 release_proof
+  （双零+空 digest，否则 ghost absent 拒绝）、输出深拷贝隔离、
+  snapshot 修订号/counts/bytes、header 检验矩阵（32MiB 界/dtype/shape/
+  offsets/EOF/重复 key）。ALL OK。
+- `_selftest_h3_adapter`：stub 语义（device 透传、meta 零 storage、strict
+  关门、purge 保槽位、registry 锁并发）+ 无 Comfy 报 ComfyUnavailable。ALL OK。
+- `_selftest_real_header_catalog`：按远端 header 报告复刻的布局保真合成头
+  （双量化伴生键/adaln/rope/refiner/patch/final），catalog 全覆盖、
+  单位划分、字节账、选择器、waived 精确忽略。ALL OK。

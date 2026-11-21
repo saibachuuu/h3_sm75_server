@@ -15,11 +15,13 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
 import re
 import struct
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -80,11 +82,14 @@ _DTYPE_NBYTES = {
     "F64": 8, "I64": 8, "U64": 8,
 }
 
-# 非计算元数据白名单：header 顶层 "__metadata__" 不是张量，跳过不计账。
+# 非计算元数据说明：safetensors header 顶层 "__metadata__" 不是张量，
+# 由 read_safetensors_header 直接剥离。张量 key 原则上全部建账；
+# 确需忽略的 key 必须由调用方经 ignored_exact 逐个具名给出
+# （build_catalog_from_header 参数），不接受前缀通配。
 HEADER_META_KEY = "__metadata__"
 
-# 已知可忽略的非计算 key 前缀（可解释白名单；命中则不建账但记录）。
-IGNORED_KEY_PREFIXES = ("__",)
+#: header 解析上限 32MiB（header 只含 dtype/shape/offset JSON，超限即异常文件）
+HEADER_MAX_BYTES = 32 * 1024 * 1024
 
 
 def dtype_nbytes(dtype: str) -> int:
@@ -108,28 +113,46 @@ def read_safetensors_header(path: str) -> Tuple[Dict[str, Dict[str, Any]], int]:
     tensors: {key: {"dtype": str, "shape": [...], "data_offsets": [b, e]}}。
     顶层 "__metadata__" 被剥离（见返回值第二元组之外的元信息不返回）。
     不读取任何权重体；枚举 catalog 不需要 safetensors/torch 包。
+
+    输入检验：8 字节长度头、header <= 32MiB、JSON 有效且为对象、
+    每项 dtype 已知、shape 为非负 int 列表、data_offsets 为 [b<=e] 且
+    落在文件内、重复 JSON key 直接失败（object_pairs_hook）。
     """
+    size = os.path.getsize(path)
     with open(path, "rb") as f:
         raw = f.read(8)
         if len(raw) < 8:
             raise CatalogError("file too small for safetensors header",
                                details={"path": path})
         (header_len,) = struct.unpack("<Q", raw)
-        if header_len > 256 * 1024 * 1024:
-            raise CatalogError("safetensors header implausibly large",
+        if header_len > HEADER_MAX_BYTES:
+            raise CatalogError("safetensors header exceeds 32MiB bound",
                                details={"path": path, "header_len": header_len})
+        if 8 + header_len > size:
+            raise CatalogError("header overruns EOF",
+                               details={"path": path, "header_len": header_len,
+                                        "size": size})
         blob = f.read(header_len)
         if len(blob) < header_len:
             raise CatalogError("truncated safetensors header",
                                details={"path": path})
+    def _no_dup(pairs):
+        d = {}
+        for k, v in pairs:
+            if k in d:
+                raise CatalogError("duplicate JSON key %r in header" % (k,),
+                                   details={"key": k})
+            d[k] = v
+        return d
     try:
-        header = json.loads(blob.decode("utf-8"))
+        header = json.loads(blob.decode("utf-8"), object_pairs_hook=_no_dup)
     except (UnicodeDecodeError, ValueError) as e:
         raise CatalogError("safetensors header is not valid JSON: %s" % e,
                            details={"path": path}) from None
     if not isinstance(header, dict):
         raise CatalogError("safetensors header is not an object",
                            details={"path": path})
+    data_start = 8 + header_len
     tensors: Dict[str, Dict[str, Any]] = {}
     for k, v in header.items():
         if k == HEADER_META_KEY:
@@ -137,9 +160,36 @@ def read_safetensors_header(path: str) -> Tuple[Dict[str, Dict[str, Any]], int]:
         if not isinstance(v, dict) or "dtype" not in v or "shape" not in v:
             raise CatalogError("malformed tensor entry %r" % (k,),
                                details={"key": k})
-        tensors[k] = {"dtype": v["dtype"], "shape": list(v["shape"]),
-                      "data_offsets": list(v.get("data_offsets", [0, 0]))}
+        if k in tensors:
+            raise CatalogError("duplicate tensor key %r" % (k,),
+                               details={"key": k})
+        dtype = v["dtype"]
+        dtype_nbytes(dtype)  # 未知 dtype 直接失败
+        shape = _require_int_list(v["shape"], k)
+        off = v.get("data_offsets", [0, 0])
+        if (not isinstance(off, (list, tuple)) or len(off) != 2
+                or isinstance(off[0], bool) or isinstance(off[1], bool)
+                or not isinstance(off[0], int) or not isinstance(off[1], int)
+                or off[0] < 0 or off[1] < off[0]
+                or data_start + off[1] > size):
+            raise CatalogError("bad data_offsets for %r" % (k,),
+                               details={"key": k, "data_offsets": off})
+        tensors[k] = {"dtype": dtype, "shape": shape,
+                      "data_offsets": [off[0], off[1]]}
     return tensors, header_len
+
+
+def _require_int_list(shape: Any, key: str) -> List[int]:
+    if not isinstance(shape, list):
+        raise CatalogError("shape of %r is not a list" % (key,),
+                           details={"key": key})
+    out = []
+    for d in shape:
+        if isinstance(d, bool) or not isinstance(d, int) or d < 0:
+            raise CatalogError("bad dim %r of %r" % (d, key),
+                               details={"key": key, "dim": d})
+        out.append(d)
+    return out
 
 
 def header_digest(path: str, header_len: int) -> str:
@@ -173,20 +223,28 @@ class ModelRecipe:
     adapter_version: str = "weights-v0"
 
     def summary(self) -> Dict[str, Any]:
+        # 深拷贝：调用方改动返回 dict 不得污染 registry 内部
         return {
             "model_id": self.model_id,
             "kind": self.kind,
             "path": self.path,
             "extra_paths": list(self.extra_paths),
-            "options": dict(self.options),
-            "fingerprint": dict(self.fingerprint),
+            "options": copy.deepcopy(self.options),
+            "fingerprint": copy.deepcopy(self.fingerprint),
             "adapter_version": self.adapter_version,
         }
 
     def same_source(self, other: "ModelRecipe") -> bool:
+        """同源判定：path/extra/fingerprint 外，还必须 kind/options/version 一致。
+
+        同一文件改 mlp_chunk、TE kind、adapter 版本都算换源，必须先全量 purge。
+        """
         return (self.path == other.path
                 and tuple(self.extra_paths) == tuple(other.extra_paths)
-                and self.fingerprint == other.fingerprint)
+                and self.fingerprint == other.fingerprint
+                and self.kind == other.kind
+                and self.options == other.options
+                and self.adapter_version == other.adapter_version)
 
 
 def fingerprint_of(path: str) -> Dict[str, Any]:
@@ -221,7 +279,9 @@ def make_recipe(model_id: str, kind: str, path: str,
 
 
 def recipe_from_header_dict(model_id: str, kind: str, path_label: str,
-                            tensors: Mapping[str, Mapping[str, Any]]) -> ModelRecipe:
+                            tensors: Mapping[str, Mapping[str, Any]],
+                            options: Optional[Dict[str, Any]] = None,
+                            adapter_version: str = "weights-v0") -> ModelRecipe:
     """无真实文件时（如单测 fake header）构造轻量 recipe（指纹标 fake）。"""
     canon = json.dumps({k: {"dtype": v["dtype"], "shape": list(v["shape"])}
                         for k, v in sorted(tensors.items())},
@@ -230,7 +290,8 @@ def recipe_from_header_dict(model_id: str, kind: str, path_label: str,
           "header_sha256": "fake-" + hashlib.sha256(canon).hexdigest()[:16],
           "num_tensors": len(tensors), "fake": True}
     return ModelRecipe(model_id=model_id, kind=kind, path=path_label,
-                       fingerprint=fp)
+                       fingerprint=fp, options=dict(options or {}),
+                       adapter_version=adapter_version)
 
 
 # ---------------------------------------------------------------------------
@@ -299,10 +360,14 @@ class UnitCatalog:
         return sum(self.units[uid].expected_bytes for uid in unit_ids)
 
     def check_cover(self, header_keys: Iterable[str]) -> None:
-        """全量覆盖校验：未识别 key 直接失败（不允许 leftover 后继续）。"""
+        """全量覆盖校验：未识别 key 直接失败（不允许 leftover 后继续）。
+
+        唯一的例外是构造时具名的 ignored_exact（精确全名、可解释），
+        前缀通配不接受。
+        """
+        ignored = set(self.ignored_keys)
         missing = [k for k in header_keys
-                   if k not in self.key_to_unit
-                   and not any(k.startswith(p) for p in IGNORED_KEY_PREFIXES)]
+                   if k not in self.key_to_unit and k not in ignored]
         if missing:
             raise UnmappedKeyError(
                 "%d unmapped checkpoint keys (e.g. %r)" % (len(missing), missing[:5]),
@@ -322,24 +387,25 @@ _BLOCK_RE = re.compile(r"(?:^|[._])(?:blocks?|transformer_blocks?)[._-]?(\d+)(?:
 _LAYER_RE = re.compile(r"(?:^|[._])(?:layers?|predictor)[._-]?(\d+)(?:[._]|$)")
 
 
-def _is_ignored(key: str) -> bool:
-    return any(key.startswith(p) for p in IGNORED_KEY_PREFIXES)
-
-
 def build_catalog_from_header(model_id: str,
                               header: Mapping[str, Mapping[str, Any]],
-                              family: str = "dit") -> UnitCatalog:
-    """从 header 全量建 catalog（暂行命名规则，未经真实 H3 验证）。
+                              family: str = "dit",
+                              ignored_exact: Sequence[str] = ()) -> UnitCatalog:
+    """从 header 全量建 catalog（暂行命名规则，已按真实 H3 布局校准 key 名，
+    但共享边界/VAE 独立性仍待真实张量复核）。
 
     family: dit | te | vae | veda。规则只看 key 字符串，不读任何权重体。
+    ignored_exact: 精确全名白名单（可解释，如单测 fake 标记 key）；
+      不接受前缀通配；真实带权 key 不得出现在此列。
     同一 storage 的共享归属（shared_group）在真实布局核实前保守地按 unit
     独立建账，并在 docs/p0_weights.md 登记为 unknown。
     """
+    ignored_set = set(ignored_exact)
     buckets: Dict[str, List[str]] = {}
     unit_groups: Dict[str, Tuple[str, ...]] = {}
     ignored: List[str] = []
     for key in header.keys():
-        if _is_ignored(key):
+        if key in ignored_set:
             ignored.append(key)
             continue
         uid = _assign_unit(model_id, key, family)
@@ -711,43 +777,89 @@ def _new_unit_record(info: UnitInfo) -> Dict[str, Any]:
 
 
 class WeightRegistry:
-    """单进程权重注册表：JSON 摘要快照，不持有真实 Tensor 强引用。"""
+    """单进程权重注册表：JSON 摘要快照，不持有真实 Tensor 强引用。
+
+    线程安全：所有公开读写经同一 RLock，保证 snapshot 与状态写入互斥
+    （plan 02.8 的 metadata 一致性在底座的最小实现；admission 锁归
+    主代理的 executor 层）。
+    """
 
     def __init__(self):
+        self._lock = threading.RLock()
         self.recipes: Dict[str, ModelRecipe] = {}
         self.catalogs: Dict[str, UnitCatalog] = {}
         self.units: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self.model_generation: Dict[str, int] = {}
+        self._revision = 0
+
+    def locked(self) -> threading.RLock:
+        """供主代理 executor 做跨 registry+adapter 原子段时复用同一把锁。"""
+        return self._lock
+
+    def _bump(self, model_id: str) -> None:
+        self.model_generation[model_id] = self.model_generation.get(
+            model_id, 0) + 1
+        self._revision += 1
+
+    def _catalog_signature(self, catalog: UnitCatalog) -> str:
+        h = hashlib.sha256()
+        for uid in catalog.unit_ids():
+            info = catalog.units[uid]
+            h.update(uid.encode("utf-8"))
+            for k in info.checkpoint_keys:
+                h.update(b"\x00")
+                h.update(k.encode("utf-8"))
+        return h.hexdigest()
 
     # -- recipe / catalog --
     def register_recipe(self, recipe: ModelRecipe) -> None:
-        mid = recipe.model_id
-        cur = self.recipes.get(mid)
-        if cur is not None and self._has_resident(mid) and not cur.same_source(recipe):
-            raise RecipeError(
-                "model %r has resident weights; purge all units before "
-                "switching recipe" % (mid,),
-                recovery=["purgefromram 该模型全部 unit 后再换 recipe"],
-                details={"model": mid})
-        self.recipes[mid] = recipe
-        self.units.setdefault(mid, {})
-        self.model_generation.setdefault(mid, 0)
+        with self._lock:
+            mid = recipe.model_id
+            cur = self.recipes.get(mid)
+            if cur is not None and not cur.same_source(recipe):
+                if self._has_resident(mid):
+                    raise RecipeError(
+                        "RECIPE_CONFLICT: model %r has resident weights; "
+                        "purgefromram all units before switching recipe/kind/options" % (mid,),
+                        recovery=["purgefromram 该模型全部 unit 后再换 recipe"],
+                        details={"model": mid})
+                # 无驻留：允许换源，但旧 catalog/记录必须清理（防旧 key 残留），
+                # generation 与 revision 单调递增、不归零。
+                self.catalogs.pop(mid, None)
+                self.units[mid] = {}
+                self._bump(mid)
+            self.recipes[mid] = recipe
+            self.units.setdefault(mid, {})
+            self.model_generation.setdefault(mid, 0)
 
     def attach_catalog(self, catalog: UnitCatalog) -> None:
-        mid = catalog.model_id
-        if mid not in self.recipes:
-            raise RecipeError("no recipe for model %r" % (mid,),
-                              details={"model": mid})
-        self.catalogs[mid] = catalog
-        store = self.units.setdefault(mid, {})
-        for uid, info in catalog.units.items():
-            if uid not in store:
-                store[uid] = _new_unit_record(info)
-            else:
-                store[uid]["expected_bytes"] = info.expected_bytes
+        with self._lock:
+            mid = catalog.model_id
+            if mid not in self.recipes:
+                raise RecipeError("no recipe for model %r" % (mid,),
+                                  details={"model": mid})
+            new_sig = self._catalog_signature(catalog)
+            old = self.catalogs.get(mid)
+            if old is not None and self._has_resident(mid):
+                if self._catalog_signature(old) != new_sig:
+                    raise CatalogError(
+                        "RECIPE_CONFLICT: catalog changed while model %r has "
+                        "resident weights" % (mid,),
+                        recovery=["purgefromram 该模型全部 unit 后再换 catalog"],
+                        details={"model": mid})
+                # 驻留下同签名重挂：只刷新 expected_bytes，不 touching 状态
+                for uid, info in catalog.units.items():
+                    if uid in self.units[mid]:
+                        self.units[mid][uid]["expected_bytes"] = info.expected_bytes
+                return
+            # 无驻留：整体替换，旧 unit 记录不保留（防 stale），generation 单调
+            self.catalogs[mid] = catalog
+            self.units[mid] = {uid: _new_unit_record(info)
+                               for uid, info in catalog.units.items()}
+            self._bump(mid)
 
     # -- 查询 --
-    def _require_model(self, model_id: str) -> UnitCatalog:
+    def _require_model_nolock(self, model_id: str) -> UnitCatalog:
         try:
             return self.catalogs[model_id]
         except KeyError:
@@ -759,6 +871,11 @@ class WeightRegistry:
                    for r in self.units.get(model_id, {}).values())
 
     def unit_record(self, model_id: str, unit_id: str) -> Dict[str, Any]:
+        """只读深拷贝摘要；要写内部状态必须经 set_*/mark_*（持锁）。"""
+        with self._lock:
+            return copy.deepcopy(self._record_nolock(model_id, unit_id))
+
+    def _record_nolock(self, model_id: str, unit_id: str) -> Dict[str, Any]:
         try:
             return self.units[model_id][unit_id]
         except KeyError:
@@ -767,13 +884,28 @@ class WeightRegistry:
 
     def resolve_units(self, model_id: str, mode: str,
                       units: Sequence[str] = ()) -> List[str]:
-        return resolve_units(self._require_model(model_id), mode, units)
+        with self._lock:
+            return resolve_units(self._require_model_nolock(model_id), mode, units)
 
     def model_state(self, model_id: str) -> Dict[str, Any]:
-        cat = self._require_model(model_id)
+        with self._lock:
+            return self._model_state_nolock(model_id)
+
+    def snapshot(self) -> Dict[str, Any]:
+        """全量可 JSON 快照：revision 单调递增，调用方缓存据此失效。"""
+        with self._lock:
+            snap = {"revision": self._revision,
+                    "models": {mid: self._model_state_nolock(mid)
+                               for mid in self.catalogs.keys()}}
+            json.dumps(snap)
+            return snap
+
+    def _model_state_nolock(self, model_id: str) -> Dict[str, Any]:
+        cat = self._require_model_nolock(model_id)
         store = self.units.get(model_id, {})
         unit_list = []
         absent = ram = vram = mixed = error = 0
+        res_cpu = res_cuda = expected = 0
         for uid in cat.unit_ids():
             r = store.get(uid)
             if r is None:
@@ -785,10 +917,14 @@ class WeightRegistry:
                                   "last_error": None, "recovery_actions": []})
                 absent += 1
                 continue
-            unit_list.append({k: r[k] for k in (
-                "id", "state", "device", "generation", "resident_bytes_cpu",
-                "resident_bytes_cuda", "expected_bytes", "last_error",
-                "recovery_actions")})
+            unit_list.append(copy.deepcopy(
+                {k: r[k] for k in (
+                    "id", "state", "device", "generation", "resident_bytes_cpu",
+                    "resident_bytes_cuda", "expected_bytes", "last_error",
+                    "recovery_actions")}))
+            res_cpu += int(r["resident_bytes_cpu"])
+            res_cuda += int(r["resident_bytes_cuda"])
+            expected += int(r["expected_bytes"])
             if r["state"] == "absent":
                 absent += 1
             elif r["state"] == "ram":
@@ -817,92 +953,122 @@ class WeightRegistry:
             "generation": self.model_generation.get(model_id, 0),
             "recipe": self.recipes[model_id].summary(),
             "absent_units": absent,
+            "counts": {"absent": absent, "ram": ram, "vram": vram,
+                       "mixed": mixed, "error": error},
+            "bytes": {"resident_cpu": res_cpu, "resident_cuda": res_cuda,
+                      "expected": expected},
             "units": unit_list,
         }
-
-    def snapshot(self) -> Dict[str, Any]:
-        return {"models": {mid: self.model_state(mid)
-                           for mid in self.catalogs.keys()}}
 
     # -- 状态写入（由 adapter 物化/搬运/释放成功后调用） --
     def set_unit_loaded(self, model_id: str, unit_id: str, device: str,
                         resident_bytes_cpu: int = 0,
                         resident_bytes_cuda: int = 0,
                         storage_digest: Optional[List[str]] = None) -> None:
-        r = self.unit_record(model_id, unit_id)
-        if device == "cpu":
-            r["state"] = "ram"
-        elif device == "cuda:0":
-            r["state"] = "vram"
-        else:
-            raise StateError("unknown device %r" % (device,),
-                             details={"device": device})
-        r["device"] = device
-        r["transition"] = None
-        r["resident_bytes_cpu"] = int(resident_bytes_cpu)
-        r["resident_bytes_cuda"] = int(resident_bytes_cuda)
-        r["storage_digest"] = list(storage_digest or [])
-        r["last_error"] = None
-        r["recovery_actions"] = []
-        r["generation"] += 1
-        self.model_generation[model_id] = self.model_generation.get(
-            model_id, 0) + 1
+        with self._lock:
+            r = self._record_nolock(model_id, unit_id)
+            if device == "cpu":
+                r["state"] = "ram"
+            elif device == "cuda:0":
+                r["state"] = "vram"
+            else:
+                raise StateError("unknown device %r" % (device,),
+                                 details={"device": device})
+            r["device"] = device
+            r["transition"] = None
+            r["resident_bytes_cpu"] = int(resident_bytes_cpu)
+            r["resident_bytes_cuda"] = int(resident_bytes_cuda)
+            r["storage_digest"] = list(storage_digest or [])
+            r["last_error"] = None
+            r["recovery_actions"] = []
+            r["generation"] += 1
+            self._bump(model_id)
 
     def set_unit_absent(self, model_id: str, unit_id: str) -> None:
-        r = self.unit_record(model_id, unit_id)
-        r["state"] = "absent"
-        r["transition"] = None
-        r["device"] = None
-        r["resident_bytes_cpu"] = 0
-        r["resident_bytes_cuda"] = 0
-        r["storage_digest"] = []
-        r["last_error"] = None
-        r["recovery_actions"] = []
-        r["generation"] += 1
-        self.model_generation[model_id] = self.model_generation.get(
-            model_id, 0) + 1
+        with self._lock:
+            r = self._record_nolock(model_id, unit_id)
+            r["state"] = "absent"
+            r["transition"] = None
+            r["device"] = None
+            r["resident_bytes_cpu"] = 0
+            r["resident_bytes_cuda"] = 0
+            r["storage_digest"] = []
+            r["last_error"] = None
+            r["recovery_actions"] = []
+            r["generation"] += 1
+            self._bump(model_id)
 
     def mark_error(self, model_id: str, unit_id: str, message: str,
                    recovery: Optional[List[str]] = None) -> None:
-        r = self.unit_record(model_id, unit_id)
-        r["state"] = "error"
-        r["transition"] = None
-        r["last_error"] = message
-        r["recovery_actions"] = list(recovery or ["用 recover 修复后重试"])
-        self.model_generation[model_id] = self.model_generation.get(
-            model_id, 0) + 1
+        with self._lock:
+            r = self._record_nolock(model_id, unit_id)
+            r["state"] = "error"
+            r["transition"] = None
+            r["last_error"] = message
+            r["recovery_actions"] = list(recovery or ["用 recover 修复后重试"])
+            self._bump(model_id)
 
-    def recover_unit(self, model_id: str, unit_id: str) -> Dict[str, Any]:
-        """显式 recover：仅 error/mixed 且实际完全在 CPU 才可回 absent。
+    def recover_unit(self, model_id: str, unit_id: str,
+                     release_proof: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        """显式 recover：仅 error/mixed 可回 absent，且必须附 adapter 释放凭证。
 
-        仍有 CUDA 残留时先 recover→ram（调用方搬运后再次 recover），
-        不能把恢复当成推理隐式 offload。
+        release_proof 由调用方在 adapter 侧完成释放后实测填入：
+          {"resident_bytes_cpu": int, "resident_bytes_cuda": int,
+           "storage_digest": [stor-id, ...]}
+        要求双零 + digest 为空；有任何残留都拒绝（防 ghost 状态：
+        registry 置 absent 而真实张量还活着）。CPU 仍有残留时请先走
+        adapter.purge 再附上实测凭证；recover 本身不触碰任何张量。
         """
-        r = self.unit_record(model_id, unit_id)
-        if r["state"] not in ("error", "mixed"):
-            raise TransitionError("unit %r state %r needs no recover"
-                                  % (unit_id, r["state"]),
-                                  details={"unit": unit_id,
-                                           "state": r["state"]})
-        if r["resident_bytes_cuda"]:
-            raise TransitionError(
-                "unit %r still holds CUDA storage; vram2ram first" % (unit_id,),
-                recovery=["vram2ram %s 后再次 recover" % unit_id],
-                details={"unit": unit_id})
-        self.set_unit_absent(model_id, unit_id)
-        return {"model": model_id, "unit": unit_id, "state": "absent"}
+        with self._lock:
+            r = self._record_nolock(model_id, unit_id)
+            if r["state"] not in ("error", "mixed"):
+                raise TransitionError("unit %r state %r needs no recover"
+                                      % (unit_id, r["state"]),
+                                      details={"unit": unit_id,
+                                               "state": r["state"]})
+            if not isinstance(release_proof, Mapping):
+                raise TransitionError(
+                    "recover_unit needs adapter release_proof "
+                    "(measured AFTER adapter released the unit)",
+                    recovery=["adapter 侧释放该 unit 后，用 torch 实测 resident "
+                              "字节与 storage digest 作为 release_proof 传入"],
+                    details={"unit": unit_id})
+            cpu_b = release_proof.get("resident_bytes_cpu")
+            cuda_b = release_proof.get("resident_bytes_cuda")
+            digest = release_proof.get("storage_digest")
+            if cpu_b != 0 or cuda_b != 0 or digest not in (None, [], ()):
+                raise TransitionError(
+                    "release_proof shows live storage; refuse ghost absent",
+                    recovery=["adapter 侧彻底释放该 unit 后再 recover"],
+                    details={"unit": unit_id,
+                             "proof": {"resident_bytes_cpu": cpu_b,
+                                       "resident_bytes_cuda": cuda_b,
+                                       "storage_digest": digest}})
+            self.set_unit_absent(model_id, unit_id)
+            return {"model": model_id, "unit": unit_id, "state": "absent"}
 
     # -- 四动作迁移门卫 --
     def check_transition(self, action: str, model_id: str,
                          unit_ids: Sequence[str]) -> bool:
         """参数/状态/指纹冲突在修改前拒绝；合法 no-op 返回 True。"""
-        cat = self._require_model(model_id)
+        with self._lock:
+            return self._check_transition_nolock(action, model_id, unit_ids)
+
+    def _check_transition_nolock(self, action: str, model_id: str,
+                                 unit_ids: Sequence[str]) -> bool:
+        cat = self._require_model_nolock(model_id)
         if model_id not in self.recipes:
             raise RecipeError("no recipe for model %r" % (model_id,))
         if action not in ("disk2ram", "ram2vram", "vram2ram", "purgefromram"):
             raise TransitionError("unknown action %r" % (action,),
                                   details={"action": action})
         store = self.units.get(model_id, {})
+        known = set(cat.unit_ids())
+        unknown = [u for u in unit_ids if u not in known]
+        if unknown:
+            raise SelectorError("unknown unit ids %r for model %r"
+                                % (unknown, model_id),
+                                details={"unknown": unknown, "model": model_id})
         if action == "disk2ram":
             # 非 absent 且 recipe 变化时已在 register_recipe 拒绝；
             # 同 recipe 已驻留 = no-op 成功。
@@ -938,6 +1104,15 @@ class WeightRegistry:
                     details={"blocked": bad})
             return True
         if action == "purgefromram":
+            bad_state = [u for u in unit_ids
+                         if store.get(u, {}).get("state", "absent")
+                         in ("mixed", "error")]
+            if bad_state:
+                raise TransitionError(
+                    "purgefromram refused on mixed/error units %r; "
+                    "recover first" % (bad_state,),
+                    recovery=["recover %s 后重试" % ", ".join(bad_state)],
+                    details={"blocked": bad_state})
             cuda_hold = [u for u in unit_ids
                          if store.get(u, {}).get("resident_bytes_cuda", 0) > 0
                          or store.get(u, {}).get("device") == "cuda:0"]
@@ -958,23 +1133,73 @@ class WeightRegistry:
                             not_attempted: Sequence[str] = (),
                             dry_run: bool = False,
                             extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        op = {
-            "action": action,
-            "model": model_id,
-            "mode": "all" if set(requested) == set(
-                self._require_model(model_id).unit_ids()) else "units",
-            "requested": list(requested),
-            "completed": list(completed),
-            "failed": list(failed),
-            "not_attempted": list(not_attempted),
-            "dry_run": bool(dry_run),
-            "generation": self.model_generation.get(model_id, 0),
-            "model_state": self.model_state(model_id)["state"],
-        }
-        if extra:
-            op.update(extra)
-        json.dumps(op)  # 必须可 JSON；不可序列化在此直接炸
-        return op
+        with self._lock:
+            op = {
+                "action": action,
+                "model": model_id,
+                "mode": "all" if set(requested) == set(
+                    self._require_model_nolock(model_id).unit_ids()) else "units",
+                "requested": list(requested),
+                "completed": list(completed),
+                "failed": list(failed),
+                "not_attempted": list(not_attempted),
+                "dry_run": bool(dry_run),
+                "generation": self.model_generation.get(model_id, 0),
+                "model_state": self._model_state_nolock(model_id)["state"],
+            }
+            if extra:
+                op.update(extra)
+            json.dumps(op)  # 必须可 JSON；不可序列化在此直接炸
+            return op
+
+
+# ---------------------------------------------------------------------------
+# audit：物理 inventory 与 catalog 交叉自证（不是同一算法自证）
+# ---------------------------------------------------------------------------
+
+
+def audit_unit(catalog: UnitCatalog, unit_id: str,
+               bound_keys: Sequence[str],
+               inventory: "StorageInventory",
+               expect_loaded: bool,
+               waived: Sequence[str] = ()) -> Dict[str, Any]:
+    """把 adapter 实际绑定的 keys + 物理 inventory 与 catalog 独立核对。
+
+    bound_keys: adapter 声称已绑定的 checkpoint keys（来自安全加载路径，
+      不是 catalog 自己的 keys_of() 回放——调用方必须传真实绑定记录）。
+    inventory: storage_inventory 对该 unit 子树的真实测量。
+    waived: 显式 waive 的 keys（如 adaln_basis/mean），不计入 missing，
+      但必须在报告中列出理由。
+    expect_loaded=True 要求零缺失；=False 要求零真实 storage。
+    返回可 JSON 报告；verdict != "ok" 时调用方必须 mark_error。
+    """
+    want = set(catalog.units[unit_id].checkpoint_keys) - set(waived)
+    got = set(bound_keys)
+    missing = sorted(want - got)
+    unexpected = sorted(got - want - set(waived))
+    expected_bytes = catalog.units[unit_id].expected_bytes
+    resident = inventory.total_cpu + inventory.total_cuda
+    if expect_loaded:
+        verdict = "ok" if not missing and not unexpected else "MISSING_OR_UNEXPECTED"
+    else:
+        verdict = "ok" if resident == 0 else "STORAGE_LEAK"
+    report = {
+        "unit": unit_id,
+        "expect_loaded": expect_loaded,
+        "keys_expected": len(want),
+        "keys_bound": len(got),
+        "waived": sorted(waived),
+        "missing": missing,
+        "unexpected": unexpected,
+        "expected_bytes": expected_bytes,
+        "resident_bytes_cpu": inventory.total_cpu,
+        "resident_bytes_cuda": inventory.total_cuda,
+        "num_storages": inventory.num_storages,
+        "meta_tensors": inventory.meta_tensors,
+        "verdict": verdict,
+    }
+    json.dumps(report)
+    return report
 
 
 # ---------------------------------------------------------------------------

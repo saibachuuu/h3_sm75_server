@@ -58,7 +58,8 @@ def t_no_top_level_torch_import():
 
 
 def t_build_catalog_blocks_stable():
-    cat = W.build_catalog_from_header("dit", fake_header(), "dit")
+    cat = W.build_catalog_from_header("dit", fake_header(), "dit",
+                                      ignored_exact=["__weird_tmp"])
     ids = cat.unit_ids()
     assert ids == sorted(ids), ids
     assert "dit.blocks.0" in ids and "dit.blocks.3" in ids, ids
@@ -72,14 +73,22 @@ def t_build_catalog_blocks_stable():
     assert cat.ignored_keys == ("__weird_tmp",), cat.ignored_keys
     # 穩定性：key 顺序打乱重建，unit id 与 key 归属不变
     h2 = dict(reversed(list(fake_header().items())))
-    cat2 = W.build_catalog_from_header("dit", h2, "dit")
+    cat2 = W.build_catalog_from_header("dit", h2, "dit",
+                                       ignored_exact=["__weird_tmp"])
     assert cat2.unit_ids() == ids
     assert cat2.key_to_unit == cat.key_to_unit
     return "units=%d keys=%d" % (len(ids), len(cat.key_to_unit))
 
 
-def t_cover_rejects_leftover():
+def t_double_underscore_key_is_real_key():
     cat = W.build_catalog_from_header("dit", fake_header(), "dit")
+    assert "__weird_tmp" in cat.key_to_unit, cat.ignored_keys
+    assert cat.ignored_keys == (), cat.ignored_keys
+
+
+def t_cover_rejects_leftover():
+    cat = W.build_catalog_from_header("dit", fake_header(), "dit",
+                                      ignored_exact=["__weird_tmp"])
     try:
         cat.check_cover(list(fake_header().keys()) + ["mystery.weight"])
     except W.UnmappedKeyError as e:
@@ -88,7 +97,8 @@ def t_cover_rejects_leftover():
 
 
 def t_selector_exact_group_range():
-    cat = W.build_catalog_from_header("dit", fake_header(), "dit")
+    cat = W.build_catalog_from_header("dit", fake_header(), "dit",
+                                      ignored_exact=["__weird_tmp"])
     assert W.resolve_units(cat, "all") == cat.unit_ids()
     one = W.resolve_units(cat, "units", ["dit.blocks.1"])
     assert one == ["dit.blocks.1"], one
@@ -120,7 +130,8 @@ def t_four_action_matrix():
     h = fake_header()
     rec = W.recipe_from_header_dict("dit", "dit", "fake://h", h)
     reg.register_recipe(rec)
-    reg.attach_catalog(W.build_catalog_from_header("dit", h, "dit"))
+    reg.attach_catalog(W.build_catalog_from_header("dit", h, "dit",
+                                                     ignored_exact=["__weird_tmp"]))
     units = ["dit.blocks.0", "dit.blocks.1"]
     reg.check_transition("disk2ram", "dit", units)
     for u in units:
@@ -155,7 +166,8 @@ def t_recipe_change_rejected():
     h = fake_header()
     rec = W.recipe_from_header_dict("dit", "dit", "fake://h", h)
     reg.register_recipe(rec)
-    reg.attach_catalog(W.build_catalog_from_header("dit", h, "dit"))
+    reg.attach_catalog(W.build_catalog_from_header("dit", h, "dit",
+                                                     ignored_exact=["__weird_tmp"]))
     reg.set_unit_loaded("dit", "dit.blocks.0", "cpu", resident_bytes_cpu=10,
                         resident_bytes_cuda=0)
     other = W.recipe_from_header_dict("dit", "dit", "fake://h2", h)
@@ -169,6 +181,7 @@ def t_recipe_change_rejected():
 print("== _selftest_weights_logic ==")
 check("stdlib import (no top-level torch)", t_no_top_level_torch_import)
 check("catalog build + stable ids", t_build_catalog_blocks_stable)
+check("double-underscore key is a real key", t_double_underscore_key_is_real_key)
 check("cover rejects leftover key", t_cover_rejects_leftover)
 check("selector exact/group/range", t_selector_exact_group_range)
 check("four-action transition matrix", t_four_action_matrix)
