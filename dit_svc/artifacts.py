@@ -18,6 +18,7 @@
 """
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -243,6 +244,10 @@ class ArtifactStore(object):
         self.disk_reserve_bytes = int(disk_reserve_bytes)
         self.ttl_s = float(ttl_s)
         self._lock = threading.RLock()
+        # 串行化“写临时文件 → 实际字节复核 → 无覆盖发布”。它只在提交方之间排队，
+        # 不持有 ``_lock``，所以 GET/list/引用不需要等一次 8GB 落盘。
+        self._write_lock = threading.Lock()
+        self.last_cleanup_failures = []   # 最近一次 cleanup 中删不掉/只剩孤儿
         self._refs = {}          # artifact_id -> active 引用计数
         self._index = {}         # artifact_id -> manifest dict
         self._pending = {}       # reservation token -> 预留字节
@@ -371,7 +376,15 @@ class ArtifactStore(object):
         created = manifest.get("created_at")
         if isinstance(created, bool) or not isinstance(created, (int, float)):
             return False
-        if not isinstance(manifest.get("metadata") or {}, dict):
+        # NaN/Inf 会让 TTL 比较恒为 False（被当作“永远过期”）或算不出占用，
+        # 一律视为非法 schema，不入索引。
+        try:
+            if not math.isfinite(float(created)):
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        # metadata 必须是真正的 dict：不能把 []/''/0 之类用 ``or {}`` 吞成空表
+        if "metadata" in manifest and not isinstance(manifest["metadata"], dict):
             return False
         if "format" in manifest and manifest["format"] is not None \
                 and not isinstance(manifest["format"], str):
@@ -435,16 +448,26 @@ class ArtifactStore(object):
         return int(usage.free)
 
     def stage_usage_bytes(self):
+        """stage 目录当前占用（逐条目累加）。
+
+        统计失败必须**报错**而不是当作 0：否则配额检查会把“读不到用量”当成
+        “没用过空间”，从而放行一个必然超额的写入。
+        """
         total = 0
         try:
-            for entry in os.scandir(self.stage_dir):
-                if entry.is_file(follow_symlinks=False):
+            with os.scandir(self.stage_dir) as it:
+                for entry in it:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
                     try:
                         total += entry.stat(follow_symlinks=False).st_size
-                    except OSError:
-                        continue
-        except OSError:
-            return 0
+                    except OSError as e:
+                        raise ArtifactError(
+                            "无法统计 stage 占用（%s）: %s" % (entry.name, e),
+                            code="STAGING_UNAVAILABLE", http_status=503)
+        except OSError as e:
+            raise ArtifactError("无法读取 stage 目录: %s" % e,
+                                code="STAGING_UNAVAILABLE", http_status=503)
         return total
 
     def budget(self, expected_bytes):
@@ -474,6 +497,7 @@ class ArtifactStore(object):
             "disk_free_bytes": free,
             "disk_reserve_bytes": self.disk_reserve_bytes,
             "disk_usable_bytes": usable,
+            "pending_bytes": self._pending_bytes(),
             "fits": fits,
             "reasons": reasons,
             "estimate_quality": "exact_expected_bytes",
@@ -509,27 +533,37 @@ class ArtifactStore(object):
         with self._lock:
             self._pending.pop(token, None)
 
-    def _check_actual_locked(self, actual_bytes, expected):
-        """实际字节复核：临时文件已计入 usage，因此可用量要扣掉预留本身。
+    def _check_actual_locked(self, actual_bytes, expected, *, manifest_reserve=0):
+        """实际字节复核（在 ``_write_lock`` 内串行执行）。
 
-        ``_pending`` 里包含本次预留，临时文件也已被 ``stage_usage_bytes`` 统计，
-        两者会双算；这里按实际值重新算，且把本次预留从 pending 中剔除后再算，
-        避免同一份数据被计两次。
+        临时文件**已经**被 ``stage_usage_bytes`` 统计进 usage，所以这里不再把
+        本次数据加一遍；需要额外占位的是“其它尚未消耗的预留”和本次 manifest
+        的体积。即：
+
+            usage（含本次临时文件）+ 其它预留 + manifest 余量 <= quota
+            disk_free（已扣临时文件） >= manifest 余量
+
+        旧实现把本次数据既算进 usage 又要求在 quota 余量内再扣一次，等于同一份
+        数据被计两次：quota=2048、数据 1500、无并发预留时会被误拒。
         """
         actual = int(actual_bytes)
+        reserve = max(0, int(manifest_reserve))
         free = self.free_bytes()
         usage = self.stage_usage_bytes()
-        quota_left = self.quota_bytes - usage
-        usable = free - self.disk_reserve_bytes
-        # pending 中除本次以外的预留仍需占位
-        others = self._pending_bytes() - int(expected or 0)
-        ok = actual <= quota_left - others and actual <= usable
-        if ok:
+        # 本次预留对应的临时文件已计入 usage，只有其它预留还需要占位
+        others = max(0, self._pending_bytes() - int(expected or 0))
+        required = usage + others + reserve
+        if required <= self.quota_bytes and free >= reserve:
             return
         raise ArtifactError(
-            "实际写入 %d 字节超出预算（stage 剩余 %d，磁盘可用 %d，"
-            "其它预留 %d）" % (actual, quota_left, usable, others),
-            code="RESOURCE_EXHAUSTED", http_status=503)
+            "实际写入后超出预算（占据 %d = stage 已用 %d + 其它预留 %d + "
+            "manifest %d，配额 %d；磁盘可用 %d）"
+            % (required, usage, others, reserve, self.quota_bytes, free),
+            code="RESOURCE_EXHAUSTED", http_status=503,
+            details={"actual_bytes": actual, "stage_usage_bytes": usage,
+                     "pending_bytes": others, "manifest_reserve": reserve,
+                     "quota_bytes": self.quota_bytes,
+                     "disk_free_bytes": free})
 
     # -------------------------------------------------- 生命周期
 
@@ -577,6 +611,7 @@ class ArtifactStore(object):
         return True
 
     def _delete_expired_locked(self, now, limit, removed):
+        failures = []
         for manifest in sorted(list(self._index.values()),
                                key=lambda m: m.get("created_at") or 0):
             if limit is not None and len(removed) >= int(limit):
@@ -588,22 +623,44 @@ class ArtifactStore(object):
             if self._refs.get(aid):
                 continue
             filename = manifest["filename"]
-            for p in (self.path_for(filename), self._manifest_path(aid)):
+            data_path = self.path_for(filename)
+            mpath = self._manifest_path(aid)
+            error = None
+            try:
+                os.unlink(data_path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                error = "%s: %s" % (filename, e)
+            if error is None:
                 try:
-                    os.unlink(p)
+                    os.unlink(mpath)
                 except FileNotFoundError:
                     pass
-                except OSError:
-                    continue
+                except OSError as e:
+                    error = "%s: %s" % (os.path.basename(mpath), e)
+            if error is not None:
+                # 文件还在：必须保留索引，否则数据成了无主孤儿，而“清理成功”
+                # 是谎报。数据文件没能删掉时也刻意保留 manifest，重启后仍可
+                # 追到这份数据。这里只记录失败，不 pop、不算进 removed。
+                failures.append({"id": aid, "filename": filename,
+                                 "errors": [error]})
+                continue
             self._index.pop(aid, None)
             removed.append(aid)
+        return failures
 
     def cleanup(self, *, now=None, limit=None):
-        """清理过期且未被引用的 artifact（引用检查与删除在同一把锁内）。"""
+        """清理过期且未被引用的 artifact（引用检查与删除在同一把锁内）。
+
+        删除失败的条目保留在索引中，通过 ``last_cleanup_failures`` 报告，且不
+        计入返回的 ``removed`` —— 不谎报删除成功。
+        """
         now = time.time() if now is None else float(now)
         removed = []
         with self._lock:
-            self._delete_expired_locked(now, limit, removed)
+            failures = self._delete_expired_locked(now, limit, removed)
+            self.last_cleanup_failures = failures
         return removed
 
     # -------------------------------------------------- 落盘入口
@@ -651,8 +708,36 @@ class ArtifactStore(object):
                         code="INVALID_REQUEST", http_status=400)
         return out
 
+    @staticmethod
+    def _publish_no_clobber(tmp, path, filename):
+        """把已写完的临时文件**无覆盖**地发布为最终文件。
+
+        ``os.replace`` 会覆盖同名目标，两个并发提交同名文件时后到者会悄悄改掉
+        先到者的字节。这里用同卷 ``os.link``：目标已存在则失败（409），成功
+        后再删临时文件，目标字节从发布那一刻起不可被本流程改写。
+        Windows 的 NTFS 支持硬链接；不支持的文件系统上直接报 503 —— **不回退**
+        到覆盖写，宁可失败也不破坏已存在的 artifact。
+        """
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            raise ArtifactError("文件名已被占用: %s" % filename,
+                                code="INVALID_REQUEST", http_status=409,
+                                details={"filename": filename})
+        except OSError as e:
+            raise ArtifactError(
+                "无法以无覆盖方式发布 %s（os.link 失败: %s）；本文件系统若不支持"
+                "硬链接，不能回退为覆盖写" % (filename, e),
+                code="STAGING_UNAVAILABLE", http_status=503,
+                details={"filename": filename, "error": str(e)})
+        try:
+            os.unlink(tmp)
+        except OSError:
+            # 目标已完整发布；临时名残留最多多占一份空间，不谎报失败
+            pass
+
     def commit(self, kind, filename, data, *, metadata=None, fmt=None):
-        """写入一个 artifact（唯一文件名 + 原子改名 + manifest）。
+        """写入一个 artifact（唯一文件名 + 无覆盖发布 + manifest）。
 
         预算在写之前按 ``len(data)`` 检查；失败不留半写文件。
         """
@@ -662,11 +747,13 @@ class ArtifactStore(object):
 
     def commit_stream(self, kind, filename, writer, *, metadata=None, fmt=None,
                       expected_bytes=None):
-        """用 ``writer(tmp_path)`` 落盘大文件（如 safetensors），再原子改名。
+        """用 ``writer(tmp_path)`` 落盘大文件（如 safetensors），再原子发布。
 
         writer 必须把完整内容写到给定路径；任何异常都不留半写产物。
-        流程：校验 → 配额预留 → 写临时文件 → **实际字节复核** → 确认目标名未被
-        占用 → 原子改名 → 写 manifest。manifest 失败只回滚本次数据文件。
+        流程：校验 → 配额预留 → [写锁] 写临时文件 → 实际字节复核 → 无覆盖
+        发布（os.link）→ 写 manifest。manifest 失败只回滚本次数据文件。
+
+        只读路径（get/list/budget/引用）不拿写锁，因此一次大落盘不会阻塞 GET。
         """
         validate_stage_name(filename)
         if kind not in ("cond", "latent"):
@@ -677,35 +764,44 @@ class ArtifactStore(object):
         token = self.reserve(expected)
         artifact_id = self.new_id(kind)
         path = self.path_for(filename)
-        data_written = False
         try:
-            if os.path.lexists(path):
-                raise ArtifactError("文件名已被占用: %s" % filename,
-                                    code="INVALID_REQUEST", http_status=409)
-            directory = os.path.dirname(path) or "."
-            fd, tmp = tempfile.mkstemp(prefix=".tmp_", suffix=".part",
-                                       dir=directory)
-            os.close(fd)
-            try:
-                writer(tmp)
-                with open(tmp, "r+b") as f:
-                    os.fsync(f.fileno())
-                size = os.path.getsize(tmp)
-                with self._lock:
-                    self._check_actual_locked(size, expected)
-                # 目标名必须仍然空着（防并发抢占）
+            with self._write_lock:
                 if os.path.lexists(path):
                     raise ArtifactError("文件名已被占用: %s" % filename,
                                         code="INVALID_REQUEST", http_status=409)
-                os.replace(tmp, path)
-                data_written = True
-                _fsync_dir(directory)
-            except BaseException:
+                directory = os.path.dirname(path) or "."
+                fd, tmp = tempfile.mkstemp(prefix=".tmp_", suffix=".part",
+                                           dir=directory)
+                os.close(fd)
+                published = False
                 try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
+                    writer(tmp)
+                    with open(tmp, "r+b") as f:
+                        os.fsync(f.fileno())
+                    size = os.path.getsize(tmp)
+                    # manifest 体积预留：sha256 字段定长，先按占位算出精确上界
+                    probe = {
+                        "id": artifact_id, "kind": kind, "format": fmt,
+                        "filename": filename, "bytes": size,
+                        "sha256": "0" * 64, "created_at": time.time(),
+                        "metadata": meta,
+                    }
+                    manifest_reserve = len(
+                        json.dumps(probe, ensure_ascii=False,
+                                   indent=1).encode("utf-8")) + 64
+                    del probe
+                    with self._lock:
+                        self._check_actual_locked(
+                            size, expected, manifest_reserve=manifest_reserve)
+                    self._publish_no_clobber(tmp, path, filename)
+                    published = True
+                    _fsync_dir(directory)
+                finally:
+                    if not published:
+                        try:
+                            os.unlink(tmp)
+                        except OSError:
+                            pass
 
             manifest = {
                 "id": artifact_id,
@@ -1241,6 +1337,8 @@ def _build_checked(build, video, audio, order, *, label):
 
     同时接受映射（``{video,audio}``）、带 ``.tensors`` 的类与二元序列；
     用 ``is`` 比较身份，不用 ``==``（避免 tensor 逐元素布尔歧义）。
+    返回无法识别的对象（例如只返回 ``None`` 或任意外壳）时明确 422，不能
+    把未知对象当成功容器交给上层。
     """
     obj = build(video, audio, order)
     pair = [video, audio] if order == "video,audio" else [audio, video]
@@ -1252,11 +1350,14 @@ def _build_checked(build, video, audio, order, *, label):
         got = getattr(obj, "tensors", None)
         if got is None and isinstance(obj, (list, tuple)):
             got = list(obj)
-    if got is not None:
-        if not isinstance(got, (list, tuple)) or len(got) != 2 \
-                or not all(a is b for a, b in zip(got, pair)):
-            raise ArtifactError("%s 重建后的容器顺序/内容与 source 不符" % label,
-                                code="INVALID_ARTIFACT", http_status=422)
+    if not isinstance(got, (list, tuple)):
+        raise ArtifactError(
+            "%s 重建后的容器无法识别（type=%s），需要返回映射/二元序列/"
+            "带 .tensors 的对象" % (label, type(obj).__name__),
+            code="INVALID_ARTIFACT", http_status=422)
+    if len(got) != 2 or not all(a is b for a, b in zip(got, pair)):
+        raise ArtifactError("%s 重建后的容器顺序/内容与 source 不符" % label,
+                            code="INVALID_ARTIFACT", http_status=422)
     return obj
 
 

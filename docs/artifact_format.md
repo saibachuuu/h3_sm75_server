@@ -48,21 +48,34 @@ checkpoint 的绝对路径是另一个受信配置能力，不在这里放开。
 ## 3. 原子写与预算
 
 - `atomic_write_bytes` / `ArtifactStore.commit_stream`：同目录 `mkstemp` 唯一
-  临时文件 → `write` + `fsync` → `os.replace` 原子改名 → 目录 `fsync`（Windows
-  上目录 fsync 尽力而为）。任何异常都删除临时文件，不留半写产物。
-- commit 流程：校验 → `reserve()` 预留配额 → 写临时文件 → **按实际字节复核**
-  （临时文件已计入 usage，故从预算里扣除其它预留避免双算）→ 确认目标名仍空 →
-  原子改名 → 写 manifest。manifest 写失败只回滚本次数据文件，**不覆盖**已有
-  artifact。
+  临时文件 → `write` + `fsync` → **无覆盖发布** → 目录 `fsync`（Windows 上目录
+  fsync 尽力而为）。任何异常都删除临时文件，不留半写产物。
+- 无覆盖发布用同卷 `os.link(tmp, dest)`：目标已存在则 `FileExistsError`
+  → 409，成功后 `unlink(tmp)`。**不用 `os.replace`**，因为它会覆盖同名目标
+  （两个并发提交同名文件时后到者会悄悄改掉先到者的字节）。文件系统不支持
+  硬链接时返回 `STAGING_UNAVAILABLE` 503，绝不回退为覆盖写。
+- commit 流程：校验 → `reserve()` 预留配额 → **写锁**内写临时文件 → 实际字节
+  复核 → 无覆盖发布 → 写 manifest。写锁只串行化提交方，不出现在 GET/list/
+  引用路径上，因此一次大落盘不阻塞读。
+- 预算复核公式（临时文件已被 `stage_usage_bytes` 统计，**不再重复加本次 size**）：
+  `usage + 其它未消耗预留 + manifest 余量 <= quota`，且
+  `disk_free >= manifest 余量`。旧实现把本次数据既算进 usage 又要求在 quota
+  余量内再扣一次，等于同一份数据计两次（quota 2048、数据 1500、无并发时会误拒）。
 - 预算：`stage` 配额（默认 32 GiB）+ 磁盘可用量减预留（默认 2 GiB）。
   不足返回 `RESOURCE_EXHAUSTED`（503）；`budget()` 同时给出
-  `fits`/`reasons` 供 dry-run 报告。
+  `fits`/`reasons`/`pending_bytes` 供 dry-run 报告。用量统计失败报
+  `STAGING_UNAVAILABLE` 503，不把“读不到用量”当成 0 放行。
 - 引用保护：`acquire()` 的存在性检查与加引用在同一把锁内；`delete()` 的引用
   检查与 unlink、`cleanup()` 的过期检查与删除同样同锁，避免“检查通过后被并发
   acquire”或“清理删掉 active consumer”。`ACTIVE_BINDING` 为 409。
+- 清理失败不谎报：`cleanup()` 里 `os.unlink` 抛 `OSError` 时**保留该条 manifest
+  在索引中**、不加入返回值，失败明细放进 `last_cleanup_failures`；数据文件
+  删不掉时也刻意保留 manifest，重启后仍能追到这份数据，不会产生无主孤儿。
 - 索引重建（`_load_manifests`）不信任 JSON：拒绝 manifest 自身是 symlink、
   schema 含多余字段、id 与文件名不一致、`kind` 与 ID 前缀不一致、`filename`
-  不合法、`sha256` 形状错误、数据文件缺失/为 reparse/大小与 `bytes` 不符的条目。
+  不合法、`sha256` 形状错误、`created_at` 为 NaN/Inf、`metadata` 不是真正
+  dict（`[]`/`""`/`0` 不能被当成 `{}`）、数据文件缺失/为 reparse/大小与
+  `bytes` 不符的条目。
 - `metadata` 在写入前统一 JSON 规范化（键非空且无控制字符；值支持
   str/int/float/bool/None 与可 JSON 化对象；NaN/Inf 拒绝），失败即 400，
   不等到 manifest 落盘。
@@ -105,6 +118,9 @@ class NestedTensor:
 2. 记录 `container_order`（`video,audio` 或 `audio,video`）与 `container_type`，
    读回时按原序重建；重建优先用已加载的 Comfy `NestedTensor` 类，找不到才退化成
    tuple。可用 `split_container=` / `build_container=` 注入自定义适配。
+   注入的 `build_container(video, audio, order)` 返回值必须可识别为映射 / 二元
+   序列 / 带 `.tensors` 的对象，且元素必须与 source `is` 同一对象；返回 `None`
+   或任意外壳一律 422（不能把未知对象当成功容器）。
 3. 保存 `video`、`audio` 两个 key，各自**原 dtype 的 CPU contiguous** tensor，
    不为省事统一 float32。
 4. `noise_mask` 若存在：

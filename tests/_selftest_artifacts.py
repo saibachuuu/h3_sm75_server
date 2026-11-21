@@ -661,6 +661,183 @@ def _metadata_json_guard():
 
 check("metadata 写入前 JSON 规范化", _metadata_json_guard)
 
+print("== 配额：接近上限应当成功（不双计本次 size）==")
+
+
+def _quota_near_limit():
+    base = os.path.join(TMP, "quota_near")
+    os.makedirs(base)
+    st = ArtifactStore(base, quota_bytes=2048, disk_reserve_bytes=0)
+    info = st.commit("cond", "near.safetensors", b"n" * 1500,
+                     fmt="h3.cond.v1", metadata={"format": "h3.cond.v1"})
+    assert info["bytes"] == 1500, info["bytes"]
+    assert os.path.getsize(os.path.join(st.stage_dir, "near.safetensors")) == 1500
+    # 再加 1 字节就超配额，必须仍然拒绝（不能因为放宽而失去上限）
+    def over_writer(tmp):
+        with open(tmp, "wb") as f:
+            f.write(b"o" * 700)
+
+    try:
+        st.commit_stream("cond", "over.safetensors", over_writer,
+                         metadata={"format": "h3.cond.v1"}, expected_bytes=700)
+    except ArtifactError as e:
+        assert e.code == "RESOURCE_EXHAUSTED", e.code
+    else:
+        raise AssertionError("超配额写入被接受")
+    return "1500/2048 成功"
+
+
+check("quota 2048 写 1500 成功、超限仍拒", _quota_near_limit)
+
+print("== 同名并发：1 成功 1 冲突且 winner 字节不变 ==")
+
+
+def _concurrent_same_name():
+    import threading as th
+    base = os.path.join(TMP, "clobber")
+    os.makedirs(base)
+    st = ArtifactStore(base, quota_bytes=1 << 20, disk_reserve_bytes=0)
+    barrier = th.Barrier(2)
+    results = []
+    payloads = {"t1": b"A" * 64, "t2": b"B" * 96}
+
+    def worker(tag):
+        def writer(tmp):
+            with open(tmp, "wb") as f:
+                f.write(payloads[tag])
+        try:
+            barrier.wait()
+            info = st.commit_stream("cond", "same.safetensors", writer,
+                                    fmt="h3.cond.v1",
+                                    metadata={"format": "h3.cond.v1"},
+                                    expected_bytes=len(payloads[tag]))
+            results.append(("ok", tag, info["bytes"]))
+        except ArtifactError as e:
+            results.append(("err", tag, e.code))
+
+    threads = [th.Thread(target=worker, args=(t,)) for t in ("t1", "t2")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    oks = [r for r in results if r[0] == "ok"]
+    errs = [r for r in results if r[0] == "err"]
+    assert len(oks) == 1, results
+    assert len(errs) == 1 and errs[0][2] == "INVALID_REQUEST", results
+    tag = oks[0][1]
+    with open(os.path.join(st.stage_dir, "same.safetensors"), "rb") as f:
+        assert f.read() == payloads[tag], "winner 字节被覆盖"
+    # 索引里只有一个 artifact，且它指向这份字节
+    listed = st.list(limit=10)
+    assert len(listed) == 1, listed
+    assert listed[0]["bytes"] == len(payloads[tag]), listed
+    assert st.get(listed[0]["id"])["bytes"] == len(payloads[tag])
+    # 不再有临时文件残留
+    leftovers = [n for n in os.listdir(st.stage_dir) if n.startswith(".tmp_")]
+    assert not leftovers, leftovers
+    return "%s 胜出，%s 冲突" % (tag, errs[0][1])
+
+
+check("同名并发 1 成功 1 冲突", _concurrent_same_name)
+
+print("== build 容器返回值必须可识别 ==")
+from dit_svc.artifacts import _build_checked  # noqa: E402
+
+
+def _build_unknown():
+    v, a = object(), object()
+
+    def bad_build(video, audio, order):
+        return None
+
+    try:
+        _build_checked(bad_build, v, a, "video,audio", label="latent")
+    except ArtifactError as e:
+        assert e.code == "INVALID_ARTIFACT" and e.http_status == 422, (e.code, e.http_status)
+    else:
+        raise AssertionError("build 返回 None 却不报错")
+
+    def ok_build(video, audio, order):
+        return [video, audio]
+
+    assert _build_checked(ok_build, v, a, "video,audio", label="latent")
+    return "None/未知对象 422"
+
+
+check("build 返回未知对象时 422", _build_unknown)
+
+print("== 索引安全：NaN/Inf created_at 与非 dict metadata ==")
+
+
+def _manifest_numeric_guard():
+    base = os.path.join(TMP, "nanman")
+    os.makedirs(os.path.join(base, "stage"))
+    st = ArtifactStore(base, quota_bytes=1 << 20, disk_reserve_bytes=0)
+    good = st.commit("cond", "g2.safetensors", b"abcdef",
+                     metadata={"format": "h3.cond.v1"})
+    sdir = st.stage_dir
+    base_manifest = dict(st.get(good["id"]))
+
+    def dump(name, obj):
+        with open(os.path.join(sdir, name), "w", encoding="utf-8") as f:
+            json.dump(obj, f)          # 默认 allow_nan=True，能写出 NaN/Inf
+
+    cases = {
+        "nan": dict(base_manifest, id="cond_" + "a" * 32, created_at=float("nan")),
+        "inf": dict(base_manifest, id="cond_" + "b" * 32, created_at=float("inf")),
+        "listmeta": dict(base_manifest, id="cond_" + "c" * 32, metadata=[]),
+        "emptymeta": dict(base_manifest, id="cond_" + "d" * 32, metadata=""),
+    }
+    for key, obj in cases.items():
+        dump(obj["id"] + ".json", obj)
+
+    st2 = ArtifactStore(base, quota_bytes=1 << 20, disk_reserve_bytes=0)
+    ids = [m["id"] for m in st2.list(limit=100)]
+    assert ids == [good["id"]], ids
+    return "只保留合法项"
+
+
+check("NaN/Inf created_at 与非 dict metadata 不入索引", _manifest_numeric_guard)
+
+print("== 清理失败：保留索引、不谎报删除 ==")
+
+
+def _cleanup_unlink_failure():
+    base = os.path.join(TMP, "clfail")
+    os.makedirs(base)
+    st = ArtifactStore(base, quota_bytes=1 << 20, disk_reserve_bytes=0)
+    info = st.commit("cond", "lock.safetensors", b"locked-bytes",
+                     metadata={"format": "h3.cond.v1"})
+    st._index[info["id"]]["created_at"] = 0.0
+    data_path = os.path.join(st.stage_dir, "lock.safetensors")
+    handle = open(data_path, "rb")
+    try:
+        try:
+            os.unlink(data_path)
+        except OSError:
+            pass                          # Windows 上确实删不掉
+        else:
+            return "SKIP（本平台允许删除打开中的文件）"
+        removed = st.cleanup(now=time.time() + 48 * 3600)
+        assert removed == [], removed
+        assert st.last_cleanup_failures, "未记录清理失败"
+        assert st.last_cleanup_failures[0]["id"] == info["id"]
+        # 索引必须还在，数据也还在：不制造无主孤儿
+        assert st.get(info["id"])["bytes"] == 12
+        assert os.path.isfile(data_path)
+        assert os.path.isfile(os.path.join(st.stage_dir, info["id"] + ".json"))
+    finally:
+        handle.close()
+    # 释放后能正常清掉
+    removed = st.cleanup(now=time.time() + 48 * 3600)
+    assert removed == [info["id"]], removed
+    assert st.last_cleanup_failures == [], st.last_cleanup_failures
+    assert st.list() == []
+    return "保留索引并报告失败"
+
+
+check("unlink 失败保留索引、不谎报", _cleanup_unlink_failure)
+
 shutil.rmtree(TMP, ignore_errors=True)
 if fails:
     print("FAILED %d: %s" % (len(fails), ", ".join(fails)))
