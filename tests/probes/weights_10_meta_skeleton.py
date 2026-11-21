@@ -18,19 +18,37 @@ import weights_common as C  # noqa: E402
 
 
 def main() -> int:
+    # CPU 钳制必须在任何 torch/safe_open import 之前：CUDA_VISIBLE_DEVICES='-1'
+    #（远端实测：PS 设 '' 无效，'-1' 才隐藏 GPU，主代理核实）。
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     ap = C.base_parser("weights probe 10: meta skeleton")
     ap.add_argument("--compute-dtype", default="bfloat16")
     args = ap.parse_args()
     t0 = C.rss_bytes()
-    report: dict = {"probe": "weights_10_meta_skeleton", "header": args.header}
-
-    # 版本 schema 门：不符不许 ok（显式 unverified + exit 2）
-    env = C.env_info(include_cuda=False)
+    report: dict = {"probe": "weights_10_meta_skeleton", "header": args.header,
+                    "cuda_visible_devices": "-1"}
+    rc = 0
     try:
-        C.require_schema(env, report)
-    except SystemExit:
+        _probe10_body(args, t0, report)
+        report["verdict"] = "ok"
+    except SystemExit as e:
+        rc = e.code if isinstance(e.code, int) else 1
+        if report.get("verdict") not in ("unverified", "refused"):
+            report["verdict"] = "refused"
+            report["error"] = "SystemExit: %s" % e
+    except BaseException as e:  # noqa: BLE001
+        rc = 1
+        report["verdict"] = "failed"
+        report["error"] = "%s: %s" % (type(e).__name__, e)
+    finally:
         C.write_report(report, args.out, "weights_probe_10.json")
-        raise
+    return rc
+
+
+def _probe10_body(args, t0, report) -> None:
+    # 版本 schema 门：不符不许 ok（unverified + exit 2；外层 finally 写报告）
+    env = C.env_info(include_cuda=False)
+    C.require_schema(env, report)
     report["env"] = env
 
     from dit_svc import weights as W
@@ -119,9 +137,6 @@ def main() -> int:
     report["registry"] = reg.model_state(args.model_id)
     report["rss_delta_bytes"] = C.rss_bytes() - t0
     report["cpu_peak_bytes"] = C.rss_peak_bytes()
-    report["verdict"] = "ok"
-    C.write_report(report, args.out, "weights_probe_10.json")
-    return 0
 
 
 if __name__ == "__main__":

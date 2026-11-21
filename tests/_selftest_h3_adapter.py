@@ -50,6 +50,34 @@ class StubOps:
 StubOps.disable_weight_init = StubOps
 
 
+class StubQuantLinear(nn.Linear):
+    """模拟 MixedPrecision Linear：factory_kwargs 决定重建 device。
+
+    构造期 device 固定（如 meta）；_load_from_state_dict 按
+    self.factory_kwargs["device"] 落权重（对标真实
+    _load_quantized_module:1263）。adapter 若不同步 fk，权重回落 meta，
+    审计 META_REMAINS 必炸——这正是远端 probe 20 的失败形态。
+    """
+
+    def __init__(self, in_f, out_f, bias=False, device=None, dtype=None):
+        super().__init__(in_f, out_f, bias=bias, device=device, dtype=dtype)
+        self.factory_kwargs = {"device": device, "dtype": dtype}
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        wkey = prefix + "weight"
+        if wkey not in state_dict:
+            if strict:
+                missing_keys.append(wkey)
+            return
+        w = state_dict.pop(wkey)
+        dev = (self.factory_kwargs or {}).get("device", "cpu")
+        self.weight = torch.nn.Parameter(w.to(dev))
+        skey = prefix + "weight_scale"
+        if skey in state_dict:
+            state_dict.pop(skey)
+
+
 class StubBlock(nn.Module):
     def __init__(self, hidden, ffn, device=None, operations=None, dtype=None):
         super().__init__()
@@ -60,7 +88,8 @@ class StubBlock(nn.Module):
                                    device=device, dtype=dtype)
         self.attn_out = op.Linear(hidden, hidden, bias=False,
                                    device=device, dtype=dtype)
-        self.mlp_fc1 = op.Linear(hidden, ffn, bias=False, device=device, dtype=dtype)
+        self.mlp_fc1 = StubQuantLinear(hidden, ffn, bias=False,
+                                         device=device, dtype=dtype)
         self.mlp_fc2 = op.Linear(ffn, hidden, bias=False, device=device, dtype=dtype)
 
 
@@ -306,6 +335,62 @@ def t_no_comfy_gives_clear_error():
     raise AssertionError("no error without comfy")
 
 
+def t_quant_factory_kwargs():
+    # fixture：stub 量化层的 factory_kwargs 在骨架期为 meta（真实现象），
+    # materialize 必须同步到 cpu，否则权重回落 meta。
+    a = _adapter()
+    shapes = _shapes()
+    header = {k: {"dtype": "F32", "shape": list(v)} for k, v in shapes.items()}
+    # 量化伴生键（hook 消费，不进 state_dict  strict 残留）
+    header["blocks.0.mlp_fc1.weight_scale"] = {"dtype": "F32", "shape": [128]}
+    header["blocks.1.mlp_fc1.weight_scale"] = {"dtype": "F32", "shape": [128]}
+    cat = W.build_catalog_from_header("dit", header, "dit")
+    cfg, _ = a.detect_unet_config(shapes, None)
+    model = a.build_skeleton(cat, cfg, None, torch.float32, device="meta")
+    q = model.blocks[0].mlp_fc1
+    assert isinstance(q, StubQuantLinear), type(q)
+    assert q.factory_kwargs["device"] == "meta", q.factory_kwargs
+    uid = "dit.blocks.0"
+    torch.manual_seed(7)
+    sub = {}
+    for k in cat.units[uid].checkpoint_keys:
+        if k.endswith("norm1.weight") or k.endswith("norm2.weight"):
+            sub[k] = torch.ones(64)
+        elif "mlp_fc1" in k and k.endswith("weight_scale"):
+            sub[k] = torch.ones(128)
+        elif "mlp_fc1" in k:
+            sub[k] = torch.randn(128, 64)
+        elif "mlp_fc2" in k:
+            sub[k] = torch.randn(64, 128)
+        elif "attn_out" in k:
+            sub[k] = torch.randn(64, 64)
+        else:
+            sub[k] = torch.randn(192, 64)
+    rep = a.materialize_unit(model, uid, sub, device="cpu",
+                             expected_keys=cat.units[uid].checkpoint_keys)
+    assert rep["factory_kwargs_synced"] >= 1, rep
+    assert rep["meta_repair"] == [], rep
+    assert q.factory_kwargs["device"] == "cpu", q.factory_kwargs
+    assert not q.weight.is_meta, "quant weight fell back to meta"
+    audit = a.audit_after_bind(cat, model, uid, rep, expect_loaded=True)
+    assert audit["verdict"] == "ok", audit
+    # _sync_factory_kwargs 原语：陈旧 fk 被纠正并计数（materialize 内同款调用）
+    q.factory_kwargs["device"] = "meta"
+    n2 = a._sync_factory_kwargs(model.blocks[1], "cpu")
+    assert n2 >= 1, n2
+    assert model.blocks[1].mlp_fc1.factory_kwargs["device"] == "cpu"
+    # purge 把 fk 置回 meta（与空壳状态一致），reload 经 materialize 回 cpu
+    a.purge_unit(model, uid)
+    assert q.factory_kwargs["device"] == "meta", q.factory_kwargs
+    rep2 = a.materialize_unit(model, uid, sub, device="cpu",
+                              expected_keys=cat.units[uid].checkpoint_keys)
+    assert rep2["factory_kwargs_synced"] >= 1, rep2
+    assert not q.weight.is_meta
+    assert a.audit_after_bind(cat, model, uid, rep2,
+                              expect_loaded=True)["verdict"] == "ok"
+    return "fk sync + rebind + purge/reload ok"
+
+
 def t_noncompute_short_circuit():
     a = _adapter()
     shapes = _shapes()
@@ -340,6 +425,7 @@ check("unit holders + waived", t_holders_and_waived)
 check("strict bind + audit; missing refused", t_strict_bind_and_audit)
 check("purge keeps slots, zero storage", t_purge_keeps_slots)
 check("waived-only short-circuit", t_noncompute_short_circuit)
+check("quant factory_kwargs sync", t_quant_factory_kwargs)
 check("registry lock concurrency", t_registry_lock_smoke)
 check("no-comfy clear error", t_no_comfy_gives_clear_error)
 

@@ -153,15 +153,28 @@ C:\Users\88888888\AppData\Local\Temp\opencode\explicit_api_env_20261121\Scripts\
   关门、purge 保槽位、registry 锁并发）+ 无 Comfy 报 ComfyUnavailable；
   stub 故意复现真实 bug（adaln_t_table/rope.inv_freq 无 device 分配），
   骨架靠 `torch.device` 上下文兜底并断言两 buffer 落 meta。ALL OK。
-- probe 安全（m00830，主代理远端运行，本机只做静态+00 实测）：
+- probe 安全（m00830/m00986，主代理远端运行，本机只做静态+00 实测）：
   00 仅 importlib.metadata 版本只读，零 torch.cuda.*（已本地实测）；
-  10/20 import comfy 前清 argv + 设 cpu/gpu_only，前后断言
+  00/10/20 在任何 torch/safe_open import 前设 CUDA_VISIBLE_DEVICES='-1'
+  （远端实测：PS 设 '' 无效——会移除变量，'-1' 才隐藏 GPU；21 显式 GPU
+  probe 不设）；10/20 import comfy 前清 argv + 设 cpu/gpu_only，前后断言
   `cuda.is_initialized()==False`；20/21 resolve 后双预算（≤2 units、
   源端合计 ≤1GiB，range 展开拒）；schema 不符 verdict=unverified+exit 2；
-  20 purge 前 staging（key_tensors/sub）释放 + weakref 无残留证明；
+  失败也在 finally 写报告（不再仅 assert 无文件）；20/21 purge 前 staging
+  按被 purge unit 裁剪 + weakref 零残留证明（兄弟合法常驻不计入）；
   报告真 CPU peak（PeakWorkingSetSize/ru_maxrss）而非 rss delta。
   静态核实：快照内无顶层 torch.cuda 调用、无 sage/flash 引用、
   xformers 仅 import 时加载（不执行 attention：无 forward、无 sampler）。
+- 远端实测回填（主代理亲跑）：00 版本全对；10 真实通过——56 compute units
+  + 2 noncompute、268 meta tensors、CPU/CUDA storage 均 0；20 block0 真实
+  失败 audit META_REMAINS（bound 18/18 但 CPU 仅 1763840B + meta 4，
+  应 ~387MB）：根因为 MixedPrecision Linear 构造期 factory_kwargs device
+  固定 meta，to_empty 不碰它，_load_quantized_module 按其重建致 4 量化权重
+  回落 meta。已修：materialize 递归同步 holder 子树 fk 到目标设备并计数
+  上报，绑定后扫 meta 残留→重同步+定向重绑→仍残留则硬失败（META_REMAINS
+  审计保留不放行）；purge 把 fk 置回 meta（与空壳一致），move 同步 fk；
+  stub 增 StubQuantLinear（hook 按 fk 重建）+ fixture 测同步数/purge 后
+  fk/meta/reload 回 cpu。等主代理重跑 20。
 - `_selftest_real_header_catalog`：按远端 header 报告复刻的布局保真合成头
   （双量化伴生键/adaln/rope/refiner/patch/final），catalog 全覆盖、
   单位划分、字节账、选择器、waived 精确忽略。ALL OK。

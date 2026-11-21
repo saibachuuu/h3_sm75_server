@@ -89,7 +89,8 @@ def t_schema_gate():
     rep: dict = {}
     try:
         C.require_schema(env, rep)
-    except SystemExit:
+    except SystemExit as e:
+        assert e.code == 2, e.code
         assert rep["verdict"] == "unverified", rep
         assert rep["schema_check"]["mismatches"], rep
     else:

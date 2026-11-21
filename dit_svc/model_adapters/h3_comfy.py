@@ -226,6 +226,108 @@ class H3ComfyAdapter(ModelAdapter):
             cur = getattr(cur, part)
         return cur
 
+    def _sync_factory_kwargs(self, holder: Any, device: str) -> int:
+        """递归同步 holder 子树全部 factory_kwargs['device']。
+
+        真实 MixedPrecision Linear 构造期 device 固定为 meta（骨架阶段），
+        而 _load_quantized_module 按此重建权重；to_empty 不碰该元数据，
+        不显式同步则量化权重回绑到 meta（远端 probe 20 实测 4 个 meta）。
+        只动 holder 子树，不碰未选 unit。返回同步个数（审计用）。
+        """
+        n = 0
+        seen = set()
+        for m in holder.modules():
+            if id(m) in seen:
+                continue
+            seen.add(id(m))
+            fk = getattr(m, "factory_kwargs", None)
+            if isinstance(fk, dict) and fk.get("device") != device:
+                fk["device"] = device
+                n += 1
+        return n
+
+    def _stale_holders(self, model: Any,
+                       holders: Sequence[Tuple[str, str]]) -> List[Tuple[str, str]]:
+        """返回子树仍有 meta storage 的 holders（重绑候选）。"""
+        out = []
+        for holder_path, kind in holders:
+            if kind.startswith("buffer:") or kind == "module-rootscalars":
+                continue
+            if self._meta_leaves(self._resolve(model, holder_path)):
+                out.append((holder_path, kind))
+        return out
+
+    def _meta_leaves(self, holder: Any) -> List[str]:
+        """holder 子树仍带真实 meta storage 的 params/buffers 路径。"""
+        out: List[str] = []
+        for name, p in holder.named_parameters(recurse=True):
+            if p is not None and getattr(p, "is_meta", False):
+                out.append("param:" + name)
+        for name, b in holder.named_buffers(recurse=True):
+            if b is not None and getattr(b, "is_meta", False):
+                out.append("buffer:" + name)
+        return out
+
+    def _bind_holder(self, holder: Any, holder_path: str, kind: str,
+                     key_tensors: Mapping[str, Any],
+                     device: str) -> Tuple[list, list, dict, int]:
+        """单个 holder：to_empty + factory_kwargs 同步 + strict 绑定。"""
+        torch_mod = _need("torch", self.torch)
+        bound: List[str] = []
+        waived: List[str] = []
+        quant_formats: Dict[str, str] = {}
+        if kind.startswith("buffer:"):
+            name = kind.split(":", 1)[1]
+            full = name
+            if full not in key_tensors:
+                raise AdapterError("missing buffer key %r" % (full,),
+                                   details={"key": full})
+            holder.register_buffer(
+                name, torch_mod.as_tensor(key_tensors[full]).to(device))
+            bound.append(full)
+            return bound, waived, quant_formats, 0
+        if kind == "module-rootscalars":
+            raise AdapterError("root unit has no module home; expand catalog first")
+        prefix = holder_path + "."
+        sub = {k: v for k, v in key_tensors.items() if k == holder_path
+               or k.startswith(prefix)}
+        if holder_path == "token_refiner":
+            sub = {k: v for k, v in key_tensors.items()
+                   if k.startswith("token_refiner.")}
+        for w in WAIVED_KEYS:
+            if w in sub:
+                sub.pop(w)
+                waived.append(w)
+        try:
+            holder.to_empty(device=device)
+        except Exception as e:
+            raise AdapterError("to_empty(%s) failed: %s" % (device, e),
+                               details={"holder": holder_path}) from None
+        synced = self._sync_factory_kwargs(holder, device)
+        rel = {}
+        for k, v in sub.items():
+            if k == holder_path:
+                rel[k] = v
+            elif k.startswith(prefix):
+                rel[k[len(prefix):]] = v
+            else:
+                raise AdapterError("key %r not under holder %r"
+                                   % (k, holder_path))
+        try:
+            missing, unexpected = holder.load_state_dict(rel, strict=True,
+                                                         assign=True)
+        except RuntimeError as e:
+            raise AdapterError("strict bind failed for %r: %s"
+                               % (holder_path, e),
+                               details={"holder": holder_path,
+                                        "error": str(e)[:300]}) from None
+        assert not missing and not unexpected, (missing, unexpected)
+        bound.extend(k for k in sub.keys())
+        for k, v in sub.items():
+            if k.endswith("comfy_quant"):
+                quant_formats[k] = self._read_quant_format(v)
+        return bound, waived, quant_formats, synced
+
     # -- 选择性物化：只读所选 unit keys，未选不动 --
     def materialize_unit(self, model: Any, unit_id: str,
                          key_tensors: Mapping[str, Any],
@@ -239,9 +341,10 @@ class H3ComfyAdapter(ModelAdapter):
         集合精确校验（多/少都拒）。未选 unit 的模块保持 meta/None。
         waived-only 请求（全 key 被 waive、无 holder 可绑）返回 noncompute
         报告，不触模型、不读权重体、不计驻留。
-        返回绑定报告（含 waived、per-layer quant format 日志）。
+        返回绑定报告（含 waived、per-layer quant format 日志、
+        factory_kwargs 同步数、meta 重绑记录）。
         """
-        torch_mod = _need("torch", self.torch)
+        _need("torch", self.torch)
         model_id = unit_id.split(".")[0]
         waived_pre = sorted(k for k in key_tensors
                             if k.split(".")[-1] in WAIVED_KEYS or k in WAIVED_KEYS)
@@ -259,6 +362,8 @@ class H3ComfyAdapter(ModelAdapter):
         bound: List[str] = []
         waived: List[str] = list(waived_pre)
         quant_formats: Dict[str, str] = {}
+        synced_total = 0
+        repair_log: List[Dict[str, Any]] = []
         holders = self.unit_holders(unit_id, model_id)
         # 预检：每个 key 必须被某 holder 消费或被显式 waive；
         # 跨 unit 多余 key 在此拒绝，不等绑定污染模型。
@@ -280,19 +385,6 @@ class H3ComfyAdapter(ModelAdapter):
                 recovery=["只传该 unit 的 keys；跨 unit key 必须走各自 unit 绑定"],
                 details={"unit": unit_id, "unconsumed": uncovered})
         for holder_path, kind in holders:
-            if kind.startswith("buffer:"):
-                name = kind.split(":", 1)[1]
-                full = name  # 顶层 buffer key 即名
-                if full not in key_tensors:
-                    raise AdapterError("missing buffer key %r for %r" % (full, unit_id),
-                                       details={"unit": unit_id, "key": full})
-                holder = self._resolve(model, holder_path)
-                holder.register_buffer(name, torch_mod.as_tensor(key_tensors[full]).to(device))
-                bound.append(full)
-                continue
-            if kind == "module-rootscalars":
-                raise AdapterError("root unit has no module home; expand catalog first",
-                                   details={"unit": unit_id})
             holder = self._resolve(model, holder_path)
             # holder 消费的 keys：holder_path 点转 checkpoint 前缀
             prefix = holder_path.replace(".", ".") + "."
@@ -300,58 +392,45 @@ class H3ComfyAdapter(ModelAdapter):
             # condition_proj / video_patch_proj / ...），rope 除外：
             sub = {k: v for k, v in key_tensors.items() if k == holder_path
                    or k.startswith(prefix)}
-            if holder_path == "rope":
-                # rope.inv_freq 的 holder 是 rope 模块，key 前缀 "rope."
-                pass
             if kind == "module" and holder_path in ("token_refiner",):
                 # token_refiner holder 消费 token_refiner.* 全体（refiner unit 含
                 # condition_proj 时由另一 holder 条目处理，此处只取本前缀）
                 sub = {k: v for k, v in key_tensors.items()
                        if k.startswith("token_refiner.")}
-            # waived keys 不进绑定
-            for w in WAIVED_KEYS:
-                if w in sub:
-                    sub.pop(w)
-                    waived.append(w)
-            # to_empty：meta/None 安全；把 factory device 修正到目标设备
-            try:
-                holder.to_empty(device=device)
-            except Exception as e:
-                raise AdapterError("to_empty(%s) failed for %r: %s"
-                                   % (device, holder_path, e),
-                                   details={"holder": holder_path}) from None
-            fk = getattr(holder, "factory_kwargs", None)
-            if isinstance(fk, dict):
-                fk["device"] = device
-            # 同一 holder 下的量化子层也可能有 factory_kwargs（MixedPrecision
-            # Linear 各自持有）；递归修正
-            for _m in holder.modules():
-                _fk = getattr(_m, "factory_kwargs", None)
-                if isinstance(_fk, dict):
-                    _fk["device"] = device
-            # 相对前缀：holder_path 本身对应 checkpoint 同名前缀
-            rel = {}
-            for k, v in sub.items():
-                if k == holder_path:
-                    rel[k] = v
-                elif k.startswith(prefix):
-                    rel[k[len(prefix):]] = v
-                else:
-                    raise AdapterError("key %r not under holder %r" % (k, holder_path),
-                                       details={"unit": unit_id})
-            try:
-                missing, unexpected = holder.load_state_dict(rel, strict=True, assign=True)
-            except RuntimeError as e:
-                raise AdapterError("strict bind failed for %r: %s" % (holder_path, e),
-                                   recovery=["检查所选 keys 是否与该 holder 精确对应；绝不用 strict=False 重试"],
-                                   details={"holder": holder_path,
-                                            "error": str(e)[:300]}) from None
-            assert not missing and not unexpected, (missing, unexpected)
-            bound.extend(k for k in sub.keys())
-            # quant format 日志：comfy_quant 描述符（82B 小 key 允许读）
-            for k, v in sub.items():
-                if k.endswith("comfy_quant"):
-                    quant_formats[k] = self._read_quant_format(v)
+            b, w, q, n_synced = self._bind_holder(holder, holder_path, kind,
+                                                 dict(sub), device)
+            bound.extend(b)
+            waived.extend(x for x in w if x not in waived)
+            quant_formats.update(q)
+            synced_total += n_synced
+        # 绑定后扫 meta：量化子层若仍按陈旧 factory_kwargs 重建会落 meta；
+        # 发现即重同步后定向重绑（只动本 unit holders），仍有残留则硬失败。
+        if device != "meta":
+            stale = self._stale_holders(model, holders)
+            if stale:
+                repaired = []
+                for holder_path, kind in stale:
+                    holder = self._resolve(model, holder_path)
+                    n = self._sync_factory_kwargs(holder, device)
+                    prefix = holder_path + "."
+                    sub = {k: v for k, v in key_tensors.items()
+                           if k == holder_path or k.startswith(prefix)}
+                    if kind == "module" and holder_path in ("token_refiner",):
+                        sub = {k: v for k, v in key_tensors.items()
+                               if k.startswith("token_refiner.")}
+                    b, w, q, n2 = self._bind_holder(holder, holder_path, kind,
+                                                   dict(sub), device)
+                    repaired.append({"holder": holder_path,
+                                     "resynced": n, "rebound": len(b)})
+                stale = self._stale_holders(model, holders)
+                if stale:
+                    raise AdapterError(
+                        "meta leaves remain after rebind for %r: %r"
+                        % (unit_id, stale),
+                        recovery=["检查该 holder 子树 factory_kwargs 同步逻辑"],
+                        details={"unit": unit_id, "stale": stale,
+                                 "repaired": repaired})
+                repair_log.extend(repaired)
         consumed = set(bound) | set(waived)
         unconsumed = sorted(k for k in key_tensors.keys() if k not in consumed)
         if unconsumed:
@@ -362,7 +441,8 @@ class H3ComfyAdapter(ModelAdapter):
                 details={"unit": unit_id, "unconsumed": unconsumed})
         return {"unit": unit_id, "bound_keys": sorted(bound),
                 "waived": sorted(waived), "quant_formats": quant_formats,
-                "device": device}
+                "device": device, "factory_kwargs_synced": synced_total,
+                "meta_repair": repair_log}
 
     @staticmethod
     def _read_quant_format(descriptor_tensor: Any) -> str:
@@ -377,7 +457,9 @@ class H3ComfyAdapter(ModelAdapter):
     def purge_unit(self, model: Any, unit_id: str) -> Dict[str, Any]:
         """释放该 unit 全部真实 storage（params/buffers 置 meta 空壳）。
 
-        不删除 ModuleList 索引、不碰未选 unit。返回释放报告。
+        不删除 ModuleList 索引、不碰未选 unit。同步把 holder 子树
+        factory_kwargs['device'] 置回 meta（与当前 meta 空壳状态一致，
+        防下次绑定沿用陈旧 cpu/cuda 重建）。返回释放报告。
         """
         torch_mod = _need("torch", self.torch)
         model_id = unit_id.split(".")[0]
@@ -418,6 +500,10 @@ class H3ComfyAdapter(ModelAdapter):
                             _m.register_buffer(
                                 _name, torch_mod.empty(b.shape, device="meta", dtype=b.dtype))
             touched.append(holder_path)
+        for _m in [holder] + [m for m in holder.modules()]:
+            _fk = getattr(_m, "factory_kwargs", None)
+            if isinstance(_fk, dict):
+                _fk["device"] = "meta"
         return {"unit": unit_id, "purged_holders": touched}
 
     # -- move：整 unit 子树 .to(device)，随后由 inventory 核对 --
@@ -440,6 +526,7 @@ class H3ComfyAdapter(ModelAdapter):
                 continue
             holder = self._resolve(model, holder_path)
             holder.to(device)
+            self._sync_factory_kwargs(holder, device)
             touched.append(holder_path)
         return {"unit": unit_id, "device": device, "moved_holders": touched}
 

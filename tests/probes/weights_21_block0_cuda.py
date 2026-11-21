@@ -19,15 +19,41 @@ import weights_common as C  # noqa: E402
 
 
 def main() -> int:
+    # 21 是显式 GPU probe：不清 CUDA_VISIBLE_DEVICES，不设 cpu。
+    # 但仍清 argv 防 comfy.cli_args 误读 probe 参数。
     ap = C.base_parser("weights probe 21: selective CUDA materialize")
     ap.add_argument("--allow-cuda", action="store_true",
                     help="不传则只打印预估峰值后退出，不碰 GPU")
     ap.add_argument("--allow-2-units", action="store_true")
     ap.add_argument("--compute-dtype", default="bfloat16")
     args = ap.parse_args()
-    units = C.parse_units(args.units)
-    if len(units) > (2 if args.allow_2_units else 1):
-        raise SystemExit("probe 21 refuses >%d units" % (2 if args.allow_2_units else 1))
+    t0 = C.rss_bytes()
+    report: dict = {"probe": "weights_21_block0_cuda",
+                    "units": C.parse_units(args.units)}
+    rc = 0
+    try:
+        _probe21_body(args, t0, report)
+        report["verdict"] = "ok"
+    except SystemExit as e:
+        rc = e.code if isinstance(e.code, int) else 1
+        if report.get("verdict") not in ("unverified", "refused"):
+            report["verdict"] = "refused"
+            report["error"] = "SystemExit: %s" % e
+    except BaseException as e:  # noqa: BLE001
+        rc = 1
+        report["verdict"] = "failed"
+        report["error"] = "%s: %s" % (type(e).__name__, e)
+    finally:
+        if report.get("estimate") is not None or args.allow_cuda:
+            C.write_report(report, args.out, "weights_probe_21.json")
+    return rc
+
+
+def _probe21_body(args, t0, report) -> None:
+    units = report["units"]
+    max_units = 2 if args.allow_2_units else 1
+    if len(units) > max_units:
+        raise SystemExit("probe 21 refuses >%d units" % max_units)
 
     from dit_svc import weights as W
     tensors, _ = W.read_safetensors_header(args.header)
@@ -45,21 +71,15 @@ def main() -> int:
     estimate = {"expected_resident_bytes": want,
                 "expected_peak_gpu_bytes": want + (1 << 30),
                 "note": "reserve headroom 1GB; no full-model load"}
+    report["estimate"] = estimate
     if not args.allow_cuda:
         print("ESTIMATE (no GPU touched):")
         print(__import__("json").dumps(estimate, indent=2))
-        return 0
+        return
 
-    t0 = C.rss_bytes()
-    report: dict = {"probe": "weights_21_block0_cuda", "units": units,
-                    "estimate": estimate}
-    # 版本 schema 门：不符不许 ok（显式 unverified + exit 2）
+    # 版本 schema 门：不符不许 ok（unverified + exit 2；外层 finally 写报告）
     env = C.env_info(include_cuda=False)
-    try:
-        C.require_schema(env, report)
-    except SystemExit:
-        C.write_report(report, args.out, "weights_probe_21.json")
-        raise
+    C.require_schema(env, report)
     report["env"] = env
     from dit_svc.model_adapters import H3ComfyAdapter
     from safetensors import safe_open
@@ -140,10 +160,11 @@ def main() -> int:
     reg.check_transition("purgefromram", args.model_id, resolved)
     for uid in resolved:
         adapter.purge_unit(model, uid)
-        staged = list(sub.values())
-        for k in list(sub.keys()):
-            if k in cat.units[uid].checkpoint_keys:
-                del sub[k]
+        # 只针对被 purge 的 unit 取证；仍驻留兄弟合法常驻，不得计入
+        purged_keys = set(cat.units[uid].checkpoint_keys)
+        staged = [v for k, v in sub.items() if k in purged_keys]
+        for k in [k for k in sub.keys() if k in purged_keys]:
+            del sub[k]
         proof = C.release_staging_proof(staged)
         del staged
         report.setdefault("staging_release", {})[uid] = proof
@@ -157,9 +178,6 @@ def main() -> int:
     report["registry"] = reg.model_state(args.model_id)
     report["rss_delta_bytes"] = C.rss_bytes() - t0
     report["cpu_peak_bytes"] = C.rss_peak_bytes()
-    report["verdict"] = "ok"
-    C.write_report(report, args.out, "weights_probe_21.json")
-    return 0
 
 
 if __name__ == "__main__":

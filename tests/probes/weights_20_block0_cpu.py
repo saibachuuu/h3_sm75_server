@@ -18,22 +18,42 @@ import weights_common as C  # noqa: E402
 
 
 def main() -> int:
+    # CPU 钳制必须在任何 torch/safe_open import 之前：CUDA_VISIBLE_DEVICES='-1'
+    #（远端实测：PS 设 '' 无效，'-1' 才隐藏 GPU，主代理核实）。
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     ap = C.base_parser("weights probe 20: selective CPU materialize")
     ap.add_argument("--compute-dtype", default="bfloat16")
     args = ap.parse_args()
-    units = C.parse_units(args.units)
+    t0 = C.rss_bytes()
+    report: dict = {"probe": "weights_20_block0_cpu",
+                    "units": C.parse_units(args.units),
+                    "cuda_visible_devices": "-1"}
+    rc = 0
+    try:
+        _probe20_body(args, t0, report)
+        report["verdict"] = "ok"
+    except SystemExit as e:
+        rc = e.code if isinstance(e.code, int) else 1
+        if report.get("verdict") not in ("unverified", "refused"):
+            report["verdict"] = "refused"
+            report["error"] = "SystemExit: %s" % e
+    except BaseException as e:  # noqa: BLE001
+        rc = 1
+        report["verdict"] = "failed"
+        report["error"] = "%s: %s" % (type(e).__name__, e)
+    finally:
+        C.write_report(report, args.out, "weights_probe_20.json")
+    return rc
+
+
+def _probe20_body(args, t0, report) -> None:
+    units = report["units"]
     if len(units) > 2:
         raise SystemExit("probe 20 allows at most 2 units (got %d)" % len(units))
-    t0 = C.rss_bytes()
-    report: dict = {"probe": "weights_20_block0_cpu", "units": units}
 
-    # 版本 schema 门：不符不许 ok（显式 unverified + exit 2）
+    # 版本 schema 门：不符不许 ok（unverified + exit 2；外层 finally 写报告）
     env = C.env_info(include_cuda=False)
-    try:
-        C.require_schema(env, report)
-    except SystemExit:
-        C.write_report(report, args.out, "weights_probe_20.json")
-        raise
+    C.require_schema(env, report)
     report["env"] = env
 
     from dit_svc import weights as W
@@ -145,10 +165,15 @@ def main() -> int:
     # purge 第一个 unit（purgefromram 门卫：cpu 可 purge）
     reg.check_transition("purgefromram", args.model_id, [resolved[0]])
     adapter.purge_unit(model, resolved[0])
-    # staging 释放证明：bind 临时 dict 仍持有原权重 storage，必须先释放
-    # 并证无强引用残留，否则 purge audit 的“零残留”结论不成立
-    staged = list(key_tensors.values()) + list(sub.values())
-    del key_tensors, sub
+    # staging 释放证明：只针对被 purge 的 unit。仍驻留兄弟（如 sib）的张量
+    # 被模型持有是合法常驻，不得计入 proof（否则两 unit 即误报 leak）。
+    purged_keys = set(cat.units[resolved[0]].checkpoint_keys)
+    staged = ([v for k, v in key_tensors.items() if k in purged_keys]
+              + [v for k, v in sub.items() if k in purged_keys])
+    for k in [k for k in key_tensors.keys() if k in purged_keys]:
+        del key_tensors[k]
+    for k in [k for k in sub.keys() if k in purged_keys]:
+        del sub[k]
     proof = C.release_staging_proof(staged)
     del staged
     report["staging_release"] = proof
@@ -187,9 +212,6 @@ def main() -> int:
     report["registry"] = reg.model_state(args.model_id)
     report["rss_delta_bytes"] = C.rss_bytes() - t0
     report["cpu_peak_bytes"] = C.rss_peak_bytes()
-    report["verdict"] = "ok"
-    C.write_report(report, args.out, "weights_probe_20.json")
-    return 0
 
 
 if __name__ == "__main__":

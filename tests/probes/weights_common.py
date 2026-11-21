@@ -113,12 +113,12 @@ def schema_check(env: dict) -> dict:
 
 
 def require_schema(env: dict, report: dict) -> None:
-    """版本 schema 不符：不许 verdict ok。显式 fail（exit 2）。"""
+    """版本 schema 不符：不许 verdict ok。显式 unverified + exit 2。"""
     sc = schema_check(env)
     report["schema_check"] = sc
     if sc["verdict"] != "ok":
         report["verdict"] = "unverified"
-        raise SystemExit("schema mismatch: %r" % (sc["mismatches"],))
+        raise SystemExit(2)
 
 
 def rss_bytes() -> int:
