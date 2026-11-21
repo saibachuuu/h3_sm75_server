@@ -1,9 +1,9 @@
 """VEDA predictor bundle 显式权重后端：整组四动作。
 
-bundle 是 ``veda.bundle_compat.load(path)`` 得到的 ``PredictorBundle``：
-``proj_q`` / ``proj_k`` 各 50 层 bf16 tensor（bundle 内已反量化）。
-首版 unit 是整组 ``veda.bundle.model``；后续若要按层显存优化，再拆
-``veda.layers.N``，但必须先有真实 GPU 搬运与 engine 复用的验证。
+bundle 是 ``veda.bundle_compat.load(path)`` 得到的 ``LoadedBundle``：
+``loaded.bundle.proj_q`` / ``proj_k`` 各 50 层 bf16 tensor（bundle 内已反量化），
+外加 budget 派生信息。首版 unit 是整组 ``veda.bundle.model``；后续若要按层
+显存优化，再拆 ``veda.layers.N``，但必须先有真实 GPU 搬运与 engine 复用验证。
 """
 import os
 import types
@@ -23,13 +23,24 @@ class VedaBackend(GroupBackend):
         self.MODEL_ID = "veda.bundle"
         self.PRIMARY_UNIT = "veda.bundle.model"
 
+    def _tensors(self):
+        if self.obj is None:
+            return None
+        inner = getattr(self.obj, "bundle", None)
+        if inner is None:
+            return None
+        return inner
+
     def extra_state(self):
         info = {}
-        bundle = self.obj
-        if bundle is not None:
-            info = {"num_layers": getattr(bundle, "num_layers", None),
-                    "num_heads": getattr(bundle, "num_heads", None),
-                    "head_dim": getattr(bundle, "head_dim", None)}
+        inner = self._tensors()
+        if inner is not None:
+            info = {"num_layers": getattr(inner, "num_layers", None),
+                    "num_heads": getattr(inner, "num_heads", None),
+                    "head_dim": getattr(inner, "head_dim", None)}
+            budget = getattr(self.obj, "budget_source", None)
+            if budget:
+                info["budget_source"] = budget
         info["path"] = (self.config or {}).get("path")
         return info
 
@@ -44,15 +55,17 @@ class VedaBackend(GroupBackend):
         from dit_svc import veda_star7
         self._stage("读取 veda bundle 到 CPU", operation)
         shim = types.SimpleNamespace(veda_bundle=self.config["path"])
-        self.obj = veda_star7.load_bundle(shim, log=lambda text: print(text, flush=True))
+        self.obj = veda_star7.load_bundle(
+            shim, log=lambda text: print(text, flush=True))
 
     def move_to(self, device):
-        if self.obj is None:
+        inner = self._tensors()
+        if inner is None:
             raise RuntimeError("veda bundle 未加载")
         import torch
         target = torch.device(device)
-        self.obj.proj_q = [t.to(target) for t in self.obj.proj_q]
-        self.obj.proj_k = [t.to(target) for t in self.obj.proj_k]
+        inner.proj_q = [t.to(target) for t in inner.proj_q]
+        inner.proj_k = [t.to(target) for t in inner.proj_k]
 
     def release(self):
         refs = []
@@ -63,11 +76,13 @@ class VedaBackend(GroupBackend):
 
     def inventory(self):
         out = {"units": {}, "uninspectable": [], "storage_digest": []}
-        if self.obj is None:
+        inner = self._tensors()
+        if inner is None:
             return out
-        tensors = {"proj_q": self.obj.proj_q, "proj_k": self.obj.proj_k}
+        tensors = {"proj_q": inner.proj_q, "proj_k": inner.proj_k}
         inv = W.storage_inventory(tensors, owner=self.PRIMARY_UNIT)
-        devices = {str(t.device) for t in list(self.obj.proj_q) + list(self.obj.proj_k)}
+        devices = {str(t.device)
+                   for t in list(inner.proj_q) + list(inner.proj_k)}
         if not devices:
             device = "cpu"
         elif all(d.startswith("cuda") for d in devices):
