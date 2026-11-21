@@ -152,8 +152,13 @@ def main():
             run_action(client, "te", "ram2vram", {"mode": "all"}, 240, report)
             _, weights = client.request("GET", "/api/weights/te")
             report["after_ram2vram"] = weights["model"]
-            assert weights["model"]["state"] == "vram", weights["model"]
-            cuda_bytes = weights["model"]["bytes"]["resident_cuda"]
+            model = weights["model"]
+            units = {unit["id"]: unit for unit in model["units"]}
+            # TE 主权重必须在显存；ClipProj 的 304MB 加速副本由首次 encode 惰性创建，
+            # 所以此时 model.state 可以是 partial（vram + ram），不是失败。
+            assert units["te.model"]["state"] == "vram", model
+            assert model["state"] in ("vram", "partial"), model
+            cuda_bytes = model["bytes"]["resident_cuda"]
             assert cuda_bytes > 4 * 1024 ** 3, cuda_bytes
 
             if not args.skip_encode:
