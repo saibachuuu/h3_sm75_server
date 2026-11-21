@@ -289,7 +289,7 @@ def _tag_shape_mismatch():
 
 
 expect("tags/cond token 维不一致拒绝", _tag_shape_mismatch,
-       code="INVALID_ARTIFACT", contains="token 维度")
+       code="INVALID_ARTIFACT", contains="不匹配")
 
 
 def _legacy():
@@ -377,6 +377,285 @@ def _custom_build():
 
 
 check("自定义 build_container", _custom_build)
+
+print("== batch_index 无损 roundtrip ==")
+
+
+def _batch_roundtrip():
+    lat = make_av()
+    lat["batch_index"] = [0, 3, 7]
+    save_av_latent(store, lat, base_meta(), filename="av_bi.safetensors")
+    back, md = load_av_latent(store, "av_bi.safetensors")
+    assert back.get("batch_index") == [0, 3, 7], back.get("batch_index")
+    assert md.get("batch_index") == [0, 3, 7], md.get("batch_index")
+    return "ok"
+
+
+check("batch_index 列表 roundtrip", _batch_roundtrip)
+
+
+def _batch_tensor():
+    lat = make_av()
+    lat["batch_index"] = torch.tensor([1, 2])
+    save_av_latent(store, lat, base_meta(), filename="av_bi2.safetensors")
+    back, _ = load_av_latent(store, "av_bi2.safetensors")
+    assert back["batch_index"] == [1, 2], back["batch_index"]
+    return "tensor -> list"
+
+
+check("batch_index tensor 无损转列表", _batch_tensor)
+
+expect("batch_index 字符串拒绝",
+       lambda: split_av_latent(dict(make_av(), batch_index="0,1")),
+       code="INVALID_ARTIFACT", contains="JSON 整数列表")
+expect("batch_index 浮点拒绝",
+       lambda: split_av_latent(dict(make_av(), batch_index=[1.5])),
+       code="INVALID_ARTIFACT", contains="不是整数")
+
+print("== noise_mask 形态约束 ==")
+
+
+def _mask_pairs_only():
+    lat = make_av()
+    lat["noise_mask_video"] = torch.ones(1, 1, 3, 4, 5)
+    try:
+        split_av_latent(lat)
+    except ArtifactError as e:
+        assert e.code == "INVALID_ARTIFACT"
+        assert "成对" in str(e), str(e)
+        return "拒绝"
+    raise AssertionError("只有 video mask 却没报错")
+
+
+check("只有 noise_mask_video 时 422", _mask_pairs_only)
+
+
+def _mask_both():
+    lat = make_av()
+    lat["noise_mask"] = torch.ones(1, 1, 3, 4, 5)
+    lat["noise_mask_video"] = torch.ones(1, 1, 3, 4, 5)
+    lat["noise_mask_audio"] = torch.ones(1, 1, 2, 6)
+    try:
+        split_av_latent(lat)
+    except ArtifactError as e:
+        assert "不能同时" in str(e), str(e)
+        return "拒绝"
+    raise AssertionError("unified + split 同时存在却没报错")
+
+
+check("unified + split 同时存在 422", _mask_both)
+
+
+def _mask_5d_unified():
+    lat = make_av()
+    lat["noise_mask"] = torch.ones(1, 1, 3, 4, 5)
+    try:
+        split_av_latent(lat)
+    except ArtifactError as e:
+        assert "audio 部分" in str(e), str(e)
+        return "拒绝"
+    raise AssertionError("5D 单块 mask 缺 audio 却没报错")
+
+
+check("5D 单块 mask 缺 audio 422", _mask_5d_unified)
+
+print("== 读取前 header 校验 ==")
+
+
+def _no_metadata():
+    from safetensors.torch import save_file
+    p = os.path.join(store.stage_dir, "lat_nometa.safetensors")
+    save_file({"video": torch.zeros(1, 24, 2, 2, 2),
+               "audio": torch.zeros(1, 32, 2, 4)}, p)
+    try:
+        load_av_latent(store, "lat_nometa.safetensors")
+    except ArtifactError as e:
+        assert e.code == "INVALID_ARTIFACT" and "format" in str(e), str(e)
+        return "拒绝"
+    raise AssertionError("缺 metadata 的 latent 被接受")
+
+
+check("latent 缺 metadata format 拒绝", _no_metadata)
+
+
+def _bad_fps():
+    from safetensors.torch import save_file
+    p = os.path.join(store.stage_dir, "lat_fps.safetensors")
+    save_file({"video": torch.zeros(1, 24, 2, 2, 2),
+               "audio": torch.zeros(1, 32, 2, 4)}, p,
+              metadata={"format": FORMAT_AVLATENT, "requested_length": "124",
+                        "native_fps": "30"})
+    try:
+        load_av_latent(store, "lat_fps.safetensors")
+    except ArtifactError as e:
+        assert "24" in str(e), str(e)
+        return "拒绝"
+    raise AssertionError("native_fps=30 被接受")
+
+
+check("latent native_fps!=24 拒绝", _bad_fps)
+
+
+def _missing_length():
+    from safetensors.torch import save_file
+    p = os.path.join(store.stage_dir, "lat_nolen.safetensors")
+    save_file({"video": torch.zeros(1, 24, 2, 2, 2),
+               "audio": torch.zeros(1, 32, 2, 4)}, p,
+              metadata={"format": FORMAT_AVLATENT, "native_fps": "24"})
+    try:
+        load_av_latent(store, "lat_nolen.safetensors")
+    except ArtifactError as e:
+        assert "requested_length" in str(e), str(e)
+        return "拒绝"
+    raise AssertionError("缺 requested_length 被接受")
+
+
+check("latent 缺 requested_length 拒绝", _missing_length)
+
+
+def _bad_video_shape():
+    from safetensors.torch import save_file
+    p = os.path.join(store.stage_dir, "lat_shape.safetensors")
+    save_file({"video": torch.zeros(1, 16, 2, 2, 2),
+               "audio": torch.zeros(1, 32, 2, 4)}, p,
+              metadata={"format": FORMAT_AVLATENT, "requested_length": "124",
+                        "native_fps": "24"})
+    try:
+        load_av_latent(store, "lat_shape.safetensors")
+    except ArtifactError as e:
+        assert "video shape" in str(e), str(e)
+        return "拒绝"
+    raise AssertionError("C=16 的 video 被接受")
+
+
+check("latent video 通道数错误拒绝", _bad_video_shape)
+
+
+def _unknown_key():
+    from safetensors.torch import save_file
+    p = os.path.join(store.stage_dir, "lat_extra.safetensors")
+    save_file({"video": torch.zeros(1, 24, 2, 2, 2),
+               "audio": torch.zeros(1, 32, 2, 4),
+               "mystery": torch.zeros(1)}, p,
+              metadata={"format": FORMAT_AVLATENT, "requested_length": "124",
+                        "native_fps": "24"})
+    try:
+        load_av_latent(store, "lat_extra.safetensors")
+    except ArtifactError as e:
+        assert "未支持" in str(e), str(e)
+        return "拒绝"
+    raise AssertionError("未知 key 被接受")
+
+
+check("latent 未知 key 拒绝", _unknown_key)
+
+
+def _bad_build():
+    info = save_av_latent(store, make_av(), base_meta(), filename="av_bad.safetensors")
+    try:
+        load_av_latent(store, "av_bad.safetensors",
+                       build_container=lambda v, a, o: tuple([a, v]))
+    except ArtifactError as e:
+        assert "顺序" in str(e) or "内容" in str(e), str(e)
+        return "拒绝"
+    raise AssertionError("注入的 build 调换顺序却没报错")
+
+
+check("build 调换顺序被识别", _bad_build)
+
+print("== cond header 校验与 extensions ==")
+
+
+def _cond_wrong_format():
+    from safetensors.torch import save_file
+    p = os.path.join(store.stage_dir, "cond_wrongfmt.safetensors")
+    save_file({"cond": torch.zeros(1, 4, 8),
+               "minimax_token_tags": torch.zeros(4, dtype=torch.long)}, p,
+              metadata={"format": "h3.avlatent.v1"})
+    try:
+        load_cond(store, "cond_wrongfmt.safetensors")
+    except ArtifactError as e:
+        assert "format" in str(e), str(e)
+        return "拒绝"
+    raise AssertionError("错误 format 的 cond 被接受")
+
+
+check("cond 明确错误 format 拒绝", _cond_wrong_format)
+
+
+def _cond_tags_dtype():
+    from safetensors.torch import save_file
+    p = os.path.join(store.stage_dir, "cond_baddtype.safetensors")
+    save_file({"cond": torch.zeros(1, 4, 8),
+               "minimax_token_tags": torch.zeros(4, dtype=torch.float32)}, p,
+              metadata={"format": FORMAT_COND})
+    try:
+        load_cond(store, "cond_baddtype.safetensors")
+    except ArtifactError as e:
+        assert "整型" in str(e), str(e)
+        return "拒绝"
+    raise AssertionError("浮点 tags 被接受")
+
+
+check("cond tags 非整型拒绝", _cond_tags_dtype)
+
+
+def _cond_1d_tags():
+    """真实 ClipProj 返回 1D tags [seq]；必须接受。"""
+    from safetensors.torch import save_file
+    p = os.path.join(store.stage_dir, "cond_1d.safetensors")
+    save_file({"cond": torch.zeros(1, 9, 16),
+               "minimax_token_tags": torch.zeros(9, dtype=torch.long)}, p,
+              metadata={"format": FORMAT_COND})
+    t, md = load_cond(store, "cond_1d.safetensors")
+    assert tuple(t["minimax_token_tags"].shape) == (9,)
+    return "1D tags 接受"
+
+
+check("cond 1D tags（真实 ClipProj）可读", _cond_1d_tags)
+
+
+def _cond_ext_roundtrip():
+    ext = ("custom_block",)
+    info = save_cond(store, dict(cond_ok, custom_block=torch.ones(1, 2)),
+                     {"mode": "ref2va"}, filename="cond_ext.safetensors",
+                     extensions=ext)
+    md = store.get(info["id"])["metadata"]
+    assert md.get("extensions") == '["custom_block"]', md
+    t, _ = load_cond(store, "cond_ext.safetensors", extensions=ext)
+    assert "custom_block" in t
+    try:
+        load_cond(store, "cond_ext.safetensors")     # 不声明扩展 → 明确拒绝
+    except ArtifactError as e:
+        assert "未支持" in str(e), str(e)
+        return "声明的扩展被真正保存"
+    raise AssertionError("扩展字段未被保存")
+
+
+check("extensions 声明后真正保存并可读回", _cond_ext_roundtrip)
+
+
+def _custom_split_used():
+    """自定义 split_container 必须真的被调用（之前被忽略）。"""
+    called = []
+
+    class Box(object):
+        def __init__(self, a, b):
+            self.first = a
+            self.second = b
+
+    def my_split(container):
+        called.append(1)
+        return container.first, container.second, "video,audio"
+
+    box = Box(torch.zeros(1, 24, 2, 2, 2), torch.zeros(1, 32, 2, 4))
+    tensors, extra = split_av_latent({"samples": box}, split_container=my_split)
+    assert called, "split_container 未被调用"
+    assert extra["container_order"] == "video,audio"
+    return "ok"
+
+
+check("自定义 split_container 被真正使用", _custom_split_used)
 
 print()
 shutil.rmtree(TMP, ignore_errors=True)

@@ -22,6 +22,10 @@
 
 ## 2. 安全路径规则（`validate_stage_name` / `safe_join` / `resolve_any`）
 
+**stage 根本身也要校验**：`ArtifactStore.__init__` 拒绝 stage 目录是 symlink /
+junction / reparse point，并确认 `realpath(stage)` 仍在 `out_dir` 内。否则
+`realpath` 会落到外部，`safe_join` 以它为根反而把逃逸判成“安全”。
+
 下载与引用解析只接受 stage 内**单层文件名**，以下一律返回 `INVALID_PATH`（400）：
 
 | 输入 | 拒绝原因 |
@@ -46,11 +50,22 @@ checkpoint 的绝对路径是另一个受信配置能力，不在这里放开。
 - `atomic_write_bytes` / `ArtifactStore.commit_stream`：同目录 `mkstemp` 唯一
   临时文件 → `write` + `fsync` → `os.replace` 原子改名 → 目录 `fsync`（Windows
   上目录 fsync 尽力而为）。任何异常都删除临时文件，不留半写产物。
-- 预算在写前检查：`stage` 配额（默认 32 GiB）+ 磁盘可用量减预留（默认 2 GiB）。
-  不足返回 `RESOURCE_EXHAUSTED`（503），`budget()` 同时给出 `fits`/`reasons`
-  供 dry-run 报告。
-- 引用保护：consumer 期间 `acquire(id)`，清理与 `delete` 会跳过/拒绝被引用的
-  artifact（`ACTIVE_BINDING` 409）。`cleanup()` 只删过期且未引用的条目。
+- commit 流程：校验 → `reserve()` 预留配额 → 写临时文件 → **按实际字节复核**
+  （临时文件已计入 usage，故从预算里扣除其它预留避免双算）→ 确认目标名仍空 →
+  原子改名 → 写 manifest。manifest 写失败只回滚本次数据文件，**不覆盖**已有
+  artifact。
+- 预算：`stage` 配额（默认 32 GiB）+ 磁盘可用量减预留（默认 2 GiB）。
+  不足返回 `RESOURCE_EXHAUSTED`（503）；`budget()` 同时给出
+  `fits`/`reasons` 供 dry-run 报告。
+- 引用保护：`acquire()` 的存在性检查与加引用在同一把锁内；`delete()` 的引用
+  检查与 unlink、`cleanup()` 的过期检查与删除同样同锁，避免“检查通过后被并发
+  acquire”或“清理删掉 active consumer”。`ACTIVE_BINDING` 为 409。
+- 索引重建（`_load_manifests`）不信任 JSON：拒绝 manifest 自身是 symlink、
+  schema 含多余字段、id 与文件名不一致、`kind` 与 ID 前缀不一致、`filename`
+  不合法、`sha256` 形状错误、数据文件缺失/为 reparse/大小与 `bytes` 不符的条目。
+- `metadata` 在写入前统一 JSON 规范化（键非空且无控制字符；值支持
+  str/int/float/bool/None 与可 JSON 化对象；NaN/Inf 拒绝），失败即 400，
+  不等到 manifest 落盘。
 
 ## 4. cond 格式 `h3.cond.v1`
 
@@ -61,7 +76,12 @@ checkpoint 的绝对路径是另一个受信配置能力，不在这里放开。
 - `minimax_token_tags is None` 时拒绝保存（`INVALID_ARTIFACT` 422）——不能写出
   一个缺必需 key 的"成功"文件。只有已验证的适配器可以传 `synthesize_tags`
   生成等价 tags，并在 metadata 写 `token_tags_source=synthesized`。
-- `tags` 的形状必须是 `cond.shape` 的前缀（`[B,T]` vs `[B,T,C]`）。
+- tags 必须是整型；形状接受真实 ClipProj 的 `[T]`（`tags_from_embeds_info`
+  返回 `torch.ones(seq_len, dtype=long)`）或带 batch 的 `[B,T]`，且必须与
+  `cond` 的 token 维一致（`cond` 至少 `[T,C]`）。
+- `extensions` 声明的字段会**真正保存**（`save_cond` 写
+  `metadata.extensions`），读回时也必须显式传同样的 `extensions`，否则那部分
+  key 会被当成未知字段拒绝（不会静默丢弃）。
 - metadata strings：`format=h3.cond.v1`、`mode`、`width`、`height`、
   `token_tags_source`，以及调用方补充的 TE recipe fingerprint / 参考图摘要。
 - legacy 文件（无 metadata）仍可读；缺必需 key 仍拒绝。
@@ -87,11 +107,33 @@ class NestedTensor:
    tuple。可用 `split_container=` / `build_container=` 注入自定义适配。
 3. 保存 `video`、`audio` 两个 key，各自**原 dtype 的 CPU contiguous** tensor，
    不为省事统一 float32。
-4. `noise_mask` 若存在：嵌套容器拆成 `noise_mask_video` / `noise_mask_audio`
-   （按维度判别，不套 latent 通道规则）；单 tensor 则存 `noise_mask`。
-   `batch_index` 只存字符串摘要（不假装是 tensor）。
-5. **未知字段直接失败**（`INVALID_ARTIFACT` 422 + `unsupported_fields`），
+4. `noise_mask` 若存在：
+   - 嵌套容器拆成 `noise_mask_video` / `noise_mask_audio`（按 5D/4D 维度判别，
+     不套 latent 通道规则）；
+   - 单 tensor 则存 `noise_mask`；
+   - `noise_mask` 与 `noise_mask_video/audio` **不能同时存在**，拆块必须成对，
+     否则 422（不是 KeyError 也不是静默丢一半）。
+5. `batch_index` 只接受 JSON 整数列表（或可 `tolist()` 的整数张量），原样
+   roundtrip；其它形态（字符串、浮点）明确 422，不做截断式字符串化。
+6. **未知字段直接失败**（`INVALID_ARTIFACT` 422 + `unsupported_fields`），
    不静默丢弃。
+
+### 读回：先 header 后 tensor
+
+`load_av_latent` 在读取任何大 tensor 之前，通过 `safe_open` 的
+`get_slice().get_shape()/get_dtype()` 与文件 metadata 完成：
+
+1. 文件字节上限（`MAX_AVLATENT_BYTES`，超限 413）；
+2. `format == h3.avlatent.v1`，`requested_length`/`native_fps` 必须存在且
+   `native_fps == 24`（缺失不再被静默补 0）；
+3. key 白名单；`noise_mask_video/audio` 必须成对且不与 `noise_mask` 共存；
+4. `video` 必须是 `[B,24,T,H,W]`、`audio` 必须是 `[B,32,2,T]` 且 batch 一致、
+   二者为浮点 dtype；
+5. 只有全部通过才 `get_tensor()` 真正读数据。
+
+`load_cond` 同样先做 header 校验：恰好 `format` 为空（legacy）或
+`h3.cond.v1`（明确写别的 format 一律 422）、cond 至少 `[T,C]` 浮点、
+tags 1D/2D 整型且与 token 维匹配，然后才读 tensor。
 
 metadata strings：
 
