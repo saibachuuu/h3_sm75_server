@@ -62,6 +62,10 @@ class VaeBackend(GroupBackend):
         vae.first_stage_model.requires_grad_(False)
         vae.patcher.offload_device = torch.device("cpu")
         self.obj = vae
+        if self.video:
+            self.runtime.vvae = vae
+        else:
+            self.runtime.avae = vae
 
     def move_to(self, device):
         if self.obj is None:
@@ -76,6 +80,10 @@ class VaeBackend(GroupBackend):
             except Exception:
                 pass
             refs.append(self._release_ref(self.obj))
+        if self.video:
+            self.runtime.vvae = None
+        else:
+            self.runtime.avae = None
         self.obj = None
         return refs
 

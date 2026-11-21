@@ -44,6 +44,7 @@ class DitBackend(GroupBackend):
         self.shapes = None
         self.metadata = None
         self._catalog_ready = False
+        self._patcher_pair = None
 
     # ---------------------------------------------------------- recipe/catalog
     def configured(self):
@@ -234,6 +235,7 @@ class DitBackend(GroupBackend):
             raise
         finally:
             gc.collect()
+        self._ensure_patchers()
         return self._summary(
             "disk2ram", units, completed=completed,
             extra={"not_attempted": [u for u in units if u not in completed],
@@ -267,6 +269,7 @@ class DitBackend(GroupBackend):
                     % (uid, audit["device"]), 500, True, audit)
             completed.append(uid)
         after = self._cuda_bytes(torch)
+        self._refresh_patcher_sizes()
         print("[dit] ram2vram %d units | cuda %.2f -> %.2f GB"
               % (len(completed), before / 1e9, after / 1e9), flush=True)
         return self._summary("ram2vram", units, completed=completed,
@@ -341,6 +344,62 @@ class DitBackend(GroupBackend):
         return self._summary("purgefromram", units, completed=completed,
                              extra={"all_absent": not remaining})
 
+    # ---------------------------------------------------------- patcher 外壳
+    def _all_units_resident(self):
+        if self.catalog is None:
+            return False
+        return all(self.registry.unit_record(MODEL_ID, unit)["state"]
+                   in ("ram", "vram") for unit in self.catalog.unit_ids())
+
+    def _ensure_patchers(self):
+        """全量物化后包装成可采样的 (unet, model_shifted)。
+
+        只做 metadata/采样外壳：不重读权重、不 load、不 cast。B 的
+        wrap_h3_skeleton 用私有 disable 开关跳过第二次大模型构造，再把现有
+        skeleton 绑到 BaseModel 上。
+        """
+        if self._patcher_pair is not None or self.model is None:
+            return self._patcher_pair
+        if not self._all_units_resident():
+            return None
+        import torch
+        import comfy.supported_models as supported
+        import comfy.model_base as model_base
+        import comfy.model_patcher as model_patcher
+        from comfy_extras.nodes_minimax_h3 import MiniMaxH3SigmaShift
+        from dit_svc.h3_patcher import wrap_h3_skeleton
+
+        self._stage("DiT 采样外壳（BaseModel/ModelPatcher + SigmaShift）")
+        pair = wrap_h3_skeleton(
+            self.model, self.unet_config, torch_mod=torch,
+            supported_models_mod=supported, model_base_mod=model_base,
+            model_patcher_mod=model_patcher,
+            sigma_shift_node=MiniMaxH3SigmaShift,
+            load_device=torch.device("cuda:0"),
+            offload_device=torch.device("cpu"),
+            inference_dtype=torch.bfloat16,
+            manual_cast_dtype=torch.bfloat16,
+            quant_config=self.quant_config)
+        self._patcher_pair = pair
+        self.runtime.unet = pair.unet
+        self.runtime.model_shifted = pair.model_shifted
+        self.runtime.diff_model = self.model
+        print("[dit] patcher 外壳就绪: unet=%s shifted=%s"
+              % (type(pair.unet).__name__, type(pair.model_shifted).__name__),
+              flush=True)
+        return pair
+
+    def _refresh_patcher_sizes(self):
+        if self._patcher_pair is None:
+            return
+        from dit_svc.h3_patcher import invalidate_patcher_sizes
+        cuda_bytes = sum(
+            int(self.registry.unit_record(MODEL_ID, unit)["resident_bytes_cuda"])
+            for unit in self.catalog.unit_ids())
+        invalidate_patcher_sizes(
+            self._patcher_pair.unet, self._patcher_pair.model_shifted,
+            model_loaded_weight_memory=cuda_bytes)
+
     # ---------------------------------------------------------- 账目
     def _refresh_unit(self, uid, expect_loaded=True):
         inventory = W.storage_inventory(
@@ -406,6 +465,10 @@ class DitBackend(GroupBackend):
 
     def _release_model(self):
         refs = []
+        self.runtime.unet = None
+        self.runtime.model_shifted = None
+        self.runtime.diff_model = None
+        self._patcher_pair = None
         if self.model is not None:
             refs.append(self._release_ref(self.model))
         self.model = None
