@@ -12,6 +12,7 @@ import gc
 import os
 import shutil
 import sys
+import threading
 import time
 import traceback
 
@@ -31,12 +32,21 @@ def find_ffmpeg():
 
 
 class Runtime:
-    """服务级常驻状态。load() 在后台线程执行，ready 前拒绝任务。"""
+    """Environment availability and compute readiness are separate states."""
 
     def __init__(self, args, rt):
         self.args = args
         self.rt = rt                    # infer_h3_turing 模块（工具函数来源）
-        self.ready = False
+        self.env_ready = False
+        self.compute_ready = False
+        self.device_healthy = True
+        self._env_lock = threading.RLock()
+        self.torch = None
+        self.mm = None
+        self.attention = None
+        self.minimax_model = None
+        self.comfy_kitchen = None
+        self.device = None
         self.error = None
         self.stage = "初始化"
         self.stage_t0 = time.perf_counter()
@@ -50,7 +60,7 @@ class Runtime:
         self.attn_override = None
         self.veda_patch = None      # --attn veda 时：star7 VedaPatch（运行期统计）
         self.ffmpeg = None
-        self.attn = args.attn
+        self.attn = getattr(args, "attn", "none")
         # 分块卸载 / 文本编码器常驻（--offload-dit-blocks / --te-gguf / --te-4b）
         self.offloaded_blocks = []
         self.text_encoder = None
@@ -58,6 +68,113 @@ class Runtime:
         self.te_load_s = 0.0
         self.te_swaps = 0           # 已发生的 VAE↔TE 交换次数
         self._te_step_state = {}    # 原子化 TE encode 状态机
+        self.weights = None
+
+    @property
+    def ready(self):
+        """Legacy compute-ready field; control APIs must instead use env_ready."""
+        return self.compute_ready
+
+    @ready.setter
+    def ready(self, value):
+        self.compute_ready = bool(value)
+
+    def ensure_env(self):
+        """Initialize dependencies without constructing any weighted model.
+
+        Quant kernels, decode patches and attention optimization are deferred
+        to explicit operations. Failure remains visible to diagnostic APIs.
+        """
+        with self._env_lock:
+            if self.env_ready:
+                return
+            self.set_stage("初始化 ComfyUI 环境（不加载权重）")
+            try:
+                import torch
+                import comfy.options
+                comfy.options.enable_args_parsing(True)
+                import comfy.cli_args
+                comfy.cli_args.args.gpu_only = True
+                import comfy.sd
+                import comfy.model_management as mm
+                import comfy.ldm.modules.attention as attention
+                import comfy.ldm.minimax.model as minimax_model
+                import comfy_kitchen
+                ffmpeg = find_ffmpeg()
+                if not ffmpeg:
+                    raise RuntimeError("ffmpeg unavailable; configure it before inference")
+                self.torch = torch
+                self.mm = mm
+                self.attention = attention
+                self.minimax_model = minimax_model
+                self.comfy_kitchen = comfy_kitchen
+                self.device = torch.device("cuda:0")
+                self.ffmpeg = ffmpeg
+                self.error = None
+                self.env_ready = True
+                self.set_stage("环境就绪（无权重）")
+            except Exception as exc:
+                self.env_ready = False
+                self.error = "%s: %s" % (type(exc).__name__, exc)
+                self.set_stage("环境初始化失败")
+                traceback.print_exc()
+                raise
+
+    def weights_snapshot(self):
+        """A cheap metadata snapshot; startup never opens checkpoint files."""
+        snapshot = self.weights.snapshot() if self.weights is not None else {"models": {}}
+        models = snapshot.setdefault("models", {})
+        for model_id in ("dit", "vae.video", "vae.audio", "te", "veda.bundle"):
+            models.setdefault(model_id, {
+                "model_id": model_id, "state": "absent", "generation": 0,
+                "catalog_ready": False, "units": [], "bytes_cpu": 0, "bytes_cuda": 0,
+            })
+        snapshot["ok"] = True
+        return snapshot
+
+    def capabilities(self):
+        models = self.weights_snapshot()["models"]
+        needs = {"encode": ("te",), "sample": ("dit",),
+                 "decode": ("vae.video", "vae.audio"),
+                 "video_from_cond": ("dit", "vae.video", "vae.audio")}
+        result = {}
+        for name, required in needs.items():
+            missing = [model for model in required if models[model]["state"] != "vram"]
+            result[name] = {"ready": self.env_ready and self.device_healthy and not missing,
+                            "missing": missing}
+        return result
+
+    def job_admission(self, job):
+        """Cheap locked admission hook; specific unit requirements follow in P2/P3."""
+        from dit_svc.operations import OperationError
+        capability = "decode" if job.kind == "vae_probe" else "video_from_cond"
+        required = ("vae.video",) if job.kind == "vae_probe" else ("dit", "vae.video", "vae.audio")
+        models = self.weights_snapshot()["models"]
+        missing = [model for model in required if models[model]["state"] != "vram"]
+        if missing:
+            raise OperationError("MISSING_UNITS", "任务所需权重尚未在显存中", 409, False,
+                                 {"capability": capability, "missing": missing})
+
+    def require_job_execution(self, job):
+        self.job_admission(job)
+
+    def operation_admission(self, kind, payload):
+        from dit_svc.operations import OperationError
+        if not self.env_ready:
+            raise OperationError("ENV_NOT_READY", self.error or "环境尚未就绪", 503, True)
+        if not self.device_healthy:
+            raise OperationError("DEVICE_UNHEALTHY", "CUDA 设备不可用，需检查或重启", 503, False)
+
+    def operation_synchronize(self, operation):
+        if self.torch is not None and self.torch.cuda.is_initialized():
+            try:
+                self.torch.cuda.synchronize()
+            except Exception:
+                self.device_healthy = False
+                raise
+
+    def job_synchronize(self, job):
+        self.operation_synchronize(job)
 
     # ---------- 阶段上报 ----------
     def set_stage(self, name):

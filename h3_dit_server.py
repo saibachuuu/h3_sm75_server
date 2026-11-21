@@ -1,7 +1,7 @@
 """入口 B（远程）：H3 DiT 生成服务 + WebUI（连续生成，模型常驻）。
 
 用法（远程 python_embeded）：
-  python h3_dit_server.py [--port 8190] [--attn int8] [--out-dir outputs]
+  python h3_dit_server.py [--port 8190] [--defaults-file paths.json] [--out-dir outputs]
 
 推荐的本机连接方式（一条命令同时开双向隧道；或直接跑本目录 tunnel.ps1）：
   ssh -N -p 56622 -L 8190:127.0.0.1:8190 -R 9310:127.0.0.1:8189 sheepserver@bwg.aki.pm
@@ -10,13 +10,12 @@
 说明：
   - 依赖 h3-runner 的 infer_h3_turing.py / h3_mlp_chunk.py 作为库（--runner-dir 自动探测）；
   - **不含 warmup 逻辑**（DiT 部分 warmup 已按需求删除）；
-  - attention 默认 int8；sage/w8a8 仅为调试档（sage 全尺寸已知 0/2 崩，见事故报告）。
+  - 启动不加载权重、不主动安装 attention 优化；所有模型动作通过 API 执行。
 """
 import argparse
+import json
 import os
 import sys
-import threading
-import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -43,69 +42,52 @@ def find_runner_dir(explicit=None):
     return None
 
 
-def main():
-    ap = argparse.ArgumentParser(description="H3 DiT 生成服务（模型常驻 + 串行队列 + WebUI）")
+def parse_args(argv=None):
+    """Process settings only; pin paths before runner changes cwd."""
+    ap = argparse.ArgumentParser(description="H3 DiT 空壳服务（模型与 attention 通过 API 控制）")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=DEFAULT_DIT_PORT)
     ap.add_argument("--runner-dir", default=None, help="h3-runner 目录（默认自动探测）")
     ap.add_argument("--cond-url", default=DEFAULT_COND_URL,
                     help="本机 cond server（经 ssh -R 9310 -> 8189 的回调地址）")
-    ap.add_argument("--unet", default=DEFAULT_UNET)
-    ap.add_argument("--video_vae", default=DEFAULT_VIDEO_VAE)
-    ap.add_argument("--audio_vae", default=DEFAULT_AUDIO_VAE)
-    ap.add_argument("--light-vae", action="store_true",
-                    help="视频 VAE 用 LynnReal Light 版（decoder 26 层，省 ~0.7GB 权重）")
-    ap.add_argument("--offload-dit-blocks", type=int, default=0, metavar="N",
-                    help="加载完毕后把这 N 个 DiT blocks（自 blocks.0 起）搬到 RAM，腾出显存；"
-                         "0=不卸。实测中间块约 0.2GB、首两块约 0.4GB，10 块约还 2.3GB")
-    ap.add_argument("--te-gguf", default=None,
-                    help="文本编码器主权重 GGUF；加载后整份常驻 RAM（cpu），不占显卡")
-    ap.add_argument("--te-mmproj", default=None,
-                    help="文本编码器视觉塔 mmproj GGUF（与 --te-gguf 配套）")
-    ap.add_argument("--te-4b", default=None,
-                    help="4B 文本编码器 safetensors（ComfyUI int8_convrot 格式）；"
-                         "加载后整份常驻 RAM，encode 时才上卡，配合 --te-proj 使用")
-    ap.add_argument("--te-proj", default=None,
-                    help="ClipProj 投影文件名（放在 ComfyUI/models/clip_projections/ 下），"
-                         "把 4B 的 2560 维 hidden 投到 H3 要的 5120 维")
-    ap.add_argument("--attn", choices=["int8", "sage", "w8a8", "sdpa", "veda"], default="int8",
-                    help="服务级 attention 后端（int8=已验证默认；sage/w8a8=调试档；veda=dev 实验）")
-    ap.add_argument("--veda-bundle", default=DEFAULT_VEDA_BUNDLE,
-                    help="Veda predictor bundle (.safetensors)，--attn veda 时必填")
-    ap.add_argument("--veda-keep-tiles", type=int, default=0,
-                    help="每个 query tile 保留的 key tile 数（star7 预算语义）；"
-                         "0=用 bundle 训练默认值（r2va bundle 是 32）")
-    ap.add_argument("--veda-ref-keep-tiles", type=int, default=-1,
-                    help="reference 块（首尾帧/参考图/视频）每 query tile 保留的 key "
-                         "tile 数；-1=跟随 --veda-keep-tiles")
-    ap.add_argument("--veda-keep", type=float, default=0.0,
-                    help="按比例的保留率 (0,1]（star7 Budget.ratio 语义）；"
-                         "与 --veda-keep-tiles 二选一，tiles 优先")
-    ap.add_argument("--veda-dense-layers", default="",
-                    help="保持全量注意力的 DiT block 索引，如 '0,1,49'（0 基）")
-    ap.add_argument("--veda-dense-steps", default="",
-                    help="保持全量注意力的采样步索引，如 '0'（0 基，第一步）")
-    ap.add_argument("--veda-tile-precision", choices=["fp32", "fp16"], default="fp32",
-                    help="VEDA 打分（tile_logits 三个 bmm）精度：fp32=上游默认行为；"
-                         "fp16 走 sm75 HMMA（实验项，需同参 A/B 验证画质；"
-                         "sm75 的 bf16 本来就无张量核，fp16 是硬件快路）")
-    ap.add_argument("--veda-chunk-share", type=int, default=16,
-                    help="VEDA head chunk 大小 = 剩余显存 // N（上游默认 16）。"
-                         "显存富余（如当前 ~3.8GB）时调小（如 8）可减少 kernel "
-                         "launch 次数；=1 表示一次吃完剩余显存，慎用")
-    ap.add_argument("--veda-warmup", choices=["off", "probe", "tier1", "tier2", "tier3"],
-                    default="probe", help="Veda/sage 启动 warmup 负载分级（默认 probe 最小）")
-    ap.add_argument("--veda-debug", action="store_true",
-                    help="Veda 调试日志：tile plan/keep 与每 forward 的 sparse_calls")
-    ap.add_argument("--dump-module-dtypes", action="store_true",
-                    help="加载后打印 DiT 每个带权模块的 dtype/quant 标记 + 汇总（查 bf16 仿算层）")
-    ap.add_argument("--w4a8_backend", choices=["turingutils", "cublas"], default="turingutils")
-    ap.add_argument("--mlp_chunk", type=int, default=8192)
+    ap.add_argument("--defaults-file", help="JSON model recipes (no automatic loading)")
+    ap.add_argument("--w4a8-backend", "--w4a8_backend", dest="w4a8_backend",
+                    choices=["turingutils", "cublas"], default="turingutils")
     ap.add_argument("--out-dir", default=os.path.join(HERE, "outputs"))
-    args = ap.parse_args()
-    if args.light_vae and args.video_vae == DEFAULT_VIDEO_VAE:
-        args.video_vae = DEFAULT_VIDEO_VAE_LIGHT
-        print("[entry] light VAE: %s" % args.video_vae, flush=True)
+    args = ap.parse_args(argv)
+    args.out_dir = os.path.abspath(args.out_dir)
+    if args.runner_dir:
+        args.runner_dir = os.path.abspath(args.runner_dir)
+    args.model_recipes = {}
+    if args.defaults_file:
+        args.defaults_file = os.path.abspath(args.defaults_file)
+        try:
+            with open(args.defaults_file, encoding="utf-8-sig") as source:
+                config = json.load(source)
+            if not isinstance(config, dict) or set(config) != {"models"}:
+                raise ValueError("defaults JSON must contain only a models object")
+            if not isinstance(config["models"], dict):
+                raise ValueError("models must be a JSON object")
+            known = {"dit", "vae.video", "vae.audio", "te", "veda.bundle"}
+            for model, recipe in config["models"].items():
+                if model not in known or not isinstance(recipe, dict):
+                    raise ValueError("invalid model recipe: %s" % model)
+                for key in ("path", "mmproj"):
+                    value = recipe.get(key)
+                    if value is not None:
+                        if not isinstance(value, str) or not value:
+                            raise ValueError("%s.%s must be a nonempty path" % (model, key))
+                        recipe[key] = os.path.abspath(value)
+            args.model_recipes = config["models"]
+        except (OSError, ValueError) as exc:
+            ap.error("invalid --defaults-file: %s" % exc)
+    args.attn = "none"
+    args.mlp_chunk = 8192
+    return args
+
+
+def main():
+    args = parse_args()
     # argv 清干净，避免 comfy.cli_args 读到外部参数（embed_h3 同款卫生）
     sys.argv = [sys.argv[0]]
 
@@ -130,23 +112,18 @@ def main():
     }
     queue = QueueManager(runtime, ctx)
 
-    # 模型加载放后台线程：HTTP 先起来（WebUI 显示加载进度），ready 前拒绝提交
-    loader = threading.Thread(target=runtime.load, name="h3-loader", daemon=True)
-    loader.start()
+    # Only initialize the environment. Never start the legacy model loader.
+    try:
+        runtime.ensure_env()
+    except Exception:
+        # Recorded on runtime; keep diagnostic APIs available.
+        pass
 
     print("", flush=True)
     print("=" * 72, flush=True)
     print(" H3 DiT server | WebUI: http://%s:%d/" % (args.host, args.port), flush=True)
-    print(" attention=%s  w4a8=%s  mlp_chunk=%d  cond=%s"
-          % (args.attn, args.w4a8_backend, args.mlp_chunk, args.cond_url), flush=True)
-    if args.attn == "veda":
-        print(" veda bundle=%s keep_tiles=%s dense_layers=%r dense_steps=%r"
-              % (os.path.basename(args.veda_bundle),
-                 args.veda_keep_tiles or "bundle默认",
-                 args.veda_dense_layers or "-",
-                 args.veda_dense_steps or "-"), flush=True)
-        print(" veda tuning tile_precision=%s chunk_share=%d（上游默认 fp32/16）"
-              % (args.veda_tile_precision, args.veda_chunk_share), flush=True)
+    print(" attention=none (factory; no override installed)  cond=%s" % args.cond_url, flush=True)
+    print("[entry] 空壳启动：未加载任何权重；环境就绪=%s" % runtime.env_ready, flush=True)
     print(" 本机隧道（一条命令开双向）:", flush=True)
     print("   ssh -p <port> -L %d:localhost:%d -R 9310:localhost:8189 sheepserver@<host>"
           % (args.port, args.port), flush=True)

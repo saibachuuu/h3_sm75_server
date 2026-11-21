@@ -83,6 +83,14 @@ class OperationError(Exception):
         """把 callback/preflight 抛出的普通异常归类成新协议错误。"""
         if isinstance(exc, cls):
             return exc
+        # Subsystem errors remain stdlib-importable and need not import this
+        # module. Preserve their protocol category instead of turning 409/422
+        # into an unhelpful generic 500 at the worker boundary.
+        code = getattr(exc, "code", None)
+        status = getattr(exc, "http_status", None)
+        if isinstance(code, str) and isinstance(status, int) and 400 <= status <= 599:
+            return cls(code, str(exc), status, getattr(exc, "retryable", False),
+                       getattr(exc, "details", None))
         if isinstance(exc, ValueError):
             return cls("INVALID_REQUEST", str(exc), 400, False,
                        {"exception": type(exc).__name__})

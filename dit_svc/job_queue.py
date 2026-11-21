@@ -669,6 +669,7 @@ class QueueManager:
     def _run_job(self, job):
         """旧 job 的执行分发；保持原有异常字段/日志/完成语义。"""
         print("[queue] running %s (%s)" % (job.id, job.kind), flush=True)
+        terminal_status, terminal_stage = "done", "完成"
         try:
             # 执行前重验：提交后到真正开跑之间，weights/env 可能已变化。
             hook = getattr(self.runtime, "require_job_execution", None)
@@ -685,11 +686,8 @@ class QueueManager:
             else:
                 from dit_svc import pipeline
                 pipeline.run_job(job, self.ctx)
-            job.status = "done"
-            job.stage = "完成"
         except Exception as e:
-            job.status = "failed"
-            job.stage = "失败"
+            terminal_status, terminal_stage = "failed", "失败"
             if isinstance(e, OperationError):
                 job.error = "%s: %s" % (e.code, e.message)
             else:
@@ -699,7 +697,23 @@ class QueueManager:
             traceback.print_exc()
             print("[queue] job %s FAILED: %s" % (job.id, job.error), flush=True)
         finally:
-            job.finished = time.time()
+            # Legacy jobs use the same GPU lifetime boundary as new operations.
+            # Keep their reservation running until asynchronous work is drained.
+            for name in ("job_cleanup", "job_synchronize"):
+                hook = getattr(self.runtime, name, None)
+                if callable(hook):
+                    try:
+                        hook(job)
+                    except Exception as exc:
+                        terminal_status, terminal_stage = "failed", "失败"
+                        if not job.error:
+                            job.error = "%s: %s" % (type(exc).__name__, exc)
+                        job.log.append("ERROR: %s: %s" % (name, exc))
+            with self._cond:
+                job.status = terminal_status
+                job.stage = terminal_stage
+                job.finished = time.time()
+                self._cond.notify_all()
 
     def _operation_cleanup(self, op):
         """callback 后、terminal 前的可选 cleanup/synchronize hooks。

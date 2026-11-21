@@ -6,6 +6,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from common.protocol import DEFAULTS, DIRECTOR_MAX_SHOTS, SAMPLERS, SCHEDULERS, dumps
+from dit_svc.operations import OperationError
 
 WEBUI_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webui")
 MAX_BODY = 96 * 1024 * 1024
@@ -152,6 +153,14 @@ def make_handler(runtime, queue, ctx):
             snap = queue.snapshot(limit=1)
             return {
                 "ready": runtime.ready,
+                "env_ready": getattr(runtime, "env_ready", runtime.ready),
+                "compute_ready": getattr(runtime, "compute_ready", runtime.ready),
+                "device_healthy": getattr(runtime, "device_healthy", True),
+                "api_version": 2,
+                "executor": queue.executor_state(),
+                "capabilities": runtime.capabilities(),
+                "requirements_are_request_dependent": True,
+                "weights": runtime.weights_snapshot()["models"],
                 "error": runtime.error,
                 "stage": runtime.stage,
                 "stage_elapsed": round(runtime.stage_elapsed(), 1),
@@ -186,7 +195,35 @@ def make_handler(runtime, queue, ctx):
                     self._json({"ok": False, "error": str(e)}, 500)
             elif path == "/api/defaults":
                 self._json({"defaults": DEFAULTS, "sampler": SAMPLERS,
-                            "scheduler": SCHEDULERS, "director": DIRECTOR_DEFAULTS})
+                            "scheduler": SCHEDULERS, "director": DIRECTOR_DEFAULTS,
+                            "model_recipes": getattr(runtime.args, "model_recipes", {})})
+            elif path == "/api/weights":
+                self._json(runtime.weights_snapshot())
+            elif path.startswith("/api/weights/"):
+                model_id = path[len("/api/weights/"):]
+                model = runtime.weights_snapshot()["models"].get(model_id)
+                if model is None:
+                    err = OperationError("MODEL_NOT_FOUND", "未知模型", 404, False)
+                    self._json({"ok": False, "error": err.to_dict()}, 404)
+                else:
+                    self._json({"ok": True, "model": model})
+            elif path == "/api/operations":
+                try:
+                    query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    limit = int(query.get("limit", ["20"])[0])
+                    if not 1 <= limit <= 200:
+                        raise ValueError("limit must be between 1 and 200")
+                    self._json({"ok": True, **queue.operations_snapshot(limit)})
+                except ValueError as exc:
+                    err = OperationError("INVALID_REQUEST", str(exc), 400, False)
+                    self._json({"ok": False, "error": err.to_dict()}, 400)
+            elif path.startswith("/api/operations/"):
+                operation = queue.get_operation(path[len("/api/operations/"):])
+                if operation is None:
+                    err = OperationError("OPERATION_NOT_FOUND", "操作不存在", 404, False)
+                    self._json({"ok": False, "error": err.to_dict()}, 404)
+                else:
+                    self._json({"ok": True, "operation": operation.public(include_log=True)})
             elif path == "/api/jobs":
                 self._json(queue.snapshot())
             elif path.startswith("/api/jobs/"):
@@ -212,7 +249,17 @@ def make_handler(runtime, queue, ctx):
         # ---------------- POST ----------------
         def do_POST(self):
             path = urllib.parse.urlparse(self.path).path
-            if path == "/api/jobs":
+            if path.startswith("/api/operations/") and path.endswith("/cancel"):
+                operation_id = path[len("/api/operations/"):-len("/cancel")]
+                try:
+                    if self.headers.get("Content-Length", "0") != "0":
+                        payload = self._read_json_body()
+                        if not isinstance(payload, dict):
+                            raise OperationError("INVALID_REQUEST", "请求体必须是 JSON 对象", 400, False)
+                    self._json({"ok": True, "operation": queue.cancel_operation(operation_id)})
+                except OperationError as exc:
+                    self._json({"ok": False, "error": exc.to_dict()}, exc.http_status)
+            elif path == "/api/jobs":
                 payload = self._read_json_body()
                 if payload is None:
                     self._json({"ok": False, "error": "请求体不是合法 JSON 或过大"}, 400)

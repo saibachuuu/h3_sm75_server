@@ -34,3 +34,16 @@ Four children created; no model duplicated. Slot E remains unused, not replaced 
 - Child scopes are non-overlapping; shared interface changes are communicated using their existing session IDs.
 - Before integrating: inspect each commit/diff, run focused tests, resolve interface assumptions, then cherry-pick reviewed commits.
 - Record review findings and integrated commit IDs in `implementation_notes.md`; a phase is not complete merely because a child committed code.
+
+## Primary review history
+
+- B `6ca7535` / `0d101db`: personally reviewed and integrated as `6de0165`
+  / `e3bfcac`; readiness, atomic admission, retained inputs/errors and
+  synchronization-before-terminal regressions passed.
+- A `9353342` / `66467fe` / `9e5464e` / `0c9023f`: review continues; actual
+  meta construction and strict quantized materialization require additional
+  proof/corrections before use. Session A is reused for every follow-up.
+- D `083b885` / `b3169d6` / `e3b95f7` / `5dddcbf`: reviewed and locally
+  retested; additional concrete storage/serialization corrections requested
+  in the same session D, not a replacement agent.
+- C: original assigned work still pending acceptance; no replacement agent.
