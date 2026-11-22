@@ -71,6 +71,9 @@ class Runtime:
         self.veda_patch = None      # --attn veda 时：star7 VedaPatch（运行期统计）
         self.ffmpeg = None
         self.attn = getattr(args, "attn", "none")
+        # 运行时 attention 档位（attn.install）：factory 快照与最后一次成功安装的请求
+        self._attn_factory = None
+        self._attn_installed_request = None
         # 分块卸载 / 文本编码器常驻（--offload-dit-blocks / --te-gguf / --te-4b）
         self.offloaded_blocks = []
         self.text_encoder = None
@@ -204,6 +207,14 @@ class Runtime:
         if kind in ("infer.encode", "infer.te_probe"):
             # 只查状态，不自动上卡；缺资源时给有序建议。
             self.weights.preflight_encode(None)
+        if kind == "attn.install":
+            # 便宜检查（持锁）：DiT 采样外壳必须就绪；安装本体在 worker 里执行。
+            if self.unet is None or self.model_shifted is None:
+                raise OperationError(
+                    "ATTN_NOT_READY",
+                    "DiT 采样外壳未就绪；先完成 dit 全量 disk2ram（补齐全部 unit）",
+                    409, False,
+                    {"hint": "POST /api/weights/dit/disk2ram {\"mode\":\"all\"}"})
 
     def run_weights_action(self, model_id, action, request, operation=None):
         """weights.<action> 的唯一执行入口（单 worker 调用）。"""
@@ -215,6 +226,11 @@ class Runtime:
 
     def run_infer_te_probe(self, request, operation=None):
         return self.weights.probe(request, operation)
+
+    def run_attn_install(self, request, operation=None):
+        """attn.install 的唯一执行入口（单 worker 调用）。"""
+        from dit_svc import attn_service
+        return attn_service.install(self, request, operation)
 
     def operation_synchronize(self, operation):
         if self.torch is not None and self.torch.cuda.is_initialized():

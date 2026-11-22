@@ -78,6 +78,7 @@ PHASES = {"p0": P0_SPECS, "p1": P1_SPECS,
               TestSpec("te_probe", "_selftest_te_probe.py"),
               TestSpec("weight_api", "_selftest_weight_api.py"),
               TestSpec("h3_patcher", "_selftest_h3_patcher.py"),
+              TestSpec("attn_api", "_selftest_attn_api.py"),
           )}
 PHASE_ORDER = ("p0", "p1", "p2")
 STATUS_ORDER = ("passed", "failed", "timeout", "error", "not-covered")

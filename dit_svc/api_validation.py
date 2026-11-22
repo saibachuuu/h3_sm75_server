@@ -513,6 +513,94 @@ def validate_te_probe_request(payload):
     return validate_request(payload)
 
 
+# ------------------------------------------------------------------ attn.install
+
+ATTN_MODES = ("int8", "sdpa", "sage", "w8a8", "veda", "none")
+ATTN_VEDA_WARMUP = ("off", "probe", "tier1", "tier2", "tier3")
+
+_VEDA_LIST_ITEM_RE = re.compile(r"^\d+(-\d+)?$")
+
+
+def _veda_int_list(value, field):
+    """"0,1,47-49" 形式的 0 基闭区间列表；空串合法（=不指定）。"""
+    text = value.strip()
+    if not text:
+        return ""
+    parts = [p.strip() for p in text.split(",")]
+    if any(not p for p in parts):
+        raise invalid("veda.%s 列表不能有空项" % field, field=field)
+    for part in parts:
+        if not _VEDA_LIST_ITEM_RE.match(part):
+            raise invalid("veda.%s 只接受数字/闭区间（如 \"0,1,47-49\"）" % field,
+                          field=field)
+        if "-" in part:
+            lo, hi = (int(x) for x in part.split("-", 1))
+            if lo > hi:
+                raise invalid("veda.%s 区间起点大于终点: %s" % (field, part),
+                              field=field)
+            if hi > 63:
+                raise invalid("veda.%s 索引超出 DiT 层数上限 63" % field, field=field)
+        elif int(part) > 63:
+            raise invalid("veda.%s 索引超出 DiT 层数上限 63" % field, field=field)
+    return text
+
+
+def validate_attn_install_request(payload):
+    """POST /api/attention/install 的严格校验（api_version=2）。"""
+    _require_object(payload)
+    _reject_unknown(payload, {"mode", "veda", "request_id"})
+    mode = payload.get("mode")
+    if not isinstance(mode, str) or mode not in ATTN_MODES:
+        raise invalid("mode 必须是 %s 之一" % "|".join(ATTN_MODES), field="mode")
+    veda_in = payload.get("veda")
+    if veda_in is None:
+        veda_in = {}
+    elif not isinstance(veda_in, dict):
+        raise invalid("veda 必须是 JSON 对象", field="veda")
+    elif mode != "veda":
+        raise invalid("veda 参数只在 mode=veda 时接受", field="veda")
+    _reject_unknown(veda_in, {"keep_tiles", "ref_keep_tiles", "keep_ratio",
+                               "dense_layers", "dense_steps", "tile_precision",
+                               "chunk_share", "warmup", "debug"},
+                    where="veda")
+    keep_ratio = veda_in.get("keep_ratio")
+    if keep_ratio is not None and (isinstance(keep_ratio, bool)
+                                   or not isinstance(keep_ratio, (int, float))
+                                   or not 0.0 <= float(keep_ratio) <= 1.0):
+        raise invalid("veda.keep_ratio 必须是 [0,1] 内的数字", field="keep_ratio")
+    tile_precision = veda_in.get("tile_precision")
+    if tile_precision is not None and tile_precision not in ("fp32", "fp16"):
+        raise invalid("veda.tile_precision 只接受 fp32 或 fp16", field="tile_precision")
+    warmup = veda_in.get("warmup")
+    if warmup is not None and warmup not in ATTN_VEDA_WARMUP:
+        raise invalid("veda.warmup 必须是 %s 之一" % "|".join(ATTN_VEDA_WARMUP),
+                      field="warmup")
+    for field in ("dense_layers", "dense_steps"):
+        value = veda_in.get(field)
+        if value is not None and (not isinstance(value, str)
+                                   or len(value) > MAX_REQUEST_ID_LEN):
+            raise invalid("veda.%s 必须是不长于 %d 字符的字符串"
+                          % (field, MAX_REQUEST_ID_LEN), field=field)
+    veda = {
+        "keep_tiles": _strict_int(veda_in, "keep_tiles", 0, lo=0, hi=1024,
+                                   where="veda"),
+        "ref_keep_tiles": _strict_int(veda_in, "ref_keep_tiles", -1, lo=-1, hi=1024,
+                                       where="veda"),
+        "keep_ratio": (round(float(keep_ratio), 6) if keep_ratio is not None
+                       else None),
+        "dense_layers": (_veda_int_list(veda_in["dense_layers"], "dense_layers")
+                          if veda_in.get("dense_layers") is not None else ""),
+        "dense_steps": (_veda_int_list(veda_in["dense_steps"], "dense_steps")
+                         if veda_in.get("dense_steps") is not None else ""),
+        "tile_precision": tile_precision or "fp32",
+        "chunk_share": _strict_int(veda_in, "chunk_share", 16, lo=1, hi=1024,
+                                   where="veda"),
+        "warmup": warmup or "probe",
+        "debug": _strict_bool(veda_in, "debug", False, where="veda"),
+    }
+    return {"mode": mode, "veda": veda, "request_id": _request_id(payload)}
+
+
 # ------------------------------------------------------------------ infer.sample
 
 _SAMPLE_ALLOWED = {"cond_artifact", "cond_file", "cond_b64", "image_b64s",

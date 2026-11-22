@@ -240,6 +240,33 @@ def make_handler(runtime, queue, ctx):
                 self._json({"ok": False, "error": error.to_dict()},
                            error.http_status)
 
+        def _post_attn_install(self):
+            """POST /api/attention/install → 202 operation receipt."""
+            payload = self._read_json_body()
+            if payload is None:
+                self._json({"ok": False, "error": {
+                    "code": "INVALID_REQUEST", "message": "请求体必须是 JSON 对象",
+                    "http_status": 400, "retryable": False, "details": None}}, 400)
+                return
+            try:
+                if not isinstance(payload, dict):
+                    raise OperationError("INVALID_REQUEST", "请求体必须是 JSON 对象",
+                                         400, False)
+                request = api_validation.validate_attn_install_request(payload)
+                operation = queue.submit_operation(
+                    "attn.install", request,
+                    lambda op: runtime.run_attn_install(request, op),
+                    request_id=request["request_id"])
+                receipt = operation.receipt()
+                receipt["mode"] = request["mode"]
+                self._json(receipt, 202)
+            except OperationError as exc:
+                self._json({"ok": False, "error": exc.to_dict()}, exc.http_status)
+            except Exception as exc:
+                error = OperationError.from_exception(exc)
+                self._json({"ok": False, "error": error.to_dict()},
+                           error.http_status)
+
         def _post_legacy_te(self, path):
             """Preserve synchronous legacy response, but execute on the single worker."""
             payload = self._read_json_body()
@@ -355,6 +382,13 @@ def make_handler(runtime, queue, ctx):
                             "model_recipes": getattr(runtime.args, "model_recipes", {})})
             elif path == "/api/weights":
                 self._json(runtime.weights_snapshot())
+            elif path == "/api/attention":
+                self._json({"ok": True, "attention": {
+                    "mode": getattr(runtime, "attn", "none"),
+                    "installed": getattr(runtime, "_attn_installed_request", None),
+                    "override_active": getattr(runtime, "attn_override", None) is not None,
+                    "veda_calls": _veda_calls_snapshot(),
+                }})
             elif path.startswith("/api/weights/"):
                 model_id = path[len("/api/weights/"):]
                 model = runtime.weights_snapshot()["models"].get(model_id)
@@ -423,6 +457,9 @@ def make_handler(runtime, queue, ctx):
                 return
             if path == "/api/infer/encode":
                 self._post_encode()
+                return
+            if path == "/api/attention/install":
+                self._post_attn_install()
                 return
             if path.startswith("/api/operations/") and path.endswith("/cancel"):
                 operation_id = path[len("/api/operations/"):-len("/cancel")]
