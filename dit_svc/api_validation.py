@@ -545,6 +545,12 @@ def _veda_int_list(value, field):
     return text
 
 
+def validate_dit_probe_request(payload):
+    """Synthetic-input DiT probe scale; no promised internal token count."""
+    from dit_svc.dit_probe import validate_request
+    return validate_request(payload)
+
+
 def validate_attn_install_request(payload):
     """POST /api/attention/install 的严格校验（api_version=2）。"""
     _require_object(payload)

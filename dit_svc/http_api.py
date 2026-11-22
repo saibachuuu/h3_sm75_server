@@ -240,6 +240,33 @@ def make_handler(runtime, queue, ctx):
                 self._json({"ok": False, "error": error.to_dict()},
                            error.http_status)
 
+        def _post_dit_probe(self):
+            """POST /api/infer/dit_probe -> 202 operation receipt."""
+            payload = self._read_json_body()
+            if payload is None:
+                self._json({"ok": False, "error": {
+                    "code": "INVALID_REQUEST", "message": "请求体必须是 JSON 对象",
+                    "http_status": 400, "retryable": False, "details": None}}, 400)
+                return
+            try:
+                if not isinstance(payload, dict):
+                    raise OperationError("INVALID_REQUEST", "请求体必须是 JSON 对象",
+                                         400, False)
+                request = api_validation.validate_dit_probe_request(payload)
+                operation = queue.submit_operation(
+                    "infer.dit_probe", request,
+                    lambda op: runtime.run_infer_dit_probe(request, op),
+                    request_id=request["request_id"])
+                receipt = operation.receipt()
+                receipt["capability"] = "dit_probe"
+                self._json(receipt, 202)
+            except OperationError as exc:
+                self._json({"ok": False, "error": exc.to_dict()}, exc.http_status)
+            except Exception as exc:
+                error = OperationError.from_exception(exc)
+                self._json({"ok": False, "error": error.to_dict()},
+                           error.http_status)
+
         def _post_attn_install(self):
             """POST /api/attention/install → 202 operation receipt."""
             payload = self._read_json_body()
@@ -454,6 +481,9 @@ def make_handler(runtime, queue, ctx):
                 return
             if path == "/api/infer/te_probe":
                 self._post_encode(probe=True)
+                return
+            if path == "/api/infer/dit_probe":
+                self._post_dit_probe()
                 return
             if path == "/api/infer/encode":
                 self._post_encode()

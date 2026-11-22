@@ -151,6 +151,7 @@ class Runtime:
     def capabilities(self):
         models = self.weights_snapshot()["models"]
         needs = {"encode": ("te",), "te_probe": ("te",), "sample": ("dit",),
+                 "dit_probe": ("dit",),
                  "decode": ("vae.video", "vae.audio"),
                  "video_from_cond": ("dit", "vae.video", "vae.audio")}
         result = {}
@@ -158,7 +159,8 @@ class Runtime:
             missing = []
             for model in required:
                 state = models[model]["state"]
-                ok = (state == "vram") if name in ("encode", "te_probe") else (
+                ok = (state == "vram") if name in ("encode", "te_probe",
+                                                  "dit_probe") else (
                     state in ("ram", "vram")) if name == "decode" else (
                     state == "vram" if model == "dit" else state in ("ram", "vram"))
                 if not ok:
@@ -207,6 +209,15 @@ class Runtime:
         if kind in ("infer.encode", "infer.te_probe"):
             # 只查状态，不自动上卡；缺资源时给有序建议。
             self.weights.preflight_encode(None)
+        if kind == "infer.dit_probe":
+            # 采样前向每步都过 token_refiner；partial 布局直接拒绝。
+            dit = self.weights_snapshot()["models"].get("dit") or {}
+            if dit.get("state") != "vram":
+                raise OperationError(
+                    "MISSING_UNITS", "dit_probe 需要 dit 全部 unit 在显存",
+                    409, False,
+                    {"dit": dit.get("state"),
+                     "hint": "POST /api/weights/dit/ram2vram {\"mode\":\"all\"}"})
         if kind == "attn.install":
             # 便宜检查（持锁）：DiT 采样外壳必须就绪；安装本体在 worker 里执行。
             if self.unet is None or self.model_shifted is None:
@@ -226,6 +237,11 @@ class Runtime:
 
     def run_infer_te_probe(self, request, operation=None):
         return self.weights.probe(request, operation)
+
+    def run_infer_dit_probe(self, request, operation=None):
+        """infer.dit_probe 的唯一执行入口（单 worker 调用）。"""
+        from dit_svc import dit_probe
+        return dit_probe.run_probe(self, request, operation)
 
     def run_attn_install(self, request, operation=None):
         """attn.install 的唯一执行入口（单 worker 调用）。"""
