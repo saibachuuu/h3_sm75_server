@@ -13,7 +13,7 @@
 | `te` | `TeBackend`（Comfy CLIP + ClipProj） | `te.model` + `te.proj`（同进同出） | 见左 |
 | `veda.bundle` | `VedaBackend`（`veda.bundle_compat`） | 整组 | `veda.bundle.model` |
 
-`GET /api/weights` 与 `GET /api/weights/<model>` 返回同一份 registry 摘要：
+`GET /api/weights` 返回完整 registry 摘要：
 
 ```json
 {
@@ -33,6 +33,12 @@
     }
   }
 }
+```
+
+`GET /api/weights/<model>` 只返回单个模型；顶层 key 是 `model`，不是 `models`：
+
+```json
+{"ok": true, "model": {"model_id": "te", ...}}
 ```
 
 state 是聚合值：含 mixed/error 即 `error`；部分缺失为 `partial`；全部 CPU 为
@@ -65,7 +71,8 @@ action ∈ disk2ram | ram2vram | vram2ram | purgefromram
  "operation_url": "/api/operations/op_...", "model": "te", "action": "disk2ram"}
 ```
 
-`GET /api/operations/<id>` 轮询；`result` 里有 `completed / failed / not_attempted /
+`GET /api/operations/<id>` 返回 `{"ok": true, "operation": {...}}`，轮询其中的
+`operation.status`；`result` 里有 `completed / failed / not_attempted /
 dry_run / generation / model_state`，成功动作另带 `audit` 或 `proof`。
 
 ### 状态迁移

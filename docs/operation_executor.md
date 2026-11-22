@@ -82,6 +82,10 @@ op.receipt()
 }
 ```
 
+`GET /api/operations/<id>` 的 HTTP 响应是
+`{"ok": true, "operation": <public(include_log=True)>}`；不要直接把顶层当
+`Operation.public()` 读。
+
 - `public()` **不包含** payload、callback、bytes 或 tensor；快照可以安全返回。
 - `public(include_log=True)` 额外给最近 40 行日志，只建议单条 GET 使用。
 - `result` / `progress` 必须是**纯 JSON**（不接受 Tensor、bytes、set、NaN/Inf
