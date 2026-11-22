@@ -156,11 +156,16 @@ class Runtime:
                  "video_from_cond": ("dit", "vae.video", "vae.audio")}
         result = {}
         for name, required in needs.items():
+            if name == "dit_probe":
+                missing = self.dit_probe_missing(models)
+                result[name] = {
+                    "ready": self.env_ready and self.device_healthy and not missing,
+                    "missing": missing}
+                continue
             missing = []
             for model in required:
                 state = models[model]["state"]
-                ok = (state == "vram") if name in ("encode", "te_probe",
-                                                  "dit_probe") else (
+                ok = (state == "vram") if name in ("encode", "te_probe") else (
                     state in ("ram", "vram")) if name == "decode" else (
                     state == "vram" if model == "dit" else state in ("ram", "vram"))
                 if not ok:
@@ -168,6 +173,28 @@ class Runtime:
             result[name] = {"ready": self.env_ready and self.device_healthy and not missing,
                             "missing": missing}
         return result
+
+    def dit_probe_missing(self, models=None):
+        """dit_probe 的 unit 级门槛：除 token refiner 外全部 unit 必须已在显存。
+
+        probe 只跑 DiT 主体，cond 以 body 宽度直接喂入 forward，
+        因此 ``condition_proj`` / ``token_refiner``（dit.refiner）允许缺席。
+        返回缺失列表（空 = 就绪）；未建立 catalog 时返回 ["dit"]。
+        """
+        if models is None:
+            models = self.weights_snapshot()["models"]
+        dit = models.get("dit") or {}
+        units = dit.get("units") or []
+        if not dit.get("catalog_ready") or not units:
+            return ["dit"]
+        missing = []
+        for unit in units:
+            uid = unit.get("id")
+            if uid == "dit.refiner":
+                continue
+            if unit.get("state") != "vram":
+                missing.append(uid)
+        return missing
 
     def job_admission(self, job):
         """Cheap locked admission hook.
@@ -210,13 +237,14 @@ class Runtime:
             # 只查状态，不自动上卡；缺资源时给有序建议。
             self.weights.preflight_encode(None)
         if kind == "infer.dit_probe":
-            # 采样前向每步都过 token_refiner；partial 布局直接拒绝。
-            dit = self.weights_snapshot()["models"].get("dit") or {}
-            if dit.get("state") != "vram":
+            # body-only probe：token refiner 允许缺席（不触发 refiner 分支），
+            # 其余 unit 必须在显存。
+            missing = self.dit_probe_missing()
+            if missing:
                 raise OperationError(
-                    "MISSING_UNITS", "dit_probe 需要 dit 全部 unit 在显存",
+                    "MISSING_UNITS", "dit_probe 需要 DiT 主体（refiner 除外）在显存",
                     409, False,
-                    {"dit": dit.get("state"),
+                    {"missing": missing,
                      "hint": "POST /api/weights/dit/ram2vram {\"mode\":\"all\"}"})
         if kind == "attn.install":
             # 便宜检查（持锁）：DiT 采样外壳必须就绪；安装本体在 worker 里执行。

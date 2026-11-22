@@ -1,15 +1,18 @@
 """Bounded synthetic-input DiT probe; real sampler path, no decode, no artifacts.
 
 Scale is cond tokens and latent canvas size, not a promised internal token count.
-The probe requires the full DiT resident in VRAM: the sampling forward exercises
-``token_refiner.preprocess_text_embeds`` every step, so partial layouts (e.g.
-refiner in RAM) are rejected at admission instead of failing mid-run.
 
-Inputs are synthetic but the compute path is real: random cond goes through the
-real ``preprocess_text_embeds`` (token_refiner + condition_proj), the latent is
-built by the stock ``_empty_av_latent``, and sampling runs the stock
-SamplerCustomAdvanced chain (RandomNoise/BasicGuider/KSamplerSelect/
-BasicScheduler). No reference images (no VAE involved), no mp4/latent artifacts.
+The probe runs the **DiT body only**: the synthetic cond is fed with the model's
+internal width already (``hidden_size``), so ``MiniMaxH3Model._embed_and_pack``
+takes its ``text_states.shape[-1] == self.hidden_size`` fast path and never calls
+``token_refiner`` / ``condition_proj``. That makes token refiner optional: it may
+stay absent (purged) and the probe still runs, which is exactly what a
+body-only probe should measure.
+
+Inputs are synthetic but the sampling compute is real: the latent comes from the
+stock ``_empty_av_latent`` and sampling runs the stock SamplerCustomAdvanced
+chain (RandomNoise/BasicGuider/KSamplerSelect/BasicScheduler). No reference
+images (no VAE involved), no mp4/latent artifacts.
 This module is safe to import without torch/Comfy.
 """
 import time
@@ -17,7 +20,9 @@ import time
 from dit_svc.operations import OperationError
 from dit_svc.te_probe import cuda_memory, require_workspace
 
-COND_DIM = 5120  # H3 text conditioning width (ClipProj output dim of this checkpoint)
+# 本 checkpoint 的 DiT 内部宽度（MiniMaxH3Model.hidden_size）。probe 直接以该宽度
+# 造 cond，避免触发 condition_proj/token_refiner 这条非 body 分支。
+DEFAULT_COND_DIM = 5376
 
 
 def validate_request(payload):
@@ -47,14 +52,24 @@ def validate_request(payload):
             "request_id": api._request_id(payload)}
 
 
-def synthetic_cond(torch, scale, seed):
-    """Random cond + all-text tags via a local CPU generator (global RNG untouched).
+def cond_dim(runtime):
+    """读取 DiT 内部宽度；读不到就报错，不隐式猜一个宽度。"""
+    model = getattr(runtime, "diff_model", None)
+    width = getattr(model, "hidden_size", None)
+    if isinstance(width, int) and width > 0:
+        return width
+    return DEFAULT_COND_DIM
 
-    cond width is the fixed ClipProj output dim of this checkpoint; tags are all
-    1 (pure text tokens — no minimax_refs blocks are built in this probe).
+
+def synthetic_cond(torch, scale, seed, width=DEFAULT_COND_DIM):
+    """Random body-width cond + all-text tags from a local CPU generator.
+
+    ``width`` must be the DiT internal width: the forward then skips
+    ``condition_proj`` + ``token_refiner`` entirely (body-only probe).
+    Tags are all 1 (pure text tokens — no minimax_refs blocks are built).
     """
     generator = torch.Generator(device="cpu").manual_seed(seed)
-    cond = torch.randn((1, scale["cond_tokens"], COND_DIM),
+    cond = torch.randn((1, scale["cond_tokens"], width),
                        generator=generator, dtype=torch.float32)
     tags = torch.ones(scale["cond_tokens"], dtype=torch.long)
     return cond, tags
@@ -103,26 +118,23 @@ def run_probe(runtime, request, operation=None):
     index = -1
     memory_queried = False
     before = None
-    cond = tags = refined = latent = None
+    cond = tags = latent = None
     frame_count = None
     try:
         before = require_workspace(torch, device, request["min_free_mb"])
         memory_queried = True
         resident_before = _dit_resident_snapshot(runtime)
         scale = request["scale"]
-        backend._stage("DiT probe 合成条件", operation)
-        cond, tags = synthetic_cond(torch, scale, request["seed"])
+        backend._stage("DiT probe 合成条件（body 宽，跳过 refiner）", operation)
+        width = cond_dim(runtime)
+        cond, tags = synthetic_cond(torch, scale, request["seed"], width)
         cond = cond.to(device=device, dtype=torch.bfloat16)
         tags = tags.to(device)
-        with torch.no_grad():
-            refined = runtime.diff_model.preprocess_text_embeds(cond)
-        del cond
-        cond = None
         backend._stage("DiT probe 组装采样链", operation)
         latent, frame_count = _empty_av_latent(
             scale["width"], scale["height"], scale["length"])
         values = {"minimax_token_tags": tags}
-        positive = [[refined, values]]
+        positive = [[cond, values]]
         sigmas = rt.unpack(BasicScheduler.execute(
             runtime.model_shifted, "simple", request["steps"], 1.0))[0]
         sampler_obj = rt.unpack(KSamplerSelect.execute("res_multistep"))[0]
@@ -184,9 +196,12 @@ def run_probe(runtime, request, operation=None):
             raise
         raise error from exc
     finally:
-        del refined, latent
+        del cond, latent
     sample_times = [row["sample_s"] for row in runs]
     return {"kind": "dit_probe", "synthetic_inputs": True,
+            "body_only": True,
+            "token_refiner": "skipped (body-width cond)",
+            "cond_dim": width,
             "scale": request["scale"], "steps": request["steps"],
             "seed": request["seed"],
             "warmup": warmup, "runs": runs,

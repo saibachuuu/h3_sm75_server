@@ -16,8 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch  # CPU build in the isolated test env
 
 from dit_svc.api_validation import ApiError
-from dit_svc.dit_probe import (COND_DIM, run_probe, synthetic_cond,
-                               validate_request)
+from dit_svc.dit_probe import (DEFAULT_COND_DIM, cond_dim, run_probe,
+                               synthetic_cond, validate_request)
 from dit_svc.operations import OperationError
 
 
@@ -134,34 +134,22 @@ class _FakeComfyExtrasContext:
         return False
 
 
-def make_runtime(nonfinite=False, mutate_after=None):
+def make_runtime(nonfinite=False, hidden_size=None):
     nodes = _FakeNodes(nonfinite=nonfinite)
     dit_backend = SimpleNamespace(_stage=lambda message, op=None: None)
+    diff_model = SimpleNamespace()
+    if hidden_size is not None:
+        diff_model.hidden_size = hidden_size
     snapshots = [{"state": "vram", "counts": {"vram": 56},
                   "bytes": {"resident_cuda": 1},
                   "units": [{"device": "cuda:0"}]}]
-    if mutate_after is not None:
-        snapshots.append({"state": "vram", "counts": {"vram": 55, "ram": 1},
-                         "bytes": {"resident_cuda": 1},
-                         "units": [{"device": "cpu"}]})
-    calls = {"n": 0}
 
     def weights_snapshot():
-        if mutate_after is None:
-            return {"models": {"dit": snapshots[0]}}
-        if calls["n"] < mutate_after:
-            calls["n"] += 1
-            return {"models": {"dit": snapshots[min(calls["n"], len(snapshots) - 1)]}}
-        return {"models": {"dit": snapshots[-1]}}
-
-    if mutate_after is not None:
-        weights_snapshot = lambda: {"models": {  # noqa: E731
-            "dit": snapshots[0] if calls["n"] == 0 else snapshots[-1]}}
+        return {"models": {"dit": snapshots[0]}}
 
     runtime = SimpleNamespace(
         rt=SimpleNamespace(unpack=lambda value: value),
-        diff_model=SimpleNamespace(
-            preprocess_text_embeds=lambda cond: cond),
+        diff_model=diff_model,
         model_shifted=object(),
         device=torch.device("cpu"),
         weights=SimpleNamespace(backends={"dit": dit_backend}),
@@ -191,12 +179,37 @@ class ValidationTests(unittest.TestCase):
 class SyntheticTests(unittest.TestCase):
     def test_cond_shape_deterministic_no_global_rng(self):
         before = torch.get_rng_state().clone()
-        cond, tags = synthetic_cond(torch, {"cond_tokens": 24}, 7)
-        cond2, tags2 = synthetic_cond(torch, {"cond_tokens": 24}, 7)
-        self.assertEqual(list(cond.shape), [1, 24, COND_DIM])
+        cond, tags = synthetic_cond(torch, {"cond_tokens": 24}, 7, 5376)
+        cond2, tags2 = synthetic_cond(torch, {"cond_tokens": 24}, 7, 5376)
+        self.assertEqual(list(cond.shape), [1, 24, 5376])
         self.assertTrue(torch.equal(cond, cond2))
         self.assertEqual(int(tags.sum()), 24)
         self.assertTrue(torch.equal(before, torch.get_rng_state()))
+
+    def test_cond_dim_prefers_model_hidden_size(self):
+        runtime, _ = make_runtime(hidden_size=5376)
+        self.assertEqual(cond_dim(runtime), 5376)
+        runtime, _ = make_runtime()          # 未暴露 hidden_size 时用默认值
+        self.assertEqual(cond_dim(runtime), DEFAULT_COND_DIM)
+
+    def test_probe_does_not_touch_token_refiner(self):
+        """body-only：cond 直接以 body 宽度喂入，不需要 preprocess_text_embeds。"""
+        runtime, nodes = make_runtime(hidden_size=5376)
+        called = {"refiner": 0}
+
+        def explode(cond):
+            called["refiner"] += 1
+            raise AssertionError("probe 不得调用 token_refiner 路径")
+
+        runtime.diff_model.preprocess_text_embeds = explode
+        request = validate_request({"scale": {"cond_tokens": 16},
+                                    "warmup": 0, "repeat": 1})
+        with _FakeComfyExtrasContext(nodes), patch.object(torch, "cuda", FakeCuda()):
+            result = run_probe(runtime, request)
+        self.assertEqual(called["refiner"], 0)
+        self.assertTrue(result["body_only"])
+        self.assertEqual(result["cond_dim"], 5376)
+        self.assertIn("skipped", result["token_refiner"])
 
 
 class ProbeTests(unittest.TestCase):
@@ -248,7 +261,7 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(error.exception.details["steps"], 1)
 
     def test_weight_mutation_fails_closed(self):
-        # 第二次 snapshot（采样后）返回不同驻留 -> WEIGHT_MUTATED
+        # 采样后快照变化 -> WEIGHT_MUTATED
         runtime, nodes = make_runtime()
         request = validate_request({"scale": {}, "warmup": 0, "repeat": 1})
         snap = {"state": "vram", "counts": {"vram": 56},
@@ -282,28 +295,70 @@ class ProbeTests(unittest.TestCase):
 
 
 class AdmissionTests(unittest.TestCase):
-    def test_dit_probe_requires_full_vram(self):
+    def _runtime(self):
         from dit_svc.runtime import Runtime
         runtime = Runtime(SimpleNamespace(attn="none"), None)
         runtime.env_ready = True
         runtime.device_healthy = True
+        return runtime
+
+    @staticmethod
+    def _snap(dit_units, catalog_ready=True):
+        return {"models": {
+            "dit": {"state": "partial", "catalog_ready": catalog_ready,
+                    "units": [{"id": uid, "state": state}
+                              for uid, state in dit_units],
+                    "counts": {}, "bytes": {}},
+            "te": {"state": "absent"},
+            "vae.video": {"state": "absent"},
+            "vae.audio": {"state": "absent"},
+            "veda.bundle": {"state": "absent"}}}
+
+    def test_dit_probe_allows_refiner_absent(self):
+        runtime = self._runtime()
+        # refiner 缺席，其余全在显存 -> 通过
+        snap = self._snap([("dit.blocks.0", "vram"),
+                           ("dit.blocks.1", "vram"),
+                           ("dit.refiner", "absent")])
+        runtime.weights_snapshot = lambda: snap
+        runtime.operation_admission("infer.dit_probe", {})
+        self.assertTrue(runtime.capabilities()["dit_probe"]["ready"])
+
+    def test_dit_probe_rejects_missing_body_unit(self):
+        runtime = self._runtime()
+        snap = self._snap([("dit.blocks.0", "vram"),
+                           ("dit.blocks.1", "ram"),
+                           ("dit.refiner", "absent")])
+        runtime.weights_snapshot = lambda: snap
         with self.assertRaises(OperationError) as ctx:
             runtime.operation_admission("infer.dit_probe", {})
         self.assertEqual(ctx.exception.code, "MISSING_UNITS")
+        self.assertEqual(ctx.exception.details["missing"], ["dit.blocks.1"])
+        caps = runtime.capabilities()["dit_probe"]
+        self.assertFalse(caps["ready"])
+        self.assertEqual(caps["missing"], ["dit.blocks.1"])
 
-        def full_snap(dit_state):
-            return {"models": {
-                name: {"state": dit_state if name == "dit" else "absent"}
-                for name in ("dit", "te", "vae.video", "vae.audio",
-                             "veda.bundle")}}
+    def test_dit_probe_requires_catalog(self):
+        runtime = self._runtime()
+        runtime.weights_snapshot = lambda: self._snap([], catalog_ready=False)
+        with self.assertRaises(OperationError) as ctx:
+            runtime.operation_admission("infer.dit_probe", {})
+        self.assertEqual(ctx.exception.details["missing"], ["dit"])
 
-        runtime.weights_snapshot = lambda: full_snap("vram")
-        runtime.operation_admission("infer.dit_probe", {})
-        caps = runtime.capabilities()
-        self.assertTrue(caps["dit_probe"]["ready"])
-        self.assertEqual(caps["dit_probe"]["missing"], [])
-        runtime.weights_snapshot = lambda: full_snap("partial")
-        self.assertFalse(runtime.capabilities()["dit_probe"]["ready"])
+    def test_sample_still_requires_full_vram(self):
+        """真实采样依旧要求 dit 全量 vram（refiner 不可缺席）。"""
+        runtime = self._runtime()
+        snap = self._snap([("dit.blocks.0", "vram"),
+                           ("dit.refiner", "absent")])
+        snap["models"]["dit"]["state"] = "partial"
+        snap["models"]["vae.video"] = {"state": "ram"}
+        snap["models"]["vae.audio"] = {"state": "ram"}
+        runtime.weights_snapshot = lambda: snap
+        job = SimpleNamespace(kind="video")
+        with self.assertRaises(OperationError) as ctx:
+            runtime.job_admission(job)
+        self.assertEqual(ctx.exception.code, "MISSING_UNITS")
+        self.assertIn("dit", ctx.exception.details["missing"])
 
 
 if __name__ == "__main__":
